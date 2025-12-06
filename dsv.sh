@@ -78,7 +78,8 @@ show_usage() {
 
 # Check if separated mode is running
 is_separated_running() {
-    $DOCKER_COMPOSE_CMD -f docker-compose.separated.yml ps --services 2>/dev/null | grep -q p2p-gateway
+    # Check for any of the running DSV containers
+    docker ps --format "{{.Names}}" | grep -qE "(dsv-|snapshot-sequencer-validator-)"
 }
 
 # Start production (separated) mode
