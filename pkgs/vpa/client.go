@@ -188,26 +188,35 @@ func (vpa *ValidatorPriorityAssigner) CanValidatorSubmit(ctx context.Context, da
 	return canSubmit, nil
 }
 
-// GetEpochReleaseTime gets the epoch release timestamp from DataMarket contract
+// GetEpochReleaseTime gets the epoch release timestamp from DataMarket contract via ProtocolState
+// Uses ProtocolState.epochInfo(dataMarket, epochID) to avoid needing DataMarket ABI
 func (vpa *ValidatorPriorityAssigner) GetEpochReleaseTime(ctx context.Context, dataMarketAddr string, epochID uint64) (uint64, error) {
-	dataMarketABI, err := abiloader.LoadABI("DataMarket.json")
+	// This method is called from PriorityCachingClient which has protocolStateABI
+	// For base ValidatorPriorityAssigner, we need to load ProtocolState ABI
+	protocolStateABI, err := abiloader.LoadABI("PowerloomProtocolState.abi.json")
 	if err != nil {
-		return 0, fmt.Errorf("failed to parse DataMarket ABI: %w", err)
+		return 0, fmt.Errorf("failed to load ProtocolState ABI: %w", err)
 	}
 
-	data, err := dataMarketABI.Pack("epochInfo", big.NewInt(int64(epochID)))
+	// Get ProtocolState address from VPA contract's protocolState() function
+	protocolStateAddr, err := vpa.getProtocolStateAddress(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("failed to get ProtocolState address: %w", err)
+	}
+
+	dataMarketAddress := common.HexToAddress(dataMarketAddr)
+	data, err := protocolStateABI.Pack("epochInfo", dataMarketAddress, big.NewInt(int64(epochID)))
 	if err != nil {
 		return 0, fmt.Errorf("failed to pack epochInfo call: %w", err)
 	}
 
-	dataMarketAddress := common.HexToAddress(dataMarketAddr)
 	msg := ethereum.CallMsg{
-		To:   &dataMarketAddress,
+		To:   &protocolStateAddr,
 		Data: data,
 	}
 	result, err := vpa.client.CallContract(ctx, msg, nil)
 	if err != nil {
-		return 0, fmt.Errorf("failed to call epochInfo: %w", err)
+		return 0, fmt.Errorf("failed to call ProtocolState.epochInfo: %w", err)
 	}
 
 	var epochInfo struct {
@@ -215,7 +224,7 @@ func (vpa *ValidatorPriorityAssigner) GetEpochReleaseTime(ctx context.Context, d
 		Blocknumber *big.Int
 		EpochEnd    *big.Int
 	}
-	err = dataMarketABI.UnpackIntoInterface(&epochInfo, "epochInfo", result)
+	err = protocolStateABI.UnpackIntoInterface(&epochInfo, "epochInfo", result)
 	if err != nil {
 		return 0, fmt.Errorf("failed to unpack epochInfo result: %w", err)
 	}
@@ -228,10 +237,24 @@ func (vpa *ValidatorPriorityAssigner) GetEpochReleaseTime(ctx context.Context, d
 }
 
 // GetSubmissionWindows gets submission window config from DataMarket contract
+// Uses a minimal ABI to avoid requiring DataMarket.json file
 func (vpa *ValidatorPriorityAssigner) GetSubmissionWindows(ctx context.Context, dataMarketAddr string) (uint64, uint64, uint64, error) {
-	dataMarketABI, err := abiloader.LoadABI("DataMarket.json")
+	// Use a minimal ABI for just getSubmissionWindows() to avoid needing DataMarket.json
+	minimalABI := `[{
+		"inputs": [],
+		"name": "getSubmissionWindows",
+		"outputs": [
+			{"internalType": "uint256", "name": "", "type": "uint256"},
+			{"internalType": "uint256", "name": "", "type": "uint256"},
+			{"internalType": "uint256", "name": "", "type": "uint256"}
+		],
+		"stateMutability": "view",
+		"type": "function"
+	}]`
+
+	dataMarketABI, err := abi.JSON(strings.NewReader(minimalABI))
 	if err != nil {
-		return 0, 0, 0, fmt.Errorf("failed to parse DataMarket ABI: %w", err)
+		return 0, 0, 0, fmt.Errorf("failed to parse minimal DataMarket ABI: %w", err)
 	}
 
 	data, err := dataMarketABI.Pack("getSubmissionWindows")
@@ -334,6 +357,34 @@ func (vpa *ValidatorPriorityAssigner) getValidatorID(ctx context.Context) (uint6
 	}
 
 	return nodeId, nil
+}
+
+// getProtocolStateAddress gets the ProtocolState contract address from VPA contract
+func (vpa *ValidatorPriorityAssigner) getProtocolStateAddress(ctx context.Context) (common.Address, error) {
+	// Call VPA contract's protocolState() public variable
+	data, err := vpa.abi.Pack("protocolState")
+	if err != nil {
+		return common.Address{}, fmt.Errorf("failed to pack protocolState call: %w", err)
+	}
+
+	msg := ethereum.CallMsg{
+		To:   &vpa.contractAddr,
+		Data: data,
+	}
+
+	result, err := vpa.client.CallContract(ctx, msg, nil)
+	if err != nil {
+		return common.Address{}, fmt.Errorf("failed to call protocolState(): %w", err)
+	}
+
+	// Unpack the result (address)
+	var protocolStateAddr common.Address
+	err = vpa.abi.UnpackIntoInterface(&protocolStateAddr, "protocolState", result)
+	if err != nil {
+		return common.Address{}, fmt.Errorf("failed to unpack protocolState result: %w", err)
+	}
+
+	return protocolStateAddr, nil
 }
 
 // getValidatorStateAddress gets the ValidatorState contract address from VPA contract
