@@ -654,8 +654,21 @@ func (pcc *PriorityCachingClient) GetMyPriority(ctx context.Context, dataMarketA
 
 	priority, err := pcc.getPriorityFromProtocolState(ctx, dataMarketAddr, epochID, validatorID)
 	if err != nil {
+		pcc.logger.WithError(err).WithFields(logrus.Fields{
+			"epochID":     epochID,
+			"validatorID": validatorIDStr,
+			"dataMarket":  dataMarketAddr,
+		}).Error("getPriorityFromProtocolState failed")
 		return 0, err
 	}
+
+	// Log the priority we got before caching
+	pcc.logger.WithFields(logrus.Fields{
+		"epochID":     epochID,
+		"validatorID": validatorIDStr,
+		"priority":    priority,
+		"dataMarket":  dataMarketAddr,
+	}).Info("GetMyPriority: Retrieved priority from ProtocolState contract")
 
 	// Cache the result for future use
 	epochIDStr := strconv.FormatUint(epochID, 10)

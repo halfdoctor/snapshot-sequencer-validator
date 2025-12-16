@@ -125,12 +125,18 @@ func NewAggregator(cfg *config.Settings) (*Aggregator, error) {
 		}
 
 		// Initialize VPA caching client with fetched address
+		// Use NEW data market address for Redis key building since we submit to new contracts
+		vpaDataMarket := cfg.NewDataMarket
+		if vpaDataMarket == "" {
+			// Fallback to old data market if new one not configured
+			vpaDataMarket = dataMarket
+		}
 		if vpaContractAddr != (common.Address{}) && cfg.VPAValidatorAddress != "" {
 			// Use first RPC node for VPA
 			rpcURL := cfg.RPCNodes[0]
 			vpaClient, err = vpa.NewPriorityCachingClient(
 				rpcURL, vpaContractAddr.Hex(), cfg.VPAValidatorAddress,
-				redisClient, protocolState, dataMarket, cfg.NewProtocolStateContract)
+				redisClient, protocolState, vpaDataMarket, cfg.NewProtocolStateContract)
 			if err != nil {
 				cancel()
 				return nil, fmt.Errorf("failed to initialize VPA caching client: %w", err)
@@ -1366,6 +1372,12 @@ func (a *Aggregator) submitBatchViaRelayer(epochID uint64, aggregatedBatch *cons
 		a.storePriorityCheck(epochID, dataMarketAddr, 0, "priority_check_failed")
 		return nil
 	}
+
+	log.WithFields(logrus.Fields{
+		"epoch":       epochIDStr,
+		"data_market": dataMarketAddr,
+		"priority":    priority,
+	}).Info("🔍 GetMyPriority returned priority")
 
 	if priority == 0 {
 		log.WithFields(logrus.Fields{
