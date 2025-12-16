@@ -198,8 +198,7 @@ func LoadConfig() error {
 		//   - Level 1 local finalization to complete
 		//   - Level 2 network-wide aggregation to complete
 		//   - Priority 1 validator to commit on-chain during P1 window
-		// Renamed from SUBMISSION_WINDOW_DURATION for clarity.
-		Level1FinalizationDelay: time.Duration(getEnvAsInt("LEVEL1_FINALIZATION_DELAY_SECONDS", getEnvAsInt("SUBMISSION_WINDOW_DURATION", 60))) * time.Second,
+		Level1FinalizationDelay: time.Duration(getEnvAsInt("LEVEL1_FINALIZATION_DELAY_SECONDS", 10)) * time.Second,
 		MaxConcurrentWindows:    getEnvAsInt("MAX_CONCURRENT_WINDOWS", 100),
 		WindowCleanupInterval:   5 * time.Minute,
 
@@ -238,7 +237,7 @@ func LoadConfig() error {
 		FinalizationBatchSize: getEnvAsInt("FINALIZATION_BATCH_SIZE", 20),
 
 		// Aggregation Configuration
-		AggregationWindowDuration: time.Duration(getEnvAsInt("AGGREGATION_WINDOW_SECONDS", 30)) * time.Second,
+		AggregationWindowDuration: time.Duration(getEnvAsInt("AGGREGATION_WINDOW_SECONDS", 20)) * time.Second,
 
 		// Validator Priority Assignment (VPA) Configuration
 		ValidatorAddress:        getEnv("VALIDATOR_ADDRESS", ""),

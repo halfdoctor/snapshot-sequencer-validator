@@ -57,8 +57,8 @@ type PriorityMetadata struct {
 type CachedPriorities struct {
 	EpochID      uint64           `json:"epochId"`
 	Metadata     PriorityMetadata `json:"metadata"`
-	Priorities   map[string]int   `json:"priorities"` // validatorID -> priority
-	TopValidator string           `json:"topValidator"`
+	Priorities   map[string]int   `json:"priorities"`   // validatorID (1-based nodeId) -> priority
+	TopValidator string           `json:"topValidator"` // validatorID (1-based nodeId)
 	CachedAt     time.Time        `json:"cachedAt"`
 }
 
@@ -160,14 +160,21 @@ func (vpa *ValidatorPriorityAssigner) CanValidatorSubmit(ctx context.Context, da
 		return false, fmt.Errorf("failed to pack canValidatorSubmit call: %w", err)
 	}
 
-	// Call the contract
 	msg := ethereum.CallMsg{
 		To:   &vpa.contractAddr,
-		From: vpa.validator,
 		Data: data,
 	}
 	result, err := vpa.client.CallContract(ctx, msg, nil)
 	if err != nil {
+		errorMsg := err.Error()
+		logrus.WithError(err).WithFields(logrus.Fields{
+			"epoch":        epochID,
+			"data_market":  dataMarketAddr,
+			"vpa_contract": vpa.contractAddr.Hex(),
+			"validator":    vpa.validator.Hex(),
+			"error_msg":    errorMsg,
+			"timestamp":    time.Now().Unix(),
+		}).Warn("CanValidatorSubmit contract call failed - check window config and epochReleaseTime")
 		return false, fmt.Errorf("failed to call canValidatorSubmit: %w", err)
 	}
 
@@ -179,6 +186,107 @@ func (vpa *ValidatorPriorityAssigner) CanValidatorSubmit(ctx context.Context, da
 	}
 
 	return canSubmit, nil
+}
+
+// GetEpochReleaseTime gets the epoch release timestamp from DataMarket contract via ProtocolState
+// Uses ProtocolState.epochInfo(dataMarket, epochID) to avoid needing DataMarket ABI
+func (vpa *ValidatorPriorityAssigner) GetEpochReleaseTime(ctx context.Context, dataMarketAddr string, epochID uint64) (uint64, error) {
+	// This method is called from PriorityCachingClient which has protocolStateABI
+	// For base ValidatorPriorityAssigner, we need to load ProtocolState ABI
+	protocolStateABI, err := abiloader.LoadABI("PowerloomProtocolState.abi.json")
+	if err != nil {
+		return 0, fmt.Errorf("failed to load ProtocolState ABI: %w", err)
+	}
+
+	// Get ProtocolState address from VPA contract's protocolState() function
+	protocolStateAddr, err := vpa.getProtocolStateAddress(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("failed to get ProtocolState address: %w", err)
+	}
+
+	dataMarketAddress := common.HexToAddress(dataMarketAddr)
+	data, err := protocolStateABI.Pack("epochInfo", dataMarketAddress, big.NewInt(int64(epochID)))
+	if err != nil {
+		return 0, fmt.Errorf("failed to pack epochInfo call: %w", err)
+	}
+
+	msg := ethereum.CallMsg{
+		To:   &protocolStateAddr,
+		Data: data,
+	}
+	result, err := vpa.client.CallContract(ctx, msg, nil)
+	if err != nil {
+		return 0, fmt.Errorf("failed to call ProtocolState.epochInfo: %w", err)
+	}
+
+	var epochInfo struct {
+		Timestamp   *big.Int
+		Blocknumber *big.Int
+		EpochEnd    *big.Int
+	}
+	err = protocolStateABI.UnpackIntoInterface(&epochInfo, "epochInfo", result)
+	if err != nil {
+		return 0, fmt.Errorf("failed to unpack epochInfo result: %w", err)
+	}
+
+	if epochInfo.Timestamp == nil {
+		return 0, fmt.Errorf("epochInfo timestamp is nil")
+	}
+
+	return epochInfo.Timestamp.Uint64(), nil
+}
+
+// GetSubmissionWindows gets submission window config from DataMarket contract
+// Uses a minimal ABI to avoid requiring DataMarket.json file
+func (vpa *ValidatorPriorityAssigner) GetSubmissionWindows(ctx context.Context, dataMarketAddr string) (uint64, uint64, uint64, error) {
+	// Use a minimal ABI for just getSubmissionWindows() to avoid needing DataMarket.json
+	minimalABI := `[{
+		"inputs": [],
+		"name": "getSubmissionWindows",
+		"outputs": [
+			{"internalType": "uint256", "name": "", "type": "uint256"},
+			{"internalType": "uint256", "name": "", "type": "uint256"},
+			{"internalType": "uint256", "name": "", "type": "uint256"}
+		],
+		"stateMutability": "view",
+		"type": "function"
+	}]`
+
+	dataMarketABI, err := abi.JSON(strings.NewReader(minimalABI))
+	if err != nil {
+		return 0, 0, 0, fmt.Errorf("failed to parse minimal DataMarket ABI: %w", err)
+	}
+
+	data, err := dataMarketABI.Pack("getSubmissionWindows")
+	if err != nil {
+		return 0, 0, 0, fmt.Errorf("failed to pack getSubmissionWindows call: %w", err)
+	}
+
+	dataMarketAddress := common.HexToAddress(dataMarketAddr)
+	msg := ethereum.CallMsg{
+		To:   &dataMarketAddress,
+		Data: data,
+	}
+	result, err := vpa.client.CallContract(ctx, msg, nil)
+	if err != nil {
+		return 0, 0, 0, fmt.Errorf("failed to call getSubmissionWindows: %w", err)
+	}
+
+	var windows struct {
+		PreSubmissionWindow *big.Int
+		P1SubmissionWindow  *big.Int
+		PNSubmissionWindow  *big.Int
+	}
+	err = dataMarketABI.UnpackIntoInterface(&windows, "getSubmissionWindows", result)
+	if err != nil {
+		return 0, 0, 0, fmt.Errorf("failed to unpack getSubmissionWindows result: %w", err)
+	}
+
+	if windows.PreSubmissionWindow == nil || windows.P1SubmissionWindow == nil || windows.PNSubmissionWindow == nil {
+		return 0, 0, 0, fmt.Errorf("unexpected nil values in getSubmissionWindows result")
+	}
+
+	return windows.PreSubmissionWindow.Uint64(), windows.P1SubmissionWindow.Uint64(), windows.PNSubmissionWindow.Uint64(), nil
 }
 
 // GetMyPriority gets this validator's priority for the given epoch and data market
@@ -202,10 +310,8 @@ func (vpa *ValidatorPriorityAssigner) GetMyPriority(ctx context.Context, dataMar
 		return 0, fmt.Errorf("failed to pack getHistoricalPriority call: %w", err)
 	}
 
-	// Call the contract
 	msg := ethereum.CallMsg{
 		To:   &vpa.contractAddr,
-		From: vpa.validator,
 		Data: data,
 	}
 	result, err := vpa.client.CallContract(ctx, msg, nil)
@@ -253,6 +359,34 @@ func (vpa *ValidatorPriorityAssigner) getValidatorID(ctx context.Context) (uint6
 	return nodeId, nil
 }
 
+// getProtocolStateAddress gets the ProtocolState contract address from VPA contract
+func (vpa *ValidatorPriorityAssigner) getProtocolStateAddress(ctx context.Context) (common.Address, error) {
+	// Call VPA contract's protocolState() public variable
+	data, err := vpa.abi.Pack("protocolState")
+	if err != nil {
+		return common.Address{}, fmt.Errorf("failed to pack protocolState call: %w", err)
+	}
+
+	msg := ethereum.CallMsg{
+		To:   &vpa.contractAddr,
+		Data: data,
+	}
+
+	result, err := vpa.client.CallContract(ctx, msg, nil)
+	if err != nil {
+		return common.Address{}, fmt.Errorf("failed to call protocolState(): %w", err)
+	}
+
+	// Unpack the result (address)
+	var protocolStateAddr common.Address
+	err = vpa.abi.UnpackIntoInterface(&protocolStateAddr, "protocolState", result)
+	if err != nil {
+		return common.Address{}, fmt.Errorf("failed to unpack protocolState result: %w", err)
+	}
+
+	return protocolStateAddr, nil
+}
+
 // getValidatorStateAddress gets the ValidatorState contract address from VPA contract
 func (vpa *ValidatorPriorityAssigner) getValidatorStateAddress(ctx context.Context) (common.Address, error) {
 	// Call VPA contract's validatorState() public variable
@@ -264,7 +398,6 @@ func (vpa *ValidatorPriorityAssigner) getValidatorStateAddress(ctx context.Conte
 
 	msg := ethereum.CallMsg{
 		To:   &vpa.contractAddr,
-		From: vpa.validator,
 		Data: data,
 	}
 
@@ -305,10 +438,8 @@ func (vpa *ValidatorPriorityAssigner) callValidatorStateGetNodeId(ctx context.Co
 		return 0, fmt.Errorf("failed to pack getNodeIdForValidator call: %w", err)
 	}
 
-	// Call the contract
 	msg := ethereum.CallMsg{
 		To:   &validatorStateAddr,
-		From: vpa.validator,
 		Data: data,
 	}
 
@@ -389,7 +520,6 @@ func (pcc *PriorityCachingClient) getPriorityFromProtocolState(ctx context.Conte
 
 	msg := ethereum.CallMsg{
 		To:   &pcc.protocolStateAddr,
-		From: pcc.validator,
 		Data: data,
 	}
 	result, err := pcc.client.CallContract(ctx, msg, nil)
@@ -502,20 +632,46 @@ func (vpa *ValidatorPriorityAssigner) IsTopPriority(ctx context.Context, dataMar
 }
 
 // WaitForSubmissionWindow waits until the validator can submit
-// It first checks if the window is already open, and only starts polling if it's not yet open
-func (vpa *ValidatorPriorityAssigner) WaitForSubmissionWindow(ctx context.Context, dataMarketAddr string, epochID uint64) error {
+// For priority > 1, calculates when the window should open and waits until then instead of polling
+func (vpa *ValidatorPriorityAssigner) WaitForSubmissionWindow(ctx context.Context, dataMarketAddr string, epochID uint64, priority int) error {
 	// First check: if window is already open, return immediately
 	canSubmit, err := vpa.CanValidatorSubmit(ctx, dataMarketAddr, epochID)
 	if err != nil {
-		// If check fails, check if it's because window is closed (expected) vs other error
-		if strings.Contains(err.Error(), "Submission window closed") || strings.Contains(err.Error(), "execution reverted") {
-			// Window is closed, start polling
+		errorMsg := err.Error()
+		// "Submission window closed" means window has already passed (fatal)
+		// "Submission window not open" means window hasn't opened yet (recoverable)
+		if strings.Contains(errorMsg, "Submission window closed") {
+			// Try to get current block to see what timestamp the contract sees
+			header, headerErr := vpa.client.HeaderByNumber(ctx, nil)
+			blockTimestamp := int64(0)
+			if headerErr == nil && header != nil {
+				blockTimestamp = int64(header.Time)
+			}
+
+			logrus.WithError(err).WithFields(logrus.Fields{
+				"epoch":           epochID,
+				"data_market":     dataMarketAddr,
+				"vpa_contract":    vpa.contractAddr.Hex(),
+				"block_timestamp": blockTimestamp,
+				"error_msg":       errorMsg,
+			}).Error("❌ Submission window has already closed - check if block.timestamp matches expected window timing")
+			return fmt.Errorf("submission window closed: %w", err)
+		}
+		// "Submission window not open" or generic "execution reverted" - might open later, start polling
+		if strings.Contains(errorMsg, "Submission window not open") || strings.Contains(errorMsg, "execution reverted") {
 			logrus.WithFields(logrus.Fields{
-				"epoch":       epochID,
-				"data_market": dataMarketAddr,
+				"epoch":        epochID,
+				"data_market":  dataMarketAddr,
+				"vpa_contract": vpa.contractAddr.Hex(),
+				"error":        errorMsg,
 			}).Debug("Submission window not yet open, starting to poll...")
 		} else {
-			// Other error, return it
+			// Other error, log it and return
+			logrus.WithError(err).WithFields(logrus.Fields{
+				"epoch":        epochID,
+				"data_market":  dataMarketAddr,
+				"vpa_contract": vpa.contractAddr.Hex(),
+			}).Error("❌ CanValidatorSubmit failed with unexpected error")
 			return fmt.Errorf("failed to check submission window status: %w", err)
 		}
 	} else if canSubmit {
@@ -527,18 +683,145 @@ func (vpa *ValidatorPriorityAssigner) WaitForSubmissionWindow(ctx context.Contex
 		return nil
 	}
 
-	// Window is not open yet, start polling
-	ticker := time.NewTicker(2 * time.Second) // Poll every 2 seconds instead of 1 to reduce RPC calls
+	// For priority > 1, calculate exact wait time from contract config
+	if priority > 1 {
+		// Get epoch release time and window config from contract
+		epochReleaseTime, err := vpa.GetEpochReleaseTime(ctx, dataMarketAddr, epochID)
+		if err != nil {
+			logrus.WithError(err).WithFields(logrus.Fields{
+				"epoch":       epochID,
+				"priority":    priority,
+				"data_market": dataMarketAddr,
+			}).Warn("Failed to get epochReleaseTime, falling back to polling")
+			// Fall through to polling logic below
+		} else {
+			preSubmissionWindow, p1SubmissionWindow, pNSubmissionWindow, err := vpa.GetSubmissionWindows(ctx, dataMarketAddr)
+			if err != nil {
+				logrus.WithError(err).WithFields(logrus.Fields{
+					"epoch":       epochID,
+					"priority":    priority,
+					"data_market": dataMarketAddr,
+				}).Warn("Failed to get submission windows, falling back to polling")
+				// Fall through to polling logic below
+			} else {
+				// Calculate when this priority's window opens
+				// Priority 2: epochReleaseTime + preSubmissionWindow + p1SubmissionWindow
+				// Priority 3: epochReleaseTime + preSubmissionWindow + p1SubmissionWindow + pNSubmissionWindow
+				// Priority N: epochReleaseTime + preSubmissionWindow + p1SubmissionWindow + (pNSubmissionWindow * (priority - 1))
+				windowStartTime := epochReleaseTime + preSubmissionWindow + p1SubmissionWindow + (pNSubmissionWindow * uint64(priority-1))
+
+				localTime := time.Now().Unix()
+				waitSeconds := int64(windowStartTime) - localTime
+
+				if waitSeconds <= 0 {
+					// Window should already be open, check immediately
+					canSubmit, err := vpa.CanValidatorSubmit(ctx, dataMarketAddr, epochID)
+					if err == nil && canSubmit {
+						logrus.WithFields(logrus.Fields{
+							"epoch":       epochID,
+							"priority":    priority,
+							"data_market": dataMarketAddr,
+						}).Info("✅ Submission window is open")
+						return nil
+					}
+					// Window closed or error - return
+					if err != nil && strings.Contains(err.Error(), "Submission window closed") {
+						return fmt.Errorf("submission window closed: %w", err)
+					}
+					return fmt.Errorf("submission window not open")
+				}
+
+				logrus.WithFields(logrus.Fields{
+					"epoch":             epochID,
+					"priority":          priority,
+					"data_market":       dataMarketAddr,
+					"wait_seconds":      waitSeconds,
+					"window_start_time": windowStartTime,
+					"local_time":        localTime,
+				}).Info("⏳ Priority > 1: Waiting for lower priority windows to close...")
+
+				// Wait until window should open
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-time.After(time.Duration(waitSeconds) * time.Second):
+					// Retry a few times after waiting - block.timestamp may not match local time exactly
+					maxRetries := 5
+					retryInterval := 2 * time.Second
+					for retry := 0; retry < maxRetries; retry++ {
+						canSubmit, err := vpa.CanValidatorSubmit(ctx, dataMarketAddr, epochID)
+						if err != nil {
+							errorMsg := err.Error()
+							if strings.Contains(errorMsg, "Submission window closed") {
+								logrus.WithError(err).WithFields(logrus.Fields{
+									"epoch":       epochID,
+									"priority":    priority,
+									"data_market": dataMarketAddr,
+								}).Error("❌ Submission window has already closed")
+								return fmt.Errorf("submission window closed: %w", err)
+							}
+							if retry < maxRetries-1 {
+								logrus.WithFields(logrus.Fields{
+									"epoch":          epochID,
+									"priority":       priority,
+									"data_market":    dataMarketAddr,
+									"retry":          retry + 1,
+									"max_retries":    maxRetries,
+									"retry_interval": retryInterval,
+								}).Debug("Window not open yet, retrying...")
+								select {
+								case <-ctx.Done():
+									return ctx.Err()
+								case <-time.After(retryInterval):
+									continue
+								}
+							}
+							logrus.WithError(err).WithFields(logrus.Fields{
+								"epoch":       epochID,
+								"priority":    priority,
+								"data_market": dataMarketAddr,
+								"retries":     maxRetries,
+							}).Warn("⚠️ Submission window still not open after waiting and retries")
+							return fmt.Errorf("submission window not open after wait: %w", err)
+						}
+						if canSubmit {
+							logrus.WithFields(logrus.Fields{
+								"epoch":       epochID,
+								"priority":    priority,
+								"data_market": dataMarketAddr,
+								"retries":     retry,
+							}).Info("✅ Submission window is now open")
+							return nil
+						}
+						if retry < maxRetries-1 {
+							select {
+							case <-ctx.Done():
+								return ctx.Err()
+							case <-time.After(retryInterval):
+								continue
+							}
+						}
+					}
+					return fmt.Errorf("submission window not open after %d retries", maxRetries)
+				}
+			}
+		}
+	}
+
+	// Priority 1: Poll normally since window opens immediately after preSubmissionWindow
+	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 
-	// Log first attempt
 	logrus.WithFields(logrus.Fields{
 		"epoch":       epochID,
+		"priority":    priority,
 		"data_market": dataMarketAddr,
 	}).Info("⏳ Waiting for submission window to open...")
 
 	pollCount := 0
-	maxPollLogInterval := 10 // Log every 10 polls (20 seconds) to avoid spam
+	maxPollLogInterval := 10
+	maxConsecutiveErrors := 10 // Reduced for priority 1
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -547,35 +830,39 @@ func (vpa *ValidatorPriorityAssigner) WaitForSubmissionWindow(ctx context.Contex
 			pollCount++
 			canSubmit, err := vpa.CanValidatorSubmit(ctx, dataMarketAddr, epochID)
 			if err != nil {
-				// Only log if it's not a "window closed" error (which is expected while waiting)
-				// And only log periodically to avoid spam
-				if !strings.Contains(err.Error(), "Submission window closed") && !strings.Contains(err.Error(), "execution reverted") {
-					if pollCount%maxPollLogInterval == 0 {
-						logrus.WithError(err).WithFields(logrus.Fields{
-							"epoch":       epochID,
-							"data_market": dataMarketAddr,
-							"polls":       pollCount,
-						}).Debug("Failed to check submission eligibility")
-					}
+				errorMsg := err.Error()
+				if strings.Contains(errorMsg, "Submission window closed") {
+					logrus.WithError(err).WithFields(logrus.Fields{
+						"epoch":       epochID,
+						"priority":    priority,
+						"data_market": dataMarketAddr,
+					}).Error("❌ Submission window has already closed")
+					return fmt.Errorf("submission window closed: %w", err)
+				}
+				if pollCount >= maxConsecutiveErrors {
+					logrus.WithError(err).WithFields(logrus.Fields{
+						"epoch":    epochID,
+						"priority": priority,
+						"polls":    pollCount,
+					}).Warn("⚠️ Max polls reached, stopping")
+					return fmt.Errorf("submission window not open after %d polls: %w", pollCount, err)
+				}
+				if pollCount%maxPollLogInterval == 0 {
+					logrus.WithFields(logrus.Fields{
+						"epoch":    epochID,
+						"priority": priority,
+						"polls":    pollCount,
+					}).Debug("Still waiting for submission window to open...")
 				}
 				continue
 			}
 			if canSubmit {
 				logrus.WithFields(logrus.Fields{
-					"epoch":       epochID,
-					"data_market": dataMarketAddr,
-					"polls":       pollCount,
+					"epoch":    epochID,
+					"priority": priority,
+					"polls":    pollCount,
 				}).Info("✅ Submission window is now open")
 				return nil
-			}
-			// Log progress every 10 polls (20 seconds) to show we're still waiting
-			if pollCount%maxPollLogInterval == 0 {
-				logrus.WithFields(logrus.Fields{
-					"epoch":       epochID,
-					"data_market": dataMarketAddr,
-					"polls":       pollCount,
-					"elapsed":     time.Duration(pollCount*2) * time.Second,
-				}).Debug("Still waiting for submission window to open...")
 			}
 		}
 	}
@@ -618,12 +905,16 @@ func (pcc *PriorityCachingClient) CacheEpochPriorities(ctx context.Context, data
 // This wraps the base GetMyPriority() method with Redis caching
 func (pcc *PriorityCachingClient) GetMyPriority(ctx context.Context, dataMarketAddr string, epochID uint64) (int, error) {
 	// Get validator ID (cached, doesn't change at runtime)
-	validatorID, err := pcc.getCachedValidatorID(ctx)
+	// getCachedValidatorID returns 0-based validatorIndex for ProtocolState.getPriorities()
+	validatorIndex, err := pcc.getCachedValidatorID(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("failed to get validator ID: %w", err)
 	}
 
-	validatorIDStr := strconv.FormatUint(validatorID, 10)
+	// For caching, use 1-based nodeId (matching getHistoricalPriority contract call)
+	// This ensures cache keys match what storeCachedPriorities stores
+	nodeId := validatorIndex + 1
+	validatorIDStr := strconv.FormatUint(nodeId, 10)
 
 	// Try cache first
 	if priority, err := pcc.getValidatorPriorityFromCache(ctx, epochID, validatorIDStr); err == nil {
@@ -652,15 +943,31 @@ func (pcc *PriorityCachingClient) GetMyPriority(ctx context.Context, dataMarketA
 		"validatorID": validatorIDStr,
 	}).Debug("Cache miss, calling ProtocolState.getPriorities()")
 
-	priority, err := pcc.getPriorityFromProtocolState(ctx, dataMarketAddr, epochID, validatorID)
+	// getPriorityFromProtocolState expects 0-based validatorIndex
+	priority, err := pcc.getPriorityFromProtocolState(ctx, dataMarketAddr, epochID, validatorIndex)
 	if err != nil {
+		pcc.logger.WithError(err).WithFields(logrus.Fields{
+			"epochID":     epochID,
+			"validatorID": validatorIDStr,
+			"dataMarket":  dataMarketAddr,
+		}).Error("getPriorityFromProtocolState failed")
 		return 0, err
 	}
+
+	// Log the priority we got before caching
+	pcc.logger.WithFields(logrus.Fields{
+		"epochID":     epochID,
+		"validatorID": validatorIDStr,
+		"priority":    priority,
+		"dataMarket":  dataMarketAddr,
+	}).Info("GetMyPriority: Retrieved priority from ProtocolState contract")
 
 	// Cache the result for future use
 	epochIDStr := strconv.FormatUint(epochID, 10)
 	validatorKey := pcc.keyBuilder.VPAValidatorPriority(epochIDStr, validatorIDStr)
-	if cacheErr := pcc.redisClient.Set(ctx, validatorKey, priority, pcc.cacheTTL).Err(); cacheErr != nil {
+	// Store as string to ensure consistent serialization
+	priorityStr := strconv.Itoa(priority)
+	if cacheErr := pcc.redisClient.Set(ctx, validatorKey, priorityStr, pcc.cacheTTL).Err(); cacheErr != nil {
 		pcc.logger.WithError(cacheErr).Warn("Failed to cache validator priority")
 	} else {
 		logLevel := logrus.DebugLevel
@@ -673,6 +980,7 @@ func (pcc *PriorityCachingClient) GetMyPriority(ctx context.Context, dataMarketA
 			"validatorID": validatorIDStr,
 			"priority":    priority,
 			"cacheKey":    validatorKey,
+			"ttl":         pcc.cacheTTL,
 		}).Log(logLevel, "Cached VPA priority")
 	}
 
@@ -680,6 +988,7 @@ func (pcc *PriorityCachingClient) GetMyPriority(ctx context.Context, dataMarketA
 }
 
 // GetValidatorPriority gets priority for a specific validator (cache-first)
+// validatorID must be 1-based nodeId (matching getHistoricalPriority contract call and cache keys)
 func (pcc *PriorityCachingClient) GetValidatorPriority(ctx context.Context, dataMarket string, epochID uint64, validatorID string) (int, error) {
 	// Try cache first
 	if priority, err := pcc.getValidatorPriorityFromCache(ctx, epochID, validatorID); err == nil {
@@ -696,6 +1005,7 @@ func (pcc *PriorityCachingClient) GetValidatorPriority(ctx context.Context, data
 }
 
 // IsTopPriority checks if validator has top priority for the epoch
+// validatorID must be 1-based nodeId (matching cache keys and GetValidatorPriority)
 func (pcc *PriorityCachingClient) IsTopPriority(ctx context.Context, dataMarket string, epochID uint64, validatorID string) (bool, error) {
 	// Get top validator from cache
 	topValidatorKey := pcc.keyBuilder.VPATopValidator(strconv.FormatUint(epochID, 10))
@@ -714,9 +1024,13 @@ func (pcc *PriorityCachingClient) IsTopPriority(ctx context.Context, dataMarket 
 }
 
 // getHistoricalPrioritiesFromContract fetches all priorities from VPA contract
+// Returns map with 1-based nodeId as keys (matching getHistoricalPriority contract call)
+// When implemented, must ensure validatorID keys in the map are 1-based nodeIds
 func (pcc *PriorityCachingClient) getHistoricalPrioritiesFromContract(_ context.Context, dataMarket string, epochID uint64) (map[string]int, PriorityMetadata, error) {
 	// This is a placeholder - actual implementation would call VPA contract methods
 	// like getHistoricalPriorities() and getHistoricalValidatorCount()
+	// IMPORTANT: getHistoricalPriorities() returns 0-based validatorIndex, but map keys must be 1-based nodeId
+	// Convert: validatorID = validatorIndex + 1
 
 	// For now, return empty data
 	priorities := make(map[string]int)
@@ -732,6 +1046,7 @@ func (pcc *PriorityCachingClient) getHistoricalPrioritiesFromContract(_ context.
 }
 
 // storeCachedPriorities stores cached priorities in Redis
+// data.Priorities map keys must be 1-based nodeId (matching getHistoricalPriority contract call)
 func (pcc *PriorityCachingClient) storeCachedPriorities(ctx context.Context, epochID uint64, data *CachedPriorities) error {
 	epochIDStr := strconv.FormatUint(epochID, 10)
 
@@ -747,9 +1062,11 @@ func (pcc *PriorityCachingClient) storeCachedPriorities(ctx context.Context, epo
 	}
 
 	// Store individual validator priorities for quick lookup
+	// validatorID from map is 1-based nodeId (ensured by getHistoricalPrioritiesFromContract)
 	for validatorID, priority := range data.Priorities {
 		validatorKey := pcc.keyBuilder.VPAValidatorPriority(epochIDStr, validatorID)
-		if err := pcc.redisClient.Set(ctx, validatorKey, priority, pcc.cacheTTL).Err(); err != nil {
+		priorityStr := strconv.Itoa(priority)
+		if err := pcc.redisClient.Set(ctx, validatorKey, priorityStr, pcc.cacheTTL).Err(); err != nil {
 			pcc.logger.WithError(err).Warn("Failed to cache validator priority")
 		}
 	}
@@ -772,12 +1089,26 @@ func (pcc *PriorityCachingClient) storeCachedPriorities(ctx context.Context, epo
 }
 
 // getValidatorPriorityFromCache gets validator priority from Redis cache
+// validatorID must be 1-based nodeId (matching cache keys stored by storeCachedPriorities)
 func (pcc *PriorityCachingClient) getValidatorPriorityFromCache(ctx context.Context, epochID uint64, validatorID string) (int, error) {
 	epochIDStr := strconv.FormatUint(epochID, 10)
 	validatorKey := pcc.keyBuilder.VPAValidatorPriority(epochIDStr, validatorID)
 
 	priorityStr, err := pcc.redisClient.Get(ctx, validatorKey).Result()
 	if err != nil {
+		if err == redis.Nil {
+			pcc.logger.WithFields(logrus.Fields{
+				"epochID":     epochID,
+				"validatorID": validatorID,
+				"cacheKey":    validatorKey,
+			}).Debug("Cache miss - key not found in Redis")
+		} else {
+			pcc.logger.WithError(err).WithFields(logrus.Fields{
+				"epochID":     epochID,
+				"validatorID": validatorID,
+				"cacheKey":    validatorKey,
+			}).Warn("Cache lookup failed")
+		}
 		return -1, err // Cache miss
 	}
 
@@ -800,7 +1131,10 @@ func (pcc *PriorityCachingClient) findTopValidator(priorities map[string]int) st
 }
 
 // getHistoricalPriorityFromContract fetches priority from VPA contract (placeholder)
-func (pcc *PriorityCachingClient) getHistoricalPriorityFromContract(_ context.Context, _ string, _ uint64, _ string) (int, error) {
+// validatorID must be 1-based nodeId (matching getHistoricalPriority contract call signature)
+func (pcc *PriorityCachingClient) getHistoricalPriorityFromContract(_ context.Context, _ string, _ uint64, validatorID string) (int, error) {
 	// Placeholder for actual contract call implementation
+	// When implemented, call VPA.getHistoricalPriority(dataMarket, epochID, validatorID)
+	// where validatorID is 1-based nodeId (not 0-based validatorIndex)
 	return -1, fmt.Errorf("contract call not yet implemented")
 }
