@@ -227,6 +227,9 @@ services:
       - VPA_CONTRACT_ADDRESS=${VPA_CONTRACT_ADDRESS}
       - VPA_VALIDATOR_ADDRESS=${VPA_VALIDATOR_ADDRESS}
       - RELAYER_PY_ENDPOINT=${RELAYER_PY_ENDPOINT:-http://relayer-py:8080}
+      # Aggregation Configuration
+      - AGGREGATION_WINDOW_SECONDS=${AGGREGATION_WINDOW_SECONDS:-20}
+      - LEVEL1_FINALIZATION_DELAY_SECONDS=${LEVEL1_FINALIZATION_DELAY_SECONDS:-10}
     depends_on:
       redis:
         condition: service_healthy
