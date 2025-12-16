@@ -160,14 +160,19 @@ func (vpa *ValidatorPriorityAssigner) CanValidatorSubmit(ctx context.Context, da
 		return false, fmt.Errorf("failed to pack canValidatorSubmit call: %w", err)
 	}
 
-	// Call the contract
 	msg := ethereum.CallMsg{
 		To:   &vpa.contractAddr,
-		From: vpa.validator,
 		Data: data,
 	}
 	result, err := vpa.client.CallContract(ctx, msg, nil)
 	if err != nil {
+		// Log detailed error information for debugging
+		logrus.WithError(err).WithFields(logrus.Fields{
+			"epoch":        epochID,
+			"data_market":  dataMarketAddr,
+			"vpa_contract": vpa.contractAddr.Hex(),
+			"validator":    vpa.validator.Hex(),
+		}).Debug("CanValidatorSubmit contract call failed")
 		return false, fmt.Errorf("failed to call canValidatorSubmit: %w", err)
 	}
 
@@ -202,10 +207,8 @@ func (vpa *ValidatorPriorityAssigner) GetMyPriority(ctx context.Context, dataMar
 		return 0, fmt.Errorf("failed to pack getHistoricalPriority call: %w", err)
 	}
 
-	// Call the contract
 	msg := ethereum.CallMsg{
 		To:   &vpa.contractAddr,
-		From: vpa.validator,
 		Data: data,
 	}
 	result, err := vpa.client.CallContract(ctx, msg, nil)
@@ -264,7 +267,6 @@ func (vpa *ValidatorPriorityAssigner) getValidatorStateAddress(ctx context.Conte
 
 	msg := ethereum.CallMsg{
 		To:   &vpa.contractAddr,
-		From: vpa.validator,
 		Data: data,
 	}
 
@@ -305,10 +307,8 @@ func (vpa *ValidatorPriorityAssigner) callValidatorStateGetNodeId(ctx context.Co
 		return 0, fmt.Errorf("failed to pack getNodeIdForValidator call: %w", err)
 	}
 
-	// Call the contract
 	msg := ethereum.CallMsg{
 		To:   &validatorStateAddr,
-		From: vpa.validator,
 		Data: data,
 	}
 
@@ -389,7 +389,6 @@ func (pcc *PriorityCachingClient) getPriorityFromProtocolState(ctx context.Conte
 
 	msg := ethereum.CallMsg{
 		To:   &pcc.protocolStateAddr,
-		From: pcc.validator,
 		Data: data,
 	}
 	result, err := pcc.client.CallContract(ctx, msg, nil)
@@ -507,15 +506,23 @@ func (vpa *ValidatorPriorityAssigner) WaitForSubmissionWindow(ctx context.Contex
 	// First check: if window is already open, return immediately
 	canSubmit, err := vpa.CanValidatorSubmit(ctx, dataMarketAddr, epochID)
 	if err != nil {
+		errorMsg := err.Error()
 		// If check fails, check if it's because window is closed (expected) vs other error
-		if strings.Contains(err.Error(), "Submission window closed") || strings.Contains(err.Error(), "execution reverted") {
+		if strings.Contains(errorMsg, "Submission window closed") || strings.Contains(errorMsg, "execution reverted") {
 			// Window is closed, start polling
 			logrus.WithFields(logrus.Fields{
-				"epoch":       epochID,
-				"data_market": dataMarketAddr,
+				"epoch":        epochID,
+				"data_market":  dataMarketAddr,
+				"vpa_contract": vpa.contractAddr.Hex(),
+				"error":        errorMsg,
 			}).Debug("Submission window not yet open, starting to poll...")
 		} else {
-			// Other error, return it
+			// Other error, log it and return
+			logrus.WithError(err).WithFields(logrus.Fields{
+				"epoch":        epochID,
+				"data_market":  dataMarketAddr,
+				"vpa_contract": vpa.contractAddr.Hex(),
+			}).Error("❌ CanValidatorSubmit failed with unexpected error")
 			return fmt.Errorf("failed to check submission window status: %w", err)
 		}
 	} else if canSubmit {
@@ -539,6 +546,10 @@ func (vpa *ValidatorPriorityAssigner) WaitForSubmissionWindow(ctx context.Contex
 
 	pollCount := 0
 	maxPollLogInterval := 10 // Log every 10 polls (20 seconds) to avoid spam
+	lastErrorType := ""
+	consecutiveErrors := 0
+	maxConsecutiveErrors := 30 // Stop after 30 consecutive errors (1 minute) of the same type
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -547,15 +558,57 @@ func (vpa *ValidatorPriorityAssigner) WaitForSubmissionWindow(ctx context.Contex
 			pollCount++
 			canSubmit, err := vpa.CanValidatorSubmit(ctx, dataMarketAddr, epochID)
 			if err != nil {
-				// Only log if it's not a "window closed" error (which is expected while waiting)
-				// And only log periodically to avoid spam
-				if !strings.Contains(err.Error(), "Submission window closed") && !strings.Contains(err.Error(), "execution reverted") {
-					if pollCount%maxPollLogInterval == 0 {
+				errorMsg := err.Error()
+				isWindowClosedError := strings.Contains(errorMsg, "Submission window closed") ||
+					strings.Contains(errorMsg, "Submission window not open") ||
+					strings.Contains(errorMsg, "execution reverted")
+
+				// Check for fatal errors that mean we should stop polling
+				isFatalError := strings.Contains(errorMsg, "Epoch not released") ||
+					strings.Contains(errorMsg, "Priorities not assigned") ||
+					strings.Contains(errorMsg, "Validator not allowed to submit")
+
+				// Track consecutive errors of the same type
+				if errorMsg == lastErrorType {
+					consecutiveErrors++
+				} else {
+					consecutiveErrors = 1
+					lastErrorType = errorMsg
+				}
+
+				// If fatal error or too many consecutive errors, give up
+				if isFatalError || consecutiveErrors >= maxConsecutiveErrors {
+					logrus.WithError(err).WithFields(logrus.Fields{
+						"epoch":              epochID,
+						"data_market":        dataMarketAddr,
+						"polls":              pollCount,
+						"consecutive_errors": consecutiveErrors,
+						"vpa_contract":       vpa.contractAddr.Hex(),
+						"is_fatal":           isFatalError,
+					}).Error("❌ CanValidatorSubmit failed with fatal/unrecoverable error, stopping polling")
+					return fmt.Errorf("canValidatorSubmit failed: %w", err)
+				}
+
+				// Log errors that aren't "window closed" errors, or if we have many consecutive errors
+				if !isWindowClosedError {
+					if pollCount%maxPollLogInterval == 0 || consecutiveErrors >= 5 {
 						logrus.WithError(err).WithFields(logrus.Fields{
+							"epoch":              epochID,
+							"data_market":        dataMarketAddr,
+							"polls":              pollCount,
+							"consecutive_errors": consecutiveErrors,
+							"vpa_contract":       vpa.contractAddr.Hex(),
+						}).Warn("⚠️ CanValidatorSubmit failed (not window closed error)")
+					}
+				} else {
+					// Log "window closed" errors periodically to show we're still polling
+					if pollCount%maxPollLogInterval == 0 {
+						logrus.WithFields(logrus.Fields{
 							"epoch":       epochID,
 							"data_market": dataMarketAddr,
 							"polls":       pollCount,
-						}).Debug("Failed to check submission eligibility")
+							"elapsed":     time.Duration(pollCount*2) * time.Second,
+						}).Debug("Still waiting for submission window to open...")
 					}
 				}
 				continue
