@@ -57,8 +57,8 @@ type PriorityMetadata struct {
 type CachedPriorities struct {
 	EpochID      uint64           `json:"epochId"`
 	Metadata     PriorityMetadata `json:"metadata"`
-	Priorities   map[string]int   `json:"priorities"` // validatorID -> priority
-	TopValidator string           `json:"topValidator"`
+	Priorities   map[string]int   `json:"priorities"`   // validatorID (1-based nodeId) -> priority
+	TopValidator string           `json:"topValidator"` // validatorID (1-based nodeId)
 	CachedAt     time.Time        `json:"cachedAt"`
 }
 
@@ -854,12 +854,16 @@ func (pcc *PriorityCachingClient) CacheEpochPriorities(ctx context.Context, data
 // This wraps the base GetMyPriority() method with Redis caching
 func (pcc *PriorityCachingClient) GetMyPriority(ctx context.Context, dataMarketAddr string, epochID uint64) (int, error) {
 	// Get validator ID (cached, doesn't change at runtime)
-	validatorID, err := pcc.getCachedValidatorID(ctx)
+	// getCachedValidatorID returns 0-based validatorIndex for ProtocolState.getPriorities()
+	validatorIndex, err := pcc.getCachedValidatorID(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("failed to get validator ID: %w", err)
 	}
 
-	validatorIDStr := strconv.FormatUint(validatorID, 10)
+	// For caching, use 1-based nodeId (matching getHistoricalPriority contract call)
+	// This ensures cache keys match what storeCachedPriorities stores
+	nodeId := validatorIndex + 1
+	validatorIDStr := strconv.FormatUint(nodeId, 10)
 
 	// Try cache first
 	if priority, err := pcc.getValidatorPriorityFromCache(ctx, epochID, validatorIDStr); err == nil {
@@ -888,7 +892,8 @@ func (pcc *PriorityCachingClient) GetMyPriority(ctx context.Context, dataMarketA
 		"validatorID": validatorIDStr,
 	}).Debug("Cache miss, calling ProtocolState.getPriorities()")
 
-	priority, err := pcc.getPriorityFromProtocolState(ctx, dataMarketAddr, epochID, validatorID)
+	// getPriorityFromProtocolState expects 0-based validatorIndex
+	priority, err := pcc.getPriorityFromProtocolState(ctx, dataMarketAddr, epochID, validatorIndex)
 	if err != nil {
 		pcc.logger.WithError(err).WithFields(logrus.Fields{
 			"epochID":     epochID,
@@ -909,7 +914,9 @@ func (pcc *PriorityCachingClient) GetMyPriority(ctx context.Context, dataMarketA
 	// Cache the result for future use
 	epochIDStr := strconv.FormatUint(epochID, 10)
 	validatorKey := pcc.keyBuilder.VPAValidatorPriority(epochIDStr, validatorIDStr)
-	if cacheErr := pcc.redisClient.Set(ctx, validatorKey, priority, pcc.cacheTTL).Err(); cacheErr != nil {
+	// Store as string to ensure consistent serialization
+	priorityStr := strconv.Itoa(priority)
+	if cacheErr := pcc.redisClient.Set(ctx, validatorKey, priorityStr, pcc.cacheTTL).Err(); cacheErr != nil {
 		pcc.logger.WithError(cacheErr).Warn("Failed to cache validator priority")
 	} else {
 		logLevel := logrus.DebugLevel
@@ -922,6 +929,7 @@ func (pcc *PriorityCachingClient) GetMyPriority(ctx context.Context, dataMarketA
 			"validatorID": validatorIDStr,
 			"priority":    priority,
 			"cacheKey":    validatorKey,
+			"ttl":         pcc.cacheTTL,
 		}).Log(logLevel, "Cached VPA priority")
 	}
 
@@ -929,6 +937,7 @@ func (pcc *PriorityCachingClient) GetMyPriority(ctx context.Context, dataMarketA
 }
 
 // GetValidatorPriority gets priority for a specific validator (cache-first)
+// validatorID must be 1-based nodeId (matching getHistoricalPriority contract call and cache keys)
 func (pcc *PriorityCachingClient) GetValidatorPriority(ctx context.Context, dataMarket string, epochID uint64, validatorID string) (int, error) {
 	// Try cache first
 	if priority, err := pcc.getValidatorPriorityFromCache(ctx, epochID, validatorID); err == nil {
@@ -945,6 +954,7 @@ func (pcc *PriorityCachingClient) GetValidatorPriority(ctx context.Context, data
 }
 
 // IsTopPriority checks if validator has top priority for the epoch
+// validatorID must be 1-based nodeId (matching cache keys and GetValidatorPriority)
 func (pcc *PriorityCachingClient) IsTopPriority(ctx context.Context, dataMarket string, epochID uint64, validatorID string) (bool, error) {
 	// Get top validator from cache
 	topValidatorKey := pcc.keyBuilder.VPATopValidator(strconv.FormatUint(epochID, 10))
@@ -963,9 +973,13 @@ func (pcc *PriorityCachingClient) IsTopPriority(ctx context.Context, dataMarket 
 }
 
 // getHistoricalPrioritiesFromContract fetches all priorities from VPA contract
+// Returns map with 1-based nodeId as keys (matching getHistoricalPriority contract call)
+// When implemented, must ensure validatorID keys in the map are 1-based nodeIds
 func (pcc *PriorityCachingClient) getHistoricalPrioritiesFromContract(_ context.Context, dataMarket string, epochID uint64) (map[string]int, PriorityMetadata, error) {
 	// This is a placeholder - actual implementation would call VPA contract methods
 	// like getHistoricalPriorities() and getHistoricalValidatorCount()
+	// IMPORTANT: getHistoricalPriorities() returns 0-based validatorIndex, but map keys must be 1-based nodeId
+	// Convert: validatorID = validatorIndex + 1
 
 	// For now, return empty data
 	priorities := make(map[string]int)
@@ -981,6 +995,7 @@ func (pcc *PriorityCachingClient) getHistoricalPrioritiesFromContract(_ context.
 }
 
 // storeCachedPriorities stores cached priorities in Redis
+// data.Priorities map keys must be 1-based nodeId (matching getHistoricalPriority contract call)
 func (pcc *PriorityCachingClient) storeCachedPriorities(ctx context.Context, epochID uint64, data *CachedPriorities) error {
 	epochIDStr := strconv.FormatUint(epochID, 10)
 
@@ -996,9 +1011,11 @@ func (pcc *PriorityCachingClient) storeCachedPriorities(ctx context.Context, epo
 	}
 
 	// Store individual validator priorities for quick lookup
+	// validatorID from map is 1-based nodeId (ensured by getHistoricalPrioritiesFromContract)
 	for validatorID, priority := range data.Priorities {
 		validatorKey := pcc.keyBuilder.VPAValidatorPriority(epochIDStr, validatorID)
-		if err := pcc.redisClient.Set(ctx, validatorKey, priority, pcc.cacheTTL).Err(); err != nil {
+		priorityStr := strconv.Itoa(priority)
+		if err := pcc.redisClient.Set(ctx, validatorKey, priorityStr, pcc.cacheTTL).Err(); err != nil {
 			pcc.logger.WithError(err).Warn("Failed to cache validator priority")
 		}
 	}
@@ -1021,12 +1038,26 @@ func (pcc *PriorityCachingClient) storeCachedPriorities(ctx context.Context, epo
 }
 
 // getValidatorPriorityFromCache gets validator priority from Redis cache
+// validatorID must be 1-based nodeId (matching cache keys stored by storeCachedPriorities)
 func (pcc *PriorityCachingClient) getValidatorPriorityFromCache(ctx context.Context, epochID uint64, validatorID string) (int, error) {
 	epochIDStr := strconv.FormatUint(epochID, 10)
 	validatorKey := pcc.keyBuilder.VPAValidatorPriority(epochIDStr, validatorID)
 
 	priorityStr, err := pcc.redisClient.Get(ctx, validatorKey).Result()
 	if err != nil {
+		if err == redis.Nil {
+			pcc.logger.WithFields(logrus.Fields{
+				"epochID":     epochID,
+				"validatorID": validatorID,
+				"cacheKey":    validatorKey,
+			}).Debug("Cache miss - key not found in Redis")
+		} else {
+			pcc.logger.WithError(err).WithFields(logrus.Fields{
+				"epochID":     epochID,
+				"validatorID": validatorID,
+				"cacheKey":    validatorKey,
+			}).Warn("Cache lookup failed")
+		}
 		return -1, err // Cache miss
 	}
 
@@ -1049,7 +1080,10 @@ func (pcc *PriorityCachingClient) findTopValidator(priorities map[string]int) st
 }
 
 // getHistoricalPriorityFromContract fetches priority from VPA contract (placeholder)
-func (pcc *PriorityCachingClient) getHistoricalPriorityFromContract(_ context.Context, _ string, _ uint64, _ string) (int, error) {
+// validatorID must be 1-based nodeId (matching getHistoricalPriority contract call signature)
+func (pcc *PriorityCachingClient) getHistoricalPriorityFromContract(_ context.Context, _ string, _ uint64, validatorID string) (int, error) {
 	// Placeholder for actual contract call implementation
+	// When implemented, call VPA.getHistoricalPriority(dataMarket, epochID, validatorID)
+	// where validatorID is 1-based nodeId (not 0-based validatorIndex)
 	return -1, fmt.Errorf("contract call not yet implemented")
 }
