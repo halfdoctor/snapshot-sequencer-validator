@@ -507,9 +507,18 @@ func (vpa *ValidatorPriorityAssigner) WaitForSubmissionWindow(ctx context.Contex
 	canSubmit, err := vpa.CanValidatorSubmit(ctx, dataMarketAddr, epochID)
 	if err != nil {
 		errorMsg := err.Error()
-		// If check fails, check if it's because window is closed (expected) vs other error
-		if strings.Contains(errorMsg, "Submission window closed") || strings.Contains(errorMsg, "execution reverted") {
-			// Window is closed, start polling
+		// "Submission window closed" means window has already passed (fatal)
+		// "Submission window not open" means window hasn't opened yet (recoverable)
+		if strings.Contains(errorMsg, "Submission window closed") {
+			logrus.WithError(err).WithFields(logrus.Fields{
+				"epoch":        epochID,
+				"data_market":  dataMarketAddr,
+				"vpa_contract": vpa.contractAddr.Hex(),
+			}).Error("❌ Submission window has already closed")
+			return fmt.Errorf("submission window closed: %w", err)
+		}
+		// "Submission window not open" or generic "execution reverted" - might open later, start polling
+		if strings.Contains(errorMsg, "Submission window not open") || strings.Contains(errorMsg, "execution reverted") {
 			logrus.WithFields(logrus.Fields{
 				"epoch":        epochID,
 				"data_market":  dataMarketAddr,
@@ -559,12 +568,15 @@ func (vpa *ValidatorPriorityAssigner) WaitForSubmissionWindow(ctx context.Contex
 			canSubmit, err := vpa.CanValidatorSubmit(ctx, dataMarketAddr, epochID)
 			if err != nil {
 				errorMsg := err.Error()
-				isWindowClosedError := strings.Contains(errorMsg, "Submission window closed") ||
-					strings.Contains(errorMsg, "Submission window not open") ||
+				// "Submission window closed" = window has already passed (fatal)
+				// "Submission window not open" = window hasn't opened yet (recoverable)
+				isWindowClosedError := strings.Contains(errorMsg, "Submission window closed")
+				isWindowNotOpenError := strings.Contains(errorMsg, "Submission window not open") ||
 					strings.Contains(errorMsg, "execution reverted")
 
 				// Check for fatal errors that mean we should stop polling
-				isFatalError := strings.Contains(errorMsg, "Epoch not released") ||
+				isFatalError := isWindowClosedError ||
+					strings.Contains(errorMsg, "Epoch not released") ||
 					strings.Contains(errorMsg, "Priorities not assigned") ||
 					strings.Contains(errorMsg, "Validator not allowed to submit")
 
@@ -589,8 +601,8 @@ func (vpa *ValidatorPriorityAssigner) WaitForSubmissionWindow(ctx context.Contex
 					return fmt.Errorf("canValidatorSubmit failed: %w", err)
 				}
 
-				// Log errors that aren't "window closed" errors, or if we have many consecutive errors
-				if !isWindowClosedError {
+				// Log errors that aren't "window not open" errors, or if we have many consecutive errors
+				if !isWindowNotOpenError {
 					if pollCount%maxPollLogInterval == 0 || consecutiveErrors >= 5 {
 						logrus.WithError(err).WithFields(logrus.Fields{
 							"epoch":              epochID,
@@ -598,10 +610,10 @@ func (vpa *ValidatorPriorityAssigner) WaitForSubmissionWindow(ctx context.Contex
 							"polls":              pollCount,
 							"consecutive_errors": consecutiveErrors,
 							"vpa_contract":       vpa.contractAddr.Hex(),
-						}).Warn("⚠️ CanValidatorSubmit failed (not window closed error)")
+						}).Warn("⚠️ CanValidatorSubmit failed (not window not open error)")
 					}
 				} else {
-					// Log "window closed" errors periodically to show we're still polling
+					// Log "window not open" errors periodically to show we're still polling
 					if pollCount%maxPollLogInterval == 0 {
 						logrus.WithFields(logrus.Fields{
 							"epoch":       epochID,
