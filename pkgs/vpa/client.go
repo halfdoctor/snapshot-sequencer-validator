@@ -166,13 +166,15 @@ func (vpa *ValidatorPriorityAssigner) CanValidatorSubmit(ctx context.Context, da
 	}
 	result, err := vpa.client.CallContract(ctx, msg, nil)
 	if err != nil {
-		// Log detailed error information for debugging
+		errorMsg := err.Error()
 		logrus.WithError(err).WithFields(logrus.Fields{
 			"epoch":        epochID,
 			"data_market":  dataMarketAddr,
 			"vpa_contract": vpa.contractAddr.Hex(),
 			"validator":    vpa.validator.Hex(),
-		}).Debug("CanValidatorSubmit contract call failed")
+			"error_msg":    errorMsg,
+			"timestamp":    time.Now().Unix(),
+		}).Warn("CanValidatorSubmit contract call failed - check window config and epochReleaseTime")
 		return false, fmt.Errorf("failed to call canValidatorSubmit: %w", err)
 	}
 
@@ -510,11 +512,20 @@ func (vpa *ValidatorPriorityAssigner) WaitForSubmissionWindow(ctx context.Contex
 		// "Submission window closed" means window has already passed (fatal)
 		// "Submission window not open" means window hasn't opened yet (recoverable)
 		if strings.Contains(errorMsg, "Submission window closed") {
+			// Try to get current block to see what timestamp the contract sees
+			header, headerErr := vpa.client.HeaderByNumber(ctx, nil)
+			blockTimestamp := int64(0)
+			if headerErr == nil && header != nil {
+				blockTimestamp = int64(header.Time)
+			}
+
 			logrus.WithError(err).WithFields(logrus.Fields{
-				"epoch":        epochID,
-				"data_market":  dataMarketAddr,
-				"vpa_contract": vpa.contractAddr.Hex(),
-			}).Error("❌ Submission window has already closed")
+				"epoch":           epochID,
+				"data_market":     dataMarketAddr,
+				"vpa_contract":    vpa.contractAddr.Hex(),
+				"block_timestamp": blockTimestamp,
+				"error_msg":       errorMsg,
+			}).Error("❌ Submission window has already closed - check if block.timestamp matches expected window timing")
 			return fmt.Errorf("submission window closed: %w", err)
 		}
 		// "Submission window not open" or generic "execution reverted" - might open later, start polling
