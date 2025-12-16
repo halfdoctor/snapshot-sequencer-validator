@@ -8,10 +8,11 @@ services:
       # defaulting to expose on 6380 to avoid conflicts with existing redis which is the most common scenario
       - "127.0.0.1:${REDIS_EXTERNAL_PORT:-6380}:6379"
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 5s
+      test: ["CMD", "sh", "-c", "redis-cli ping | grep -q PONG && redis-cli set __healthcheck__ test >/dev/null 2>&1 && redis-cli del __healthcheck__ >/dev/null 2>&1"]
+      interval: 2s
       timeout: 3s
-      retries: 5
+      retries: 60
+      start_period: 10s
     networks:
       - sequencer-net
 
