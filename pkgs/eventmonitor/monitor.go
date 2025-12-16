@@ -711,25 +711,21 @@ func (m *EventMonitor) handleEpochReleased(event *EpochReleasedEvent) {
 		if !m.newDataMarketContracts[dataMarketLower] {
 			log.WithFields(log.Fields{
 				"data_market": dataMarketAddr,
-			}).Debug("Legacy data market - fetching snapshotSubmissionWindow from legacy ProtocolState contract")
-			// For legacy contracts, query snapshotSubmissionWindow() function
-			legacyWindow, err := m.fetchLegacySubmissionWindow(dataMarketAddr)
-			if err != nil {
-				log.WithError(err).WithFields(log.Fields{
-					"data_market": dataMarketAddr,
-				}).Warn("⚠️  Failed to fetch snapshotSubmissionWindow from legacy contract, using fallback duration")
-				windowDuration = m.windowDuration
-				useFallback = true
-			} else {
-				windowDuration = time.Duration(legacyWindow.Uint64()) * time.Second
-				useFallback = false // Successfully fetched from legacy contract
-				isLegacyContract = true
-				log.WithFields(log.Fields{
-					"data_market":     dataMarketAddr,
-					"window_duration": windowDuration,
-					"source":          "legacy_contract_snapshotSubmissionWindow",
-				}).Info("✅ Using snapshotSubmissionWindow from legacy ProtocolState contract - Level 1 finalization will trigger when submission window closes (after collecting snapshot CIDs)")
-			}
+			}).Debug("Legacy data market - checking if we should use fallback delay or legacy window")
+			// For legacy contracts, we have two options:
+			// 1. Use legacy contract's snapshotSubmissionWindow() if commit/reveal is enabled (legacy behavior)
+			// 2. Use LEVEL1_FINALIZATION_DELAY_SECONDS if commit/reveal is disabled (matches new contract timing)
+			// Since we can't easily check commit/reveal status for legacy contracts, and the user wants
+			// LEVEL1_FINALIZATION_DELAY_SECONDS to be respected, we'll use the fallback delay when commit/reveal is disabled.
+			// For now, always use fallback delay to ensure consistent timing with new contracts.
+			windowDuration = m.windowDuration
+			useFallback = true
+			isLegacyContract = true
+			log.WithFields(log.Fields{
+				"data_market":     dataMarketAddr,
+				"window_duration": windowDuration,
+				"source":          "LEVEL1_FINALIZATION_DELAY_SECONDS",
+			}).Info("✅ Using LEVEL1_FINALIZATION_DELAY_SECONDS for legacy contract - Level 1 finalization will trigger after delay (ensures timing matches new contract)")
 		} else {
 			log.WithFields(log.Fields{
 				"data_market": dataMarketAddr,

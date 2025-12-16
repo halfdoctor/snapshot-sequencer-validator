@@ -8,10 +8,11 @@ services:
       # defaulting to expose on 6380 to avoid conflicts with existing redis which is the most common scenario
       - "127.0.0.1:${REDIS_EXTERNAL_PORT:-6380}:6379"
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 5s
+      test: ["CMD", "sh", "-c", "redis-cli ping | grep -q PONG && redis-cli set __healthcheck__ test >/dev/null 2>&1 && redis-cli del __healthcheck__ >/dev/null 2>&1"]
+      interval: 2s
       timeout: 3s
-      retries: 5
+      retries: 60
+      start_period: 10s
     networks:
       - sequencer-net
 
@@ -226,6 +227,9 @@ services:
       - VPA_CONTRACT_ADDRESS=${VPA_CONTRACT_ADDRESS}
       - VPA_VALIDATOR_ADDRESS=${VPA_VALIDATOR_ADDRESS}
       - RELAYER_PY_ENDPOINT=${RELAYER_PY_ENDPOINT:-http://relayer-py:8080}
+      # Aggregation Configuration
+      - AGGREGATION_WINDOW_SECONDS=${AGGREGATION_WINDOW_SECONDS:-20}
+      - LEVEL1_FINALIZATION_DELAY_SECONDS=${LEVEL1_FINALIZATION_DELAY_SECONDS:-10}
     depends_on:
       redis:
         condition: service_healthy
