@@ -188,6 +188,84 @@ func (vpa *ValidatorPriorityAssigner) CanValidatorSubmit(ctx context.Context, da
 	return canSubmit, nil
 }
 
+// GetEpochReleaseTime gets the epoch release timestamp from DataMarket contract
+func (vpa *ValidatorPriorityAssigner) GetEpochReleaseTime(ctx context.Context, dataMarketAddr string, epochID uint64) (uint64, error) {
+	dataMarketABI, err := abiloader.LoadABI("DataMarket.json")
+	if err != nil {
+		return 0, fmt.Errorf("failed to parse DataMarket ABI: %w", err)
+	}
+
+	data, err := dataMarketABI.Pack("epochInfo", big.NewInt(int64(epochID)))
+	if err != nil {
+		return 0, fmt.Errorf("failed to pack epochInfo call: %w", err)
+	}
+
+	dataMarketAddress := common.HexToAddress(dataMarketAddr)
+	msg := ethereum.CallMsg{
+		To:   &dataMarketAddress,
+		Data: data,
+	}
+	result, err := vpa.client.CallContract(ctx, msg, nil)
+	if err != nil {
+		return 0, fmt.Errorf("failed to call epochInfo: %w", err)
+	}
+
+	var epochInfo struct {
+		Timestamp   *big.Int
+		Blocknumber *big.Int
+		EpochEnd    *big.Int
+	}
+	err = dataMarketABI.UnpackIntoInterface(&epochInfo, "epochInfo", result)
+	if err != nil {
+		return 0, fmt.Errorf("failed to unpack epochInfo result: %w", err)
+	}
+
+	if epochInfo.Timestamp == nil {
+		return 0, fmt.Errorf("epochInfo timestamp is nil")
+	}
+
+	return epochInfo.Timestamp.Uint64(), nil
+}
+
+// GetSubmissionWindows gets submission window config from DataMarket contract
+func (vpa *ValidatorPriorityAssigner) GetSubmissionWindows(ctx context.Context, dataMarketAddr string) (uint64, uint64, uint64, error) {
+	dataMarketABI, err := abiloader.LoadABI("DataMarket.json")
+	if err != nil {
+		return 0, 0, 0, fmt.Errorf("failed to parse DataMarket ABI: %w", err)
+	}
+
+	data, err := dataMarketABI.Pack("getSubmissionWindows")
+	if err != nil {
+		return 0, 0, 0, fmt.Errorf("failed to pack getSubmissionWindows call: %w", err)
+	}
+
+	dataMarketAddress := common.HexToAddress(dataMarketAddr)
+	msg := ethereum.CallMsg{
+		To:   &dataMarketAddress,
+		Data: data,
+	}
+	result, err := vpa.client.CallContract(ctx, msg, nil)
+	if err != nil {
+		return 0, 0, 0, fmt.Errorf("failed to call getSubmissionWindows: %w", err)
+	}
+
+	var windows struct {
+		PreSubmissionWindow *big.Int
+		P1SubmissionWindow  *big.Int
+		PNSubmissionWindow  *big.Int
+	}
+	err = dataMarketABI.UnpackIntoInterface(&windows, "getSubmissionWindows", result)
+	if err != nil {
+		return 0, 0, 0, fmt.Errorf("failed to unpack getSubmissionWindows result: %w", err)
+	}
+
+	if windows.PreSubmissionWindow == nil || windows.P1SubmissionWindow == nil || windows.PNSubmissionWindow == nil {
+		return 0, 0, 0, fmt.Errorf("unexpected nil values in getSubmissionWindows result")
+	}
+
+	return windows.PreSubmissionWindow.Uint64(), windows.P1SubmissionWindow.Uint64(), windows.PNSubmissionWindow.Uint64(), nil
+}
+
 // GetMyPriority gets this validator's priority for the given epoch and data market
 func (vpa *ValidatorPriorityAssigner) GetMyPriority(ctx context.Context, dataMarketAddr string, epochID uint64) (int, error) {
 	if !common.IsHexAddress(dataMarketAddr) {
@@ -503,8 +581,8 @@ func (vpa *ValidatorPriorityAssigner) IsTopPriority(ctx context.Context, dataMar
 }
 
 // WaitForSubmissionWindow waits until the validator can submit
-// It first checks if the window is already open, and only starts polling if it's not yet open
-func (vpa *ValidatorPriorityAssigner) WaitForSubmissionWindow(ctx context.Context, dataMarketAddr string, epochID uint64) error {
+// For priority > 1, calculates when the window should open and waits until then instead of polling
+func (vpa *ValidatorPriorityAssigner) WaitForSubmissionWindow(ctx context.Context, dataMarketAddr string, epochID uint64, priority int) error {
 	// First check: if window is already open, return immediately
 	canSubmit, err := vpa.CanValidatorSubmit(ctx, dataMarketAddr, epochID)
 	if err != nil {
@@ -554,21 +632,144 @@ func (vpa *ValidatorPriorityAssigner) WaitForSubmissionWindow(ctx context.Contex
 		return nil
 	}
 
-	// Window is not open yet, start polling
-	ticker := time.NewTicker(2 * time.Second) // Poll every 2 seconds instead of 1 to reduce RPC calls
+	// For priority > 1, calculate exact wait time from contract config
+	if priority > 1 {
+		// Get epoch release time and window config from contract
+		epochReleaseTime, err := vpa.GetEpochReleaseTime(ctx, dataMarketAddr, epochID)
+		if err != nil {
+			logrus.WithError(err).WithFields(logrus.Fields{
+				"epoch":       epochID,
+				"priority":    priority,
+				"data_market": dataMarketAddr,
+			}).Warn("Failed to get epochReleaseTime, falling back to polling")
+			// Fall through to polling logic below
+		} else {
+			preSubmissionWindow, p1SubmissionWindow, pNSubmissionWindow, err := vpa.GetSubmissionWindows(ctx, dataMarketAddr)
+			if err != nil {
+				logrus.WithError(err).WithFields(logrus.Fields{
+					"epoch":       epochID,
+					"priority":    priority,
+					"data_market": dataMarketAddr,
+				}).Warn("Failed to get submission windows, falling back to polling")
+				// Fall through to polling logic below
+			} else {
+				// Calculate when this priority's window opens
+				// Priority 2: epochReleaseTime + preSubmissionWindow + p1SubmissionWindow
+				// Priority 3: epochReleaseTime + preSubmissionWindow + p1SubmissionWindow + pNSubmissionWindow
+				// Priority N: epochReleaseTime + preSubmissionWindow + p1SubmissionWindow + (pNSubmissionWindow * (priority - 1))
+				windowStartTime := epochReleaseTime + preSubmissionWindow + p1SubmissionWindow + (pNSubmissionWindow * uint64(priority-1))
+
+				localTime := time.Now().Unix()
+				waitSeconds := int64(windowStartTime) - localTime
+
+				if waitSeconds <= 0 {
+					// Window should already be open, check immediately
+					canSubmit, err := vpa.CanValidatorSubmit(ctx, dataMarketAddr, epochID)
+					if err == nil && canSubmit {
+						logrus.WithFields(logrus.Fields{
+							"epoch":       epochID,
+							"priority":    priority,
+							"data_market": dataMarketAddr,
+						}).Info("✅ Submission window is open")
+						return nil
+					}
+					// Window closed or error - return
+					if err != nil && strings.Contains(err.Error(), "Submission window closed") {
+						return fmt.Errorf("submission window closed: %w", err)
+					}
+					return fmt.Errorf("submission window not open")
+				}
+
+				logrus.WithFields(logrus.Fields{
+					"epoch":             epochID,
+					"priority":          priority,
+					"data_market":       dataMarketAddr,
+					"wait_seconds":      waitSeconds,
+					"window_start_time": windowStartTime,
+					"local_time":        localTime,
+				}).Info("⏳ Priority > 1: Waiting for lower priority windows to close...")
+
+				// Wait until window should open
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-time.After(time.Duration(waitSeconds) * time.Second):
+					// Retry a few times after waiting - block.timestamp may not match local time exactly
+					maxRetries := 5
+					retryInterval := 2 * time.Second
+					for retry := 0; retry < maxRetries; retry++ {
+						canSubmit, err := vpa.CanValidatorSubmit(ctx, dataMarketAddr, epochID)
+						if err != nil {
+							errorMsg := err.Error()
+							if strings.Contains(errorMsg, "Submission window closed") {
+								logrus.WithError(err).WithFields(logrus.Fields{
+									"epoch":       epochID,
+									"priority":    priority,
+									"data_market": dataMarketAddr,
+								}).Error("❌ Submission window has already closed")
+								return fmt.Errorf("submission window closed: %w", err)
+							}
+							if retry < maxRetries-1 {
+								logrus.WithFields(logrus.Fields{
+									"epoch":          epochID,
+									"priority":       priority,
+									"data_market":    dataMarketAddr,
+									"retry":          retry + 1,
+									"max_retries":    maxRetries,
+									"retry_interval": retryInterval,
+								}).Debug("Window not open yet, retrying...")
+								select {
+								case <-ctx.Done():
+									return ctx.Err()
+								case <-time.After(retryInterval):
+									continue
+								}
+							}
+							logrus.WithError(err).WithFields(logrus.Fields{
+								"epoch":       epochID,
+								"priority":    priority,
+								"data_market": dataMarketAddr,
+								"retries":     maxRetries,
+							}).Warn("⚠️ Submission window still not open after waiting and retries")
+							return fmt.Errorf("submission window not open after wait: %w", err)
+						}
+						if canSubmit {
+							logrus.WithFields(logrus.Fields{
+								"epoch":       epochID,
+								"priority":    priority,
+								"data_market": dataMarketAddr,
+								"retries":     retry,
+							}).Info("✅ Submission window is now open")
+							return nil
+						}
+						if retry < maxRetries-1 {
+							select {
+							case <-ctx.Done():
+								return ctx.Err()
+							case <-time.After(retryInterval):
+								continue
+							}
+						}
+					}
+					return fmt.Errorf("submission window not open after %d retries", maxRetries)
+				}
+			}
+		}
+	}
+
+	// Priority 1: Poll normally since window opens immediately after preSubmissionWindow
+	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 
-	// Log first attempt
 	logrus.WithFields(logrus.Fields{
 		"epoch":       epochID,
+		"priority":    priority,
 		"data_market": dataMarketAddr,
 	}).Info("⏳ Waiting for submission window to open...")
 
 	pollCount := 0
-	maxPollLogInterval := 10 // Log every 10 polls (20 seconds) to avoid spam
-	lastErrorType := ""
-	consecutiveErrors := 0
-	maxConsecutiveErrors := 30 // Stop after 30 consecutive errors (1 minute) of the same type
+	maxPollLogInterval := 10
+	maxConsecutiveErrors := 10 // Reduced for priority 1
 
 	for {
 		select {
@@ -579,79 +780,38 @@ func (vpa *ValidatorPriorityAssigner) WaitForSubmissionWindow(ctx context.Contex
 			canSubmit, err := vpa.CanValidatorSubmit(ctx, dataMarketAddr, epochID)
 			if err != nil {
 				errorMsg := err.Error()
-				// "Submission window closed" = window has already passed (fatal)
-				// "Submission window not open" = window hasn't opened yet (recoverable)
-				isWindowClosedError := strings.Contains(errorMsg, "Submission window closed")
-				isWindowNotOpenError := strings.Contains(errorMsg, "Submission window not open") ||
-					strings.Contains(errorMsg, "execution reverted")
-
-				// Check for fatal errors that mean we should stop polling
-				isFatalError := isWindowClosedError ||
-					strings.Contains(errorMsg, "Epoch not released") ||
-					strings.Contains(errorMsg, "Priorities not assigned") ||
-					strings.Contains(errorMsg, "Validator not allowed to submit")
-
-				// Track consecutive errors of the same type
-				if errorMsg == lastErrorType {
-					consecutiveErrors++
-				} else {
-					consecutiveErrors = 1
-					lastErrorType = errorMsg
-				}
-
-				// If fatal error or too many consecutive errors, give up
-				if isFatalError || consecutiveErrors >= maxConsecutiveErrors {
+				if strings.Contains(errorMsg, "Submission window closed") {
 					logrus.WithError(err).WithFields(logrus.Fields{
-						"epoch":              epochID,
-						"data_market":        dataMarketAddr,
-						"polls":              pollCount,
-						"consecutive_errors": consecutiveErrors,
-						"vpa_contract":       vpa.contractAddr.Hex(),
-						"is_fatal":           isFatalError,
-					}).Error("❌ CanValidatorSubmit failed with fatal/unrecoverable error, stopping polling")
-					return fmt.Errorf("canValidatorSubmit failed: %w", err)
+						"epoch":       epochID,
+						"priority":    priority,
+						"data_market": dataMarketAddr,
+					}).Error("❌ Submission window has already closed")
+					return fmt.Errorf("submission window closed: %w", err)
 				}
-
-				// Log errors that aren't "window not open" errors, or if we have many consecutive errors
-				if !isWindowNotOpenError {
-					if pollCount%maxPollLogInterval == 0 || consecutiveErrors >= 5 {
-						logrus.WithError(err).WithFields(logrus.Fields{
-							"epoch":              epochID,
-							"data_market":        dataMarketAddr,
-							"polls":              pollCount,
-							"consecutive_errors": consecutiveErrors,
-							"vpa_contract":       vpa.contractAddr.Hex(),
-						}).Warn("⚠️ CanValidatorSubmit failed (not window not open error)")
-					}
-				} else {
-					// Log "window not open" errors periodically to show we're still polling
-					if pollCount%maxPollLogInterval == 0 {
-						logrus.WithFields(logrus.Fields{
-							"epoch":       epochID,
-							"data_market": dataMarketAddr,
-							"polls":       pollCount,
-							"elapsed":     time.Duration(pollCount*2) * time.Second,
-						}).Debug("Still waiting for submission window to open...")
-					}
+				if pollCount >= maxConsecutiveErrors {
+					logrus.WithError(err).WithFields(logrus.Fields{
+						"epoch":    epochID,
+						"priority": priority,
+						"polls":    pollCount,
+					}).Warn("⚠️ Max polls reached, stopping")
+					return fmt.Errorf("submission window not open after %d polls: %w", pollCount, err)
+				}
+				if pollCount%maxPollLogInterval == 0 {
+					logrus.WithFields(logrus.Fields{
+						"epoch":    epochID,
+						"priority": priority,
+						"polls":    pollCount,
+					}).Debug("Still waiting for submission window to open...")
 				}
 				continue
 			}
 			if canSubmit {
 				logrus.WithFields(logrus.Fields{
-					"epoch":       epochID,
-					"data_market": dataMarketAddr,
-					"polls":       pollCount,
+					"epoch":    epochID,
+					"priority": priority,
+					"polls":    pollCount,
 				}).Info("✅ Submission window is now open")
 				return nil
-			}
-			// Log progress every 10 polls (20 seconds) to show we're still waiting
-			if pollCount%maxPollLogInterval == 0 {
-				logrus.WithFields(logrus.Fields{
-					"epoch":       epochID,
-					"data_market": dataMarketAddr,
-					"polls":       pollCount,
-					"elapsed":     time.Duration(pollCount*2) * time.Second,
-				}).Debug("Still waiting for submission window to open...")
 			}
 		}
 	}

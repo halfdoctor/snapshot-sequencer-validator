@@ -1407,7 +1407,7 @@ func (a *Aggregator) submitBatchViaRelayer(epochID uint64, aggregatedBatch *cons
 	waitCtx, cancel := context.WithTimeout(a.ctx, 10*time.Minute)
 	defer cancel()
 
-	if err := a.vpaClient.WaitForSubmissionWindow(waitCtx, dataMarketAddr, epochID); err != nil {
+	if err := a.vpaClient.WaitForSubmissionWindow(waitCtx, dataMarketAddr, epochID, priority); err != nil {
 		if err == context.DeadlineExceeded {
 			log.WithFields(logrus.Fields{
 				"epoch":    epochIDStr,
