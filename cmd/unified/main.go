@@ -40,7 +40,7 @@ import (
 )
 
 // detectPrimaryComponent identifies the main component role for logging purposes
-func detectPrimaryComponent(enableListener, enableDequeuer, enableFinalizer, enableBatchAggregation, enableEventMonitor bool) string {
+func detectPrimaryComponent(enableListener, enableDequeuer, enableFinalizer, enableBatchAggregation, enableEventMonitor, enableProtocolStateCacher bool) string {
 	// Count enabled components
 	enabledCount := 0
 	primaryComponent := "unknown"
@@ -65,6 +65,10 @@ func detectPrimaryComponent(enableListener, enableDequeuer, enableFinalizer, ena
 		enabledCount++
 		primaryComponent = "event-monitor"
 	}
+	if enableProtocolStateCacher {
+		enabledCount++
+		primaryComponent = "protocol-state-cacher"
+	}
 
 	// If multiple components are enabled, return "multi-component"
 	if enabledCount > 1 {
@@ -87,6 +91,8 @@ func getComponentEmoji(component string) string {
 		return "📡"
 	case "batch-aggregator":
 		return "🔄"
+	case "protocol-state-cacher":
+		return "💾"
 	case "multi-component":
 		return "🔧"
 	default:
@@ -171,7 +177,7 @@ func main() {
 	enableEventMonitor := cfg.EnableEventMonitor
 
 	// Detect primary component for clear identification
-	primaryComponent := detectPrimaryComponent(enableListener, enableDequeuer, enableFinalizer, enableBatchAggregation, enableEventMonitor)
+	primaryComponent := detectPrimaryComponent(enableListener, enableDequeuer, enableFinalizer, enableBatchAggregation, enableEventMonitor, cfg.EnableProtocolStateCacher)
 	componentEmoji := getComponentEmoji(primaryComponent)
 
 	// Component-specific startup banner
@@ -195,6 +201,9 @@ func main() {
 		if enableEventMonitor {
 			log.Infof("  - Event Monitor: %v", enableEventMonitor)
 		}
+		if cfg.EnableProtocolStateCacher {
+			log.Infof("  - Protocol State Cacher: %v", cfg.EnableProtocolStateCacher)
+		}
 	} else {
 		componentName := strings.ToUpper(strings.ReplaceAll(primaryComponent, "-", " "))
 		log.Infof("========================================")
@@ -208,7 +217,7 @@ func main() {
 
 	// Initialize Redis if any component needs it
 	var redisClient *redis.Client
-	if enableListener || enableDequeuer || enableFinalizer || enableEventMonitor {
+	if enableListener || enableDequeuer || enableFinalizer || enableEventMonitor || cfg.EnableProtocolStateCacher {
 		redisAddr := fmt.Sprintf("%s:%s", cfg.RedisHost, cfg.RedisPort)
 		componentPrefix := strings.ToUpper(primaryComponent)
 		log.Infof("[%s] Connecting to Redis at %s (DB: %d)", componentPrefix, redisAddr, cfg.RedisDB)

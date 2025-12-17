@@ -103,12 +103,10 @@ func NewCacher(cfg *Config) (*Cacher, error) {
 	return cacher, nil
 }
 
-// Start starts the cacher component
+// Start starts the cacher component background services
+// Note: Cold sync should be performed synchronously via WaitForColdSync() before calling Start()
 func (c *Cacher) Start(ctx context.Context) {
-	log.Info("🚀 Starting protocol state cacher component...")
-
-	// Perform initial cold sync
-	go c.coldSync(ctx)
+	log.Info("🚀 Starting protocol state cacher background services...")
 
 	// Start event-driven updates
 	go func() {
@@ -120,7 +118,7 @@ func (c *Cacher) Start(ctx context.Context) {
 	// Start periodic fallback cold sync
 	go c.periodicColdSync(ctx)
 
-	log.Info("✅ Protocol state cacher component started")
+	log.Info("✅ Protocol state cacher background services started")
 }
 
 // WaitForColdSync checks if cold sync is needed and waits for it to complete
