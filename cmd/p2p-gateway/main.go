@@ -962,11 +962,15 @@ func (g *P2PGateway) handleIncomingBatches() {
 			}
 
 			// Mark epoch as active (with TTL to prevent unbounded growth)
+			// Note: We only set TTL if missing (don't refresh on every add)
+			// The set is also pruned periodically by state-tracker to remove old epochs
 			activeEpochsKey := g.keyBuilder.ActiveEpochs()
-			if err := g.redisClient.SAdd(g.ctx, activeEpochsKey, epochIDStr).Err(); err != nil {
+			added, err := g.redisClient.SAdd(g.ctx, activeEpochsKey, epochIDStr).Result()
+			if err != nil {
 				log.WithError(err).Error("Failed to add epoch to ActiveEpochs set")
-			} else {
-				// Set TTL if key doesn't already have one (24 hours - covers epoch lifecycle)
+			} else if added > 0 {
+				// Only set TTL if key doesn't already have one (24 hours - covers epoch lifecycle)
+				// This prevents unnecessary TTL refreshes that would prevent expiration
 				ttl := g.redisClient.TTL(g.ctx, activeEpochsKey).Val()
 				if ttl == -1 { // Key exists but has no TTL
 					g.redisClient.Expire(g.ctx, activeEpochsKey, 24*time.Hour)

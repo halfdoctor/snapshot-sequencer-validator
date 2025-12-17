@@ -835,12 +835,32 @@ func (m *EventMonitor) handleEpochReleased(event *EpochReleasedEvent) {
 	pipe.Expire(m.ctx, epochKey, 24*time.Hour)
 
 	// Also add to active epochs set (use namespaced keys)
+	// Only refresh TTL when adding NEW epochs (not when epoch already exists)
+	// The set is also pruned periodically by state-tracker to remove old epochs
 	kb := m.windowManager.getKeyBuilder(dataMarketAddr)
-	pipe.SAdd(m.ctx, kb.ActiveEpochs(), event.EpochID.String())
-	pipe.Expire(m.ctx, kb.ActiveEpochs(), 24*time.Hour)
+	activeEpochsKey := kb.ActiveEpochs()
+	pipe.SAdd(m.ctx, activeEpochsKey, event.EpochID.String())
 
-	if _, err := pipe.Exec(m.ctx); err != nil {
+	results, err := pipe.Exec(m.ctx)
+	if err != nil {
 		log.Errorf("Failed to store epoch info: %v", err)
+		return
+	}
+
+	// Check if epoch was actually added (new epoch) - SAdd returns 1 if added, 0 if already exists
+	// Pipeline order: [0] HMSet, [1] Expire(epochKey), [2] SAdd(activeEpochsKey)
+	if len(results) >= 3 {
+		if sAddResult, ok := results[2].(*redis.IntCmd); ok {
+			added := sAddResult.Val()
+			if added > 0 {
+				// Only refresh TTL when adding a NEW epoch
+				// Check if TTL exists first to avoid unnecessary refresh
+				ttl := m.redisClient.TTL(m.ctx, activeEpochsKey).Val()
+				if ttl == -1 { // Key exists but has no TTL
+					m.redisClient.Expire(m.ctx, activeEpochsKey, 24*time.Hour)
+				}
+			}
+		}
 	}
 
 	// Start submission window - this window is for collecting snapshot CIDs from snapshotter nodes

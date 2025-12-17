@@ -592,10 +592,16 @@ State-tracker prunes the following timeline zsets daily (removes entries older t
 #### ActiveEpochs SET Pruning
 The `{protocol}:{market}:epochs:active` SET is pruned periodically by state-tracker to remove epochs older than 7 days. This prevents unbounded growth when TTL keeps getting refreshed.
 
-**TTL Behavior**: TTL is only set when adding NEW epochs (not refreshed on every read). The set has a 24-hour TTL as a safety net, but relies on periodic pruning for cleanup.
+**TTL Behavior**: 
+- TTL is only refreshed when adding NEW epochs (not when epoch already exists)
+- Event monitor checks if epoch was actually added before refreshing TTL
+- P2P gateway only sets TTL if missing (doesn't refresh on every add)
+- The set has a 24-hour TTL as a safety net, but relies on periodic pruning for cleanup
 
 #### Legacy Queue Cleanup
-The `{protocol}:{market}:aggregation:queue` LIST is a legacy structure that may accumulate items. The cleanup script will warn if it exceeds 10K items. Consider running `cleanup_stale_queue.sh` to remove it if unused.
+The `{protocol}:{market}:aggregation:queue` LIST is a legacy structure that is not used by the active aggregation system (which uses Redis streams instead). 
+
+**Automated Cleanup**: State-tracker automatically deletes this queue if it exceeds 10K items to prevent unbounded growth. The cleanup script will also warn about it if it exceeds the threshold.
 
 #### Size Monitoring
 State-tracker monitors Redis key sizes and logs warnings if they exceed thresholds:
