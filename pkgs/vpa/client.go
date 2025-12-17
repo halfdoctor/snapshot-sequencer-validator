@@ -240,13 +240,14 @@ func (vpa *ValidatorPriorityAssigner) GetEpochReleaseTime(ctx context.Context, d
 // Uses a minimal ABI to avoid requiring DataMarket.json file
 func (vpa *ValidatorPriorityAssigner) GetSubmissionWindows(ctx context.Context, dataMarketAddr string) (uint64, uint64, uint64, error) {
 	// Use a minimal ABI for just getSubmissionWindows() to avoid needing DataMarket.json
+	// Note: matching contract return names exactly (including typo: preSubmisisonWindow)
 	minimalABI := `[{
 		"inputs": [],
 		"name": "getSubmissionWindows",
 		"outputs": [
-			{"internalType": "uint256", "name": "", "type": "uint256"},
-			{"internalType": "uint256", "name": "", "type": "uint256"},
-			{"internalType": "uint256", "name": "", "type": "uint256"}
+			{"internalType": "uint256", "name": "preSubmisisonWindow", "type": "uint256"},
+			{"internalType": "uint256", "name": "p1SubmissionWindow", "type": "uint256"},
+			{"internalType": "uint256", "name": "pNSubmissionWindow", "type": "uint256"}
 		],
 		"stateMutability": "view",
 		"type": "function"
@@ -272,21 +273,32 @@ func (vpa *ValidatorPriorityAssigner) GetSubmissionWindows(ctx context.Context, 
 		return 0, 0, 0, fmt.Errorf("failed to call getSubmissionWindows: %w", err)
 	}
 
-	var windows struct {
-		PreSubmissionWindow *big.Int
-		P1SubmissionWindow  *big.Int
-		PNSubmissionWindow  *big.Int
-	}
-	err = dataMarketABI.UnpackIntoInterface(&windows, "getSubmissionWindows", result)
+	// Unpack directly - struct field names must match ABI output names exactly
+	outputs, err := dataMarketABI.Unpack("getSubmissionWindows", result)
 	if err != nil {
 		return 0, 0, 0, fmt.Errorf("failed to unpack getSubmissionWindows result: %w", err)
 	}
 
-	if windows.PreSubmissionWindow == nil || windows.P1SubmissionWindow == nil || windows.PNSubmissionWindow == nil {
-		return 0, 0, 0, fmt.Errorf("unexpected nil values in getSubmissionWindows result")
+	if len(outputs) != 3 {
+		return 0, 0, 0, fmt.Errorf("unexpected number of outputs: expected 3, got %d", len(outputs))
 	}
 
-	return windows.PreSubmissionWindow.Uint64(), windows.P1SubmissionWindow.Uint64(), windows.PNSubmissionWindow.Uint64(), nil
+	preSubmissionWindow, ok := outputs[0].(*big.Int)
+	if !ok || preSubmissionWindow == nil {
+		return 0, 0, 0, fmt.Errorf("invalid type for preSubmissionWindow: %T", outputs[0])
+	}
+
+	p1SubmissionWindow, ok := outputs[1].(*big.Int)
+	if !ok || p1SubmissionWindow == nil {
+		return 0, 0, 0, fmt.Errorf("invalid type for p1SubmissionWindow: %T", outputs[1])
+	}
+
+	pNSubmissionWindow, ok := outputs[2].(*big.Int)
+	if !ok || pNSubmissionWindow == nil {
+		return 0, 0, 0, fmt.Errorf("invalid type for pNSubmissionWindow: %T", outputs[2])
+	}
+
+	return preSubmissionWindow.Uint64(), p1SubmissionWindow.Uint64(), pNSubmissionWindow.Uint64(), nil
 }
 
 // GetMyPriority gets this validator's priority for the given epoch and data market
@@ -657,14 +669,25 @@ func (vpa *ValidatorPriorityAssigner) WaitForSubmissionWindow(ctx context.Contex
 			}).Error("❌ Submission window has already closed - check if block.timestamp matches expected window timing")
 			return fmt.Errorf("submission window closed: %w", err)
 		}
-		// "Submission window not open" or generic "execution reverted" - might open later, start polling
+		// "Submission window not open" or generic "execution reverted" - might open later
+		// For priority > 1, we'll calculate wait time below; for priority 1, we'll poll
 		if strings.Contains(errorMsg, "Submission window not open") || strings.Contains(errorMsg, "execution reverted") {
-			logrus.WithFields(logrus.Fields{
-				"epoch":        epochID,
-				"data_market":  dataMarketAddr,
-				"vpa_contract": vpa.contractAddr.Hex(),
-				"error":        errorMsg,
-			}).Debug("Submission window not yet open, starting to poll...")
+			if priority > 1 {
+				logrus.WithFields(logrus.Fields{
+					"epoch":        epochID,
+					"priority":     priority,
+					"data_market":  dataMarketAddr,
+					"vpa_contract": vpa.contractAddr.Hex(),
+					"error":        errorMsg,
+				}).Debug("Submission window not yet open, will calculate wait time...")
+			} else {
+				logrus.WithFields(logrus.Fields{
+					"epoch":        epochID,
+					"data_market":  dataMarketAddr,
+					"vpa_contract": vpa.contractAddr.Hex(),
+					"error":        errorMsg,
+				}).Debug("Submission window not yet open, will start polling...")
+			}
 		} else {
 			// Other error, log it and return
 			logrus.WithError(err).WithFields(logrus.Fields{
@@ -768,7 +791,7 @@ func (vpa *ValidatorPriorityAssigner) WaitForSubmissionWindow(ctx context.Contex
 									"retry":          retry + 1,
 									"max_retries":    maxRetries,
 									"retry_interval": retryInterval,
-								}).Debug("Window not open yet, retrying...")
+								}).Debug("After priority specific wait: window not open yet, retrying...")
 								select {
 								case <-ctx.Done():
 									return ctx.Err()
@@ -808,15 +831,16 @@ func (vpa *ValidatorPriorityAssigner) WaitForSubmissionWindow(ctx context.Contex
 		}
 	}
 
-	// Priority 1: Poll normally since window opens immediately after preSubmissionWindow
-	ticker := time.NewTicker(2 * time.Second)
+	// Priority 1: Poll aggressively since window opens immediately after preSubmissionWindow
+	// With per block data markets, we need fast detection
+	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
 
 	logrus.WithFields(logrus.Fields{
 		"epoch":       epochID,
 		"priority":    priority,
 		"data_market": dataMarketAddr,
-	}).Info("⏳ Waiting for submission window to open...")
+	}).Info("⏳ Waiting for submission window to open (priority 1: polling every 500ms)...")
 
 	pollCount := 0
 	maxPollLogInterval := 10
