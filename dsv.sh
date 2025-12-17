@@ -204,7 +204,7 @@ start_services() {
         fi
 
         # Clone relayer-py repository (relative to current directory)
-        RELAYER_REPO="git@github.com:powerloom/relayer-py.git"
+        RELAYER_REPO="https://github.com/powerloom/relayer-py.git"
         RELAYER_DIR="./relayer-py"
 
         # Remove existing relayer-py directory if it exists
