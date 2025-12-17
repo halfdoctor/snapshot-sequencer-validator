@@ -15,11 +15,8 @@ RUN go mod download
 # Copy source code
 COPY . .
 
-# Build all binaries
+# Build unified binary (all components enabled/disabled via env vars)
 RUN go build -o bin/unified cmd/unified/main.go
-RUN go build -o bin/listener cmd/listener/main.go 2>/dev/null || true
-RUN go build -o bin/dequeuer cmd/dequeuer/main.go 2>/dev/null || true
-RUN go build -o bin/finalizer cmd/finalizer/main.go 2>/dev/null || true
 
 # Runtime stage
 FROM alpine:latest

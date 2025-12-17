@@ -123,7 +123,12 @@ type Settings struct {
 	StreamIdleTimeout   time.Duration // Idle timeout for stream consumers
 
 	// Slot Validation Configuration
-	EnableSlotValidation bool // Validate snapshotter addresses against protocol state cache (requires protocol-state-cacher)
+	EnableSlotValidation bool
+
+	// Protocol State Cacher Configuration
+	EnableProtocolStateCacher bool
+	SlotSyncInterval          time.Duration // Fallback cold sync interval
+	SlotSyncBatchSize         int           // Batch size for slot fetching // Validate snapshotter addresses against protocol state cache (requires protocol-state-cacher)
 
 	// IPFS Configuration
 	IPFSAPI string // IPFS API endpoint (e.g., "/ip4/127.0.0.1/tcp/5001")
@@ -262,6 +267,11 @@ func LoadConfig() error {
 
 		// Slot Validation Configuration
 		EnableSlotValidation: getBoolEnv("ENABLE_SLOT_VALIDATION", false),
+
+		// Protocol State Cacher Configuration
+		EnableProtocolStateCacher: getBoolEnv("ENABLE_PROTOCOL_STATE_CACHER", false),
+		SlotSyncInterval:          time.Duration(getEnvAsInt("SLOT_SYNC_INTERVAL_SECONDS", 3600)) * time.Second,
+		SlotSyncBatchSize:         getEnvAsInt("SLOT_SYNC_BATCH_SIZE", 20),
 
 		// API Configuration
 		APIHost:      getEnv("API_HOST", "0.0.0.0"),

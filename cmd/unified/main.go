@@ -13,6 +13,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/ethereum/go-ethereum/common"
 	"github.com/libp2p/go-libp2p"
 	dht "github.com/libp2p/go-libp2p-kad-dht"
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
@@ -30,6 +31,7 @@ import (
 	"github.com/powerloom/snapshot-sequencer-validator/pkgs/eventmonitor"
 	"github.com/powerloom/snapshot-sequencer-validator/pkgs/gossipconfig"
 	"github.com/powerloom/snapshot-sequencer-validator/pkgs/ipfs"
+	"github.com/powerloom/snapshot-sequencer-validator/pkgs/protocolstate"
 	rediskeys "github.com/powerloom/snapshot-sequencer-validator/pkgs/redis"
 	"github.com/powerloom/snapshot-sequencer-validator/pkgs/submissions"
 	"github.com/powerloom/snapshot-sequencer-validator/pkgs/workers"
@@ -472,9 +474,70 @@ func main() {
 		primaryComponent:       primaryComponent,
 	}
 
+	// Initialize protocol state cacher if enabled (required if slot validation is enabled)
+	var snapshotterStateAddr common.Address
+	if cfg.EnableSlotValidation && !cfg.EnableProtocolStateCacher {
+		log.Fatal("ENABLE_PROTOCOL_STATE_CACHER must be true when ENABLE_SLOT_VALIDATION is true")
+	}
+	if cfg.EnableProtocolStateCacher && redisClient != nil {
+		// Initialize RPC Helper for cacher
+		rpcConfig := cfg.ToRPCConfig()
+		if rpcConfig == nil || len(rpcConfig.Nodes) == 0 {
+			log.Fatal("POWERLOOM_RPC_NODES must be configured for protocol state cacher")
+		}
+
+		rpcHelper := rpchelper.NewRPCHelper(rpcConfig)
+		if err := rpcHelper.Initialize(context.Background()); err != nil {
+			log.Fatalf("Failed to initialize RPC helper for protocol state cacher: %v", err)
+		}
+
+		// Get SnapshotterState address from ProtocolState contract
+		var err error
+		snapshotterStateAddr, err = protocolstate.GetSnapshotterStateAddress(
+			context.Background(),
+			rpcHelper,
+			cfg.ProtocolStateContract,
+			cfg.ContractABIPath,
+		)
+		if err != nil {
+			log.Fatalf("Failed to get SnapshotterState address: %v", err)
+		}
+		log.Infof("✅ SnapshotterState contract address: %s", snapshotterStateAddr.Hex())
+
+		// Initialize cacher
+		cacherCfg := &protocolstate.Config{
+			RPCHelper:                rpcHelper,
+			ProtocolStateContract:    cfg.ProtocolStateContract,
+			SnapshotterStateContract: snapshotterStateAddr.Hex(),
+			ContractABIPath:          cfg.ContractABIPath,
+			RedisClient:              redisClient,
+			SlotSyncInterval:         cfg.SlotSyncInterval,
+			SlotSyncBatchSize:        cfg.SlotSyncBatchSize,
+		}
+
+		cacher, err := protocolstate.NewCacher(cacherCfg)
+		if err != nil {
+			log.Fatalf("Failed to create protocol state cacher: %v", err)
+		}
+
+		// Wait for cold sync to complete before starting other components
+		log.Info("⏳ Waiting for protocol state cold sync to complete...")
+		if err := cacher.WaitForColdSync(context.Background()); err != nil {
+			log.Fatalf("Cold sync failed: %v", err)
+		}
+
+		// Start cacher background services (event processor, periodic sync)
+		sequencer.wg.Add(1)
+		go func() {
+			defer sequencer.wg.Done()
+			cacher.Start(sequencer.ctx)
+		}()
+		log.Info("✅ Protocol state cacher component started")
+	}
+
 	// Initialize components based on flags
 	if enableDequeuer && redisClient != nil {
-		dequeuer, err := submissions.NewDequeuer(redisClient, keyBuilder, sequencerID, cfg.ChainID, cfg.ProtocolStateContract, cfg.EnableSlotValidation)
+		dequeuer, err := submissions.NewDequeuer(redisClient, keyBuilder, sequencerID, cfg.ChainID, cfg.ProtocolStateContract, snapshotterStateAddr, cfg.EnableSlotValidation)
 		if err != nil {
 			log.Fatalf("Failed to create dequeuer: %v", err)
 		}
