@@ -23,6 +23,7 @@ import argparse
 import redis
 import json
 import re
+import time
 from typing import List, Set, Tuple
 from collections import defaultdict
 
@@ -35,75 +36,88 @@ class RedisCleanup:
         self.stats = defaultdict(int)
 
     def get_current_epoch(self) -> int:
-        """Get current epoch from Redis."""
-        # Try to get from metrics:current_epoch key
-        if self.protocol and self.market:
-            current_epoch_key = f"{self.protocol}:{self.market}:metrics:current_epoch"
-            try:
-                data = self.redis_client.get(current_epoch_key)
-                if data:
-                    epoch_info = json.loads(data)
-                    epoch_id = epoch_info.get('epoch_id', '')
-                    if epoch_id:
-                        # Extract numeric epoch ID
-                        epoch_num = self._extract_epoch_number(epoch_id)
-                        if epoch_num is not None:
-                            print(f"✓ Found current epoch from metrics: {epoch_num}")
-                            return epoch_num
-            except Exception as e:
-                print(f"⚠ Could not get current epoch from metrics: {e}")
+        """Get current epoch from Redis using consistent method for both dry-run and live mode."""
+        if not self.protocol or not self.market:
+            raise ValueError("Protocol and market must be specified")
+        
+        # Try methods in order of reliability, collecting all results for validation
+        candidates = []
+        
+        # Method 1: Try to get from metrics:current_epoch key (most reliable)
+        current_epoch_key = f"{self.protocol}:{self.market}:metrics:current_epoch"
+        try:
+            data = self.redis_client.get(current_epoch_key)
+            if data:
+                epoch_info = json.loads(data)
+                epoch_id = epoch_info.get('epoch_id', '')
+                if epoch_id:
+                    epoch_num = self._extract_epoch_number(epoch_id)
+                    if epoch_num is not None:
+                        candidates.append(('metrics', epoch_num))
+        except Exception as e:
+            print(f"⚠ Could not get current epoch from metrics: {e}")
 
-        # Try to get from ActiveEpochs SET
-        if self.protocol and self.market:
-            active_epochs_key = f"{self.protocol}:{self.market}:epochs:active"
-            try:
-                epochs = self.redis_client.smembers(active_epochs_key)
-                if epochs:
-                    # Get the highest epoch number
-                    epoch_nums = [self._extract_epoch_number(e) for e in epochs]
-                    epoch_nums = [e for e in epoch_nums if e is not None]
-                    if epoch_nums:
-                        current = max(epoch_nums)
-                        print(f"✓ Found current epoch from ActiveEpochs: {current}")
-                        return current
-            except Exception as e:
-                print(f"⚠ Could not get current epoch from ActiveEpochs: {e}")
+        # Method 2: Try to get from ActiveEpochs SET (fallback)
+        active_epochs_key = f"{self.protocol}:{self.market}:epochs:active"
+        try:
+            epochs = self.redis_client.smembers(active_epochs_key)
+            if epochs:
+                epoch_nums = [self._extract_epoch_number(e) for e in epochs]
+                epoch_nums = [e for e in epoch_nums if e is not None]
+                if epoch_nums:
+                    current = max(epoch_nums)
+                    candidates.append(('ActiveEpochs', current))
+        except Exception as e:
+            print(f"⚠ Could not get current epoch from ActiveEpochs: {e}")
 
-        # Try to get from timeline (most recent open epoch)
-        if self.protocol and self.market:
-            timeline_key = f"{self.protocol}:{self.market}:metrics:epochs:timeline"
-            try:
-                # Get last 10 entries
-                entries = self.redis_client.zrevrange(timeline_key, 0, 9, withscores=True)
-                for entry, score in entries:
-                    if entry.startswith('open:'):
-                        epoch_id = entry.split(':', 1)[1]
-                        epoch_num = self._extract_epoch_number(epoch_id)
-                        if epoch_num is not None:
-                            print(f"✓ Found current epoch from timeline: {epoch_num}")
-                            return epoch_num
-            except Exception as e:
-                print(f"⚠ Could not get current epoch from timeline: {e}")
+        # Method 3: Try to get from timeline (most recent open epoch)
+        timeline_key = f"{self.protocol}:{self.market}:metrics:epochs:timeline"
+        try:
+            entries = self.redis_client.zrevrange(timeline_key, 0, 9, withscores=True)
+            for entry, score in entries:
+                if entry.startswith('open:'):
+                    epoch_id = entry.split(':', 1)[1]
+                    epoch_num = self._extract_epoch_number(epoch_id)
+                    if epoch_num is not None:
+                        candidates.append(('timeline', epoch_num))
+                        break
+        except Exception as e:
+            print(f"⚠ Could not get current epoch from timeline: {e}")
+
+        # Validate consistency: if we have multiple candidates, they should be close
+        if candidates:
+            # Prefer metrics, then ActiveEpochs, then timeline
+            source_order = {'metrics': 0, 'ActiveEpochs': 1, 'timeline': 2}
+            candidates.sort(key=lambda x: (source_order.get(x[0], 99), -x[1]))
+            
+            selected = candidates[0]
+            selected_epoch = selected[1]
+            
+            # Warn if there's significant discrepancy (> 100 epochs)
+            for source, epoch in candidates[1:]:
+                if abs(epoch - selected_epoch) > 100:
+                    print(f"⚠ Warning: Epoch mismatch detected - {selected[0]}: {selected_epoch}, {source}: {epoch}")
+            
+            print(f"✓ Found current epoch from {selected[0]}: {selected_epoch}")
+            return selected_epoch
 
         # Fallback: scan for highest epoch number in epoch state keys
         print("⚠ Could not determine current epoch from standard keys, scanning...")
-        if self.protocol and self.market:
-            pattern = f"{self.protocol}:{self.market}:epoch:*:state"
-            try:
-                max_epoch = 0
-                for key in self.redis_client.scan_iter(match=pattern, count=100):
-                    # Extract epoch ID from key
-                    parts = key.split(':')
-                    if len(parts) >= 4:
-                        epoch_id = parts[3]
-                        epoch_num = self._extract_epoch_number(epoch_id)
-                        if epoch_num is not None and epoch_num > max_epoch:
-                            max_epoch = epoch_num
-                if max_epoch > 0:
-                    print(f"✓ Found current epoch from scanning: {max_epoch}")
-                    return max_epoch
-            except Exception as e:
-                print(f"⚠ Could not scan for current epoch: {e}")
+        pattern = f"{self.protocol}:{self.market}:epoch:*:state"
+        try:
+            max_epoch = 0
+            for key in self.redis_client.scan_iter(match=pattern, count=100):
+                parts = key.split(':')
+                if len(parts) >= 4:
+                    epoch_id = parts[3]
+                    epoch_num = self._extract_epoch_number(epoch_id)
+                    if epoch_num is not None and epoch_num > max_epoch:
+                        max_epoch = epoch_num
+            if max_epoch > 0:
+                print(f"✓ Found current epoch from scanning: {max_epoch}")
+                return max_epoch
+        except Exception as e:
+            print(f"⚠ Could not scan for current epoch: {e}")
 
         raise ValueError("Could not determine current epoch. Please specify --protocol and --market")
 
@@ -172,6 +186,9 @@ class RedisCleanup:
                 print(f"⚠ Error scanning pattern {pattern}: {e}")
 
         # Clean up timeline keys older than cutoff (by score/timestamp)
+        # Timeline zsets use Unix timestamps as scores, not epoch numbers
+        cutoff_timestamp = int(time.time()) - (keep_epochs * 60)  # Keep last N epochs (assuming ~1 epoch per minute)
+        
         if self.protocol and self.market:
             timeline_keys = [
                 f"{self.protocol}:{self.market}:metrics:epochs:timeline",
@@ -190,20 +207,54 @@ class RedisCleanup:
 
             for timeline_key in timeline_keys:
                 try:
-                    # Get cutoff timestamp (assuming epochs are ~30 seconds)
-                    # Use a conservative estimate: cutoff_epoch * 30 seconds
-                    cutoff_timestamp = cutoff_epoch * 30
+                    # Check if key exists first
+                    if not self.redis_client.exists(timeline_key):
+                        continue
                     
-                    # Remove entries older than cutoff
+                    # Remove entries older than cutoff timestamp
+                    # Timeline zsets use Unix timestamps as scores
                     removed = self.redis_client.zremrangebyscore(
-                        timeline_key, 0, cutoff_timestamp
+                        timeline_key, "-inf", cutoff_timestamp
                     )
                     if removed > 0:
                         self.stats[f"{timeline_key} (timeline)"] = removed
-                        print(f"  ✓ Removed {removed} entries from {timeline_key}")
+                        print(f"  ✓ Removed {removed} entries from {timeline_key} (cutoff: {cutoff_timestamp})")
                 except Exception as e:
                     if "no such key" not in str(e).lower():
                         print(f"⚠ Error cleaning timeline {timeline_key}: {e}")
+        
+        # Prune epochs:active SET to remove old epochs
+        if self.protocol and self.market:
+            active_epochs_key = f"{self.protocol}:{self.market}:epochs:active"
+            try:
+                if self.redis_client.exists(active_epochs_key):
+                    epochs = self.redis_client.smembers(active_epochs_key)
+                    epochs_to_remove = []
+                    for epoch_str in epochs:
+                        epoch_num = self._extract_epoch_number(epoch_str)
+                        if epoch_num is not None and epoch_num < cutoff_epoch:
+                            epochs_to_remove.append(epoch_str)
+                    
+                    if epochs_to_remove:
+                        removed = self.redis_client.srem(active_epochs_key, *epochs_to_remove)
+                        if removed > 0:
+                            self.stats[f"{active_epochs_key} (set)"] = removed
+                            print(f"  ✓ Removed {removed} old epochs from {active_epochs_key}")
+            except Exception as e:
+                print(f"⚠ Error pruning {active_epochs_key}: {e}")
+        
+        # Clean up legacy aggregation:queue LIST if it exceeds threshold
+        if self.protocol and self.market:
+            aggregation_queue_key = f"{self.protocol}:{self.market}:aggregation:queue"
+            try:
+                queue_length = self.redis_client.llen(aggregation_queue_key)
+                if queue_length > 10000:  # Threshold: 10K items
+                    print(f"  ⚠ Legacy aggregation:queue has {queue_length} items (threshold: 10000)")
+                    print(f"  💡 Consider running cleanup_stale_queue.sh to remove unused legacy queue")
+                    self.stats[f"{aggregation_queue_key} (legacy)"] = queue_length
+            except Exception as e:
+                if "no such key" not in str(e).lower():
+                    print(f"⚠ Error checking {aggregation_queue_key}: {e}")
 
         return keys_to_delete
 
