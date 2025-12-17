@@ -240,13 +240,14 @@ func (vpa *ValidatorPriorityAssigner) GetEpochReleaseTime(ctx context.Context, d
 // Uses a minimal ABI to avoid requiring DataMarket.json file
 func (vpa *ValidatorPriorityAssigner) GetSubmissionWindows(ctx context.Context, dataMarketAddr string) (uint64, uint64, uint64, error) {
 	// Use a minimal ABI for just getSubmissionWindows() to avoid needing DataMarket.json
+	// Note: matching contract return names exactly (including typo: preSubmisisonWindow)
 	minimalABI := `[{
 		"inputs": [],
 		"name": "getSubmissionWindows",
 		"outputs": [
-			{"internalType": "uint256", "name": "", "type": "uint256"},
-			{"internalType": "uint256", "name": "", "type": "uint256"},
-			{"internalType": "uint256", "name": "", "type": "uint256"}
+			{"internalType": "uint256", "name": "preSubmisisonWindow", "type": "uint256"},
+			{"internalType": "uint256", "name": "p1SubmissionWindow", "type": "uint256"},
+			{"internalType": "uint256", "name": "pNSubmissionWindow", "type": "uint256"}
 		],
 		"stateMutability": "view",
 		"type": "function"
