@@ -273,21 +273,32 @@ func (vpa *ValidatorPriorityAssigner) GetSubmissionWindows(ctx context.Context, 
 		return 0, 0, 0, fmt.Errorf("failed to call getSubmissionWindows: %w", err)
 	}
 
-	var windows struct {
-		PreSubmissionWindow *big.Int
-		P1SubmissionWindow  *big.Int
-		PNSubmissionWindow  *big.Int
-	}
-	err = dataMarketABI.UnpackIntoInterface(&windows, "getSubmissionWindows", result)
+	// Unpack directly - struct field names must match ABI output names exactly
+	outputs, err := dataMarketABI.Unpack("getSubmissionWindows", result)
 	if err != nil {
 		return 0, 0, 0, fmt.Errorf("failed to unpack getSubmissionWindows result: %w", err)
 	}
 
-	if windows.PreSubmissionWindow == nil || windows.P1SubmissionWindow == nil || windows.PNSubmissionWindow == nil {
-		return 0, 0, 0, fmt.Errorf("unexpected nil values in getSubmissionWindows result")
+	if len(outputs) != 3 {
+		return 0, 0, 0, fmt.Errorf("unexpected number of outputs: expected 3, got %d", len(outputs))
 	}
 
-	return windows.PreSubmissionWindow.Uint64(), windows.P1SubmissionWindow.Uint64(), windows.PNSubmissionWindow.Uint64(), nil
+	preSubmissionWindow, ok := outputs[0].(*big.Int)
+	if !ok || preSubmissionWindow == nil {
+		return 0, 0, 0, fmt.Errorf("invalid type for preSubmissionWindow: %T", outputs[0])
+	}
+
+	p1SubmissionWindow, ok := outputs[1].(*big.Int)
+	if !ok || p1SubmissionWindow == nil {
+		return 0, 0, 0, fmt.Errorf("invalid type for p1SubmissionWindow: %T", outputs[1])
+	}
+
+	pNSubmissionWindow, ok := outputs[2].(*big.Int)
+	if !ok || pNSubmissionWindow == nil {
+		return 0, 0, 0, fmt.Errorf("invalid type for pNSubmissionWindow: %T", outputs[2])
+	}
+
+	return preSubmissionWindow.Uint64(), p1SubmissionWindow.Uint64(), pNSubmissionWindow.Uint64(), nil
 }
 
 // GetMyPriority gets this validator's priority for the given epoch and data market
