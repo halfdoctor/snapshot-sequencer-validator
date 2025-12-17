@@ -474,11 +474,51 @@ func main() {
 		primaryComponent:       primaryComponent,
 	}
 
-	// Initialize protocol state cacher if enabled (required if slot validation is enabled)
+	// Wait for cold sync completion if slot validation is enabled
+	// This applies to ALL components, not just dequeuer, since slot validation
+	// affects the entire node's ability to process submissions correctly
 	var snapshotterStateAddr common.Address
-	if cfg.EnableSlotValidation && !cfg.EnableProtocolStateCacher {
-		log.Fatal("ENABLE_PROTOCOL_STATE_CACHER must be true when ENABLE_SLOT_VALIDATION is true")
+	if cfg.EnableSlotValidation && redisClient != nil {
+		if !cfg.EnableProtocolStateCacher {
+			log.Fatal("ENABLE_PROTOCOL_STATE_CACHER must be true when ENABLE_SLOT_VALIDATION is true")
+		}
+
+		// Get SnapshotterState address from ProtocolState contract (needed for Redis key)
+		rpcConfig := cfg.ToRPCConfig()
+		if rpcConfig == nil || len(rpcConfig.Nodes) == 0 {
+			log.Fatal("POWERLOOM_RPC_NODES must be configured for slot validation")
+		}
+
+		rpcHelper := rpchelper.NewRPCHelper(rpcConfig)
+		if err := rpcHelper.Initialize(context.Background()); err != nil {
+			log.Fatalf("Failed to initialize RPC helper for slot validation: %v", err)
+		}
+
+		var err error
+		snapshotterStateAddr, err = protocolstate.GetSnapshotterStateAddress(
+			context.Background(),
+			rpcHelper,
+			cfg.ProtocolStateContract,
+			cfg.ContractABIPath,
+		)
+		if err != nil {
+			log.Fatalf("Failed to get SnapshotterState address: %v", err)
+		}
+
+		// Wait for cacher service to complete cold sync (max 10 minutes)
+		if err := protocolstate.WaitForColdSyncCompletion(
+			context.Background(),
+			redisClient,
+			cfg.ProtocolStateContract,
+			snapshotterStateAddr.Hex(),
+			cfg.SlotSyncInterval,
+			10*time.Minute,
+		); err != nil {
+			log.Fatalf("Failed to wait for cold sync completion: %v", err)
+		}
 	}
+
+	// Initialize protocol state cacher if enabled (runs the cacher service)
 	if cfg.EnableProtocolStateCacher && redisClient != nil {
 		// Initialize RPC Helper for cacher
 		rpcConfig := cfg.ToRPCConfig()
@@ -493,14 +533,17 @@ func main() {
 
 		// Get SnapshotterState address from ProtocolState contract
 		var err error
-		snapshotterStateAddr, err = protocolstate.GetSnapshotterStateAddress(
-			context.Background(),
-			rpcHelper,
-			cfg.ProtocolStateContract,
-			cfg.ContractABIPath,
-		)
-		if err != nil {
-			log.Fatalf("Failed to get SnapshotterState address: %v", err)
+		if snapshotterStateAddr == (common.Address{}) {
+			// Only fetch if not already fetched above
+			snapshotterStateAddr, err = protocolstate.GetSnapshotterStateAddress(
+				context.Background(),
+				rpcHelper,
+				cfg.ProtocolStateContract,
+				cfg.ContractABIPath,
+			)
+			if err != nil {
+				log.Fatalf("Failed to get SnapshotterState address: %v", err)
+			}
 		}
 		log.Infof("✅ SnapshotterState contract address: %s", snapshotterStateAddr.Hex())
 
@@ -520,8 +563,8 @@ func main() {
 			log.Fatalf("Failed to create protocol state cacher: %v", err)
 		}
 
-		// Wait for cold sync to complete before starting other components
-		log.Info("⏳ Waiting for protocol state cold sync to complete...")
+		// Perform initial cold sync synchronously
+		log.Info("🔄 Starting protocol state cacher cold sync...")
 		if err := cacher.WaitForColdSync(context.Background()); err != nil {
 			log.Fatalf("Cold sync failed: %v", err)
 		}

@@ -88,6 +88,11 @@ services:
       - POWERLOOM_RPC_NODES=${POWERLOOM_RPC_NODES}
       # Slot Validation (uses cached data from protocol-state-cacher service)
       - ENABLE_SLOT_VALIDATION=${ENABLE_SLOT_VALIDATION:-false}
+      # Protocol State Cacher - indicates cacher service exists (for slot validation dependency check)
+      - ENABLE_PROTOCOL_STATE_CACHER=${ENABLE_PROTOCOL_STATE_CACHER:-false}
+      # Protocol State Cacher Configuration (needed to check cold sync status)
+      - SLOT_SYNC_INTERVAL_SECONDS=${SLOT_SYNC_INTERVAL_SECONDS:-3600}
+      - CONTRACT_ABI_PATH=${CONTRACT_ABI_PATH:-./abi/LegacyProtocolState.json}
     depends_on:
       redis:
         condition: service_healthy
