@@ -669,14 +669,25 @@ func (vpa *ValidatorPriorityAssigner) WaitForSubmissionWindow(ctx context.Contex
 			}).Error("❌ Submission window has already closed - check if block.timestamp matches expected window timing")
 			return fmt.Errorf("submission window closed: %w", err)
 		}
-		// "Submission window not open" or generic "execution reverted" - might open later, start polling
+		// "Submission window not open" or generic "execution reverted" - might open later
+		// For priority > 1, we'll calculate wait time below; for priority 1, we'll poll
 		if strings.Contains(errorMsg, "Submission window not open") || strings.Contains(errorMsg, "execution reverted") {
-			logrus.WithFields(logrus.Fields{
-				"epoch":        epochID,
-				"data_market":  dataMarketAddr,
-				"vpa_contract": vpa.contractAddr.Hex(),
-				"error":        errorMsg,
-			}).Debug("Submission window not yet open, starting to poll...")
+			if priority > 1 {
+				logrus.WithFields(logrus.Fields{
+					"epoch":        epochID,
+					"priority":     priority,
+					"data_market":  dataMarketAddr,
+					"vpa_contract": vpa.contractAddr.Hex(),
+					"error":        errorMsg,
+				}).Debug("Submission window not yet open, will calculate wait time...")
+			} else {
+				logrus.WithFields(logrus.Fields{
+					"epoch":        epochID,
+					"data_market":  dataMarketAddr,
+					"vpa_contract": vpa.contractAddr.Hex(),
+					"error":        errorMsg,
+				}).Debug("Submission window not yet open, will start polling...")
+			}
 		} else {
 			// Other error, log it and return
 			logrus.WithError(err).WithFields(logrus.Fields{
@@ -780,7 +791,7 @@ func (vpa *ValidatorPriorityAssigner) WaitForSubmissionWindow(ctx context.Contex
 									"retry":          retry + 1,
 									"max_retries":    maxRetries,
 									"retry_interval": retryInterval,
-								}).Debug("Window not open yet, retrying...")
+								}).Debug("After priority specific wait: window not open yet, retrying...")
 								select {
 								case <-ctx.Done():
 									return ctx.Err()
@@ -820,15 +831,16 @@ func (vpa *ValidatorPriorityAssigner) WaitForSubmissionWindow(ctx context.Contex
 		}
 	}
 
-	// Priority 1: Poll normally since window opens immediately after preSubmissionWindow
-	ticker := time.NewTicker(2 * time.Second)
+	// Priority 1: Poll aggressively since window opens immediately after preSubmissionWindow
+	// With per block data markets, we need fast detection
+	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
 
 	logrus.WithFields(logrus.Fields{
 		"epoch":       epochID,
 		"priority":    priority,
 		"data_market": dataMarketAddr,
-	}).Info("⏳ Waiting for submission window to open...")
+	}).Info("⏳ Waiting for submission window to open (priority 1: polling every 500ms)...")
 
 	pollCount := 0
 	maxPollLogInterval := 10
