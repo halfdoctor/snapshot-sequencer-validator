@@ -21,10 +21,14 @@ P2P Gateway ←→ Redis ←→ Dequeuer
 
 #### Active Epoch Management
 - `ActiveEpochs()` - SET: Currently active epoch IDs
-  - Written by: Event Monitor
+  - Written by: Event Monitor, P2P Gateway
   - Read by: State Tracker (deterministic aggregation)
   - Purpose: Direct access to active epochs instead of SCAN operations
   - Format: Set of epoch IDs
+  - **TTL**: 24 hours (set when adding new epochs, not refreshed on reads)
+  - **Pruning**: State-tracker removes epochs older than 7 days periodically
+  - **Monitoring**: Alert if size exceeds 100K members
+  - **Note**: TTL refresh is optimized to only occur when adding NEW epochs, preventing unnecessary refreshes
 
 - `EpochValidators({epochId})` - SET: Validator IDs participating in each epoch
   - Written by: Event Monitor/Aggregator
@@ -56,6 +60,9 @@ P2P Gateway ←→ Redis ←→ Dequeuer
   - Written by: P2P Gateway (when batch received)
   - Read by: Aggregator (Level 2)
   - Format: epochId as string
+  - **Status**: Legacy queue (may be unused in current implementation)
+  - **Cleanup**: Cleanup script warns if exceeds 10K items
+  - **Note**: Consider running `cleanup_stale_queue.sh` if this queue is not actively used
 
 - `validator:active:{validatorId}` - STRING: Active validator tracking
   - Written by: P2P Gateway
@@ -254,9 +261,11 @@ P2P Gateway ←→ Redis ←→ Dequeuer
 - `{protocol}:{market}:metrics:validations:timeline` - ZSET: Validation completion events
   - Written by: Dequeuer (ProcessSubmission)
   - Read by: State-Tracker (for validation metrics)
-  - No TTL (pruned daily by state-tracker)
+  - No TTL (pruned daily by state-tracker - CRITICAL: must be pruned to prevent unbounded growth)
   - Format: Sorted set by timestamp
   - Members: submissionId
+  - **Pruning**: State-tracker removes entries older than 24 hours daily
+  - **Monitoring**: Alert if size exceeds 1M members
 
 #### Validator-Specific Tracking
 - `{protocol}:{market}:metrics:validator:{validatorId}:batches` - ZSET: Per-validator batch timeline
@@ -570,6 +579,34 @@ Event Monitor → ActiveEpochs SET + EpochValidators({epochId}) SET + metrics:ep
 - **Health status**: 5 minutes (component monitoring)
 
 ### Pruning Strategy
-- **Timeline pruning**: Daily cleanup of events older than 24 hours
-- **Deterministic sets**: Keep based on epoch activity (managed by ActiveEpochs)
-- **Metrics aggregation**: State-tracker manages rolling windows
+
+#### Timeline Pruning (CRITICAL)
+State-tracker prunes the following timeline zsets daily (removes entries older than 24 hours):
+- `{protocol}:{market}:metrics:epochs:timeline` ✅
+- `{protocol}:{market}:metrics:batches:timeline` ✅
+- `{protocol}:{market}:metrics:submissions:timeline` ✅ (Fixed - was missing)
+- `{protocol}:{market}:metrics:validations:timeline` ✅ (Fixed - was missing)
+
+**Note**: If pruning fails, these zsets will grow unbounded. Monitor key sizes and alert if they exceed 1M members.
+
+#### ActiveEpochs SET Pruning
+The `{protocol}:{market}:epochs:active` SET is pruned periodically by state-tracker to remove epochs older than 7 days. This prevents unbounded growth when TTL keeps getting refreshed.
+
+**TTL Behavior**: TTL is only set when adding NEW epochs (not refreshed on every read). The set has a 24-hour TTL as a safety net, but relies on periodic pruning for cleanup.
+
+#### Legacy Queue Cleanup
+The `{protocol}:{market}:aggregation:queue` LIST is a legacy structure that may accumulate items. The cleanup script will warn if it exceeds 10K items. Consider running `cleanup_stale_queue.sh` to remove it if unused.
+
+#### Size Monitoring
+State-tracker monitors Redis key sizes and logs warnings if they exceed thresholds:
+- **ZSETs**: Alert if > 1M members
+- **SETs**: Alert if > 100K members
+- **LISTs**: Alert if > 10K items
+
+### Deterministic Sets
+- **ActiveEpochs**: Pruned periodically (removes epochs older than 7 days)
+- **EpochValidators**: Managed per epoch, cleaned up with epoch state
+- **EpochSubmissionsIds**: Managed per epoch, cleaned up with epoch state
+
+### Metrics Aggregation
+State-tracker manages rolling windows for metrics aggregation. Timeline keys are the source of truth and must be pruned regularly.
