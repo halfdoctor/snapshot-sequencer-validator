@@ -4,10 +4,12 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
 	"github.com/ethereum/go-ethereum/common"
 	rpchelper "github.com/powerloom/go-rpc-helper"
 	"github.com/powerloom/snapshot-sequencer-validator/pkgs/eventmonitor"
+	"github.com/powerloom/snapshot-sequencer-validator/pkgs/protocolstate/contract"
 )
 
 // GetSnapshotterStateAddress retrieves the SnapshotterState contract address from ProtocolState contract
@@ -55,3 +57,11 @@ func GetSnapshotterStateAddress(ctx context.Context, rpcHelper *rpchelper.RPCHel
 	return snapshotterStateAddr, nil
 }
 
+// GetSnapshotterStateABI returns the ABI for the SnapshotterState contract
+func GetSnapshotterStateABI() (abi.ABI, error) {
+	parsedABI, err := contract.SnapshotterStateContractMetaData.GetAbi()
+	if err != nil {
+		return abi.ABI{}, fmt.Errorf("failed to parse SnapshotterState contract ABI: %w", err)
+	}
+	return *parsedABI, nil
+}

@@ -91,13 +91,31 @@ func NewCacher(cfg *Config) (*Cacher, error) {
 		snapshotterStateAddr:     snapshotterStateAddr,
 	}
 
-	// Create event processor
+	// Get SnapshotterState ABI for event parsing
+	snapshotterStateABI, err := GetSnapshotterStateABI()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get SnapshotterState ABI: %w", err)
+	}
+
+	// Create event processor with polling interval (default: 30 seconds)
+	pollInterval := 30 * time.Second
+	if cfg.SlotSyncInterval > 0 && cfg.SlotSyncInterval < pollInterval {
+		// Use a fraction of sync interval for polling, but not less than 10 seconds
+		pollInterval = cfg.SlotSyncInterval / 10
+		if pollInterval < 10*time.Second {
+			pollInterval = 10 * time.Second
+		}
+	}
+
 	cacher.eventProcessor = NewEventProcessor(
 		ctx,
+		cfg.RPCHelper,
 		snapshotterStateContract,
+		snapshotterStateABI,
 		slotManager,
 		protocolStateAddr,
 		snapshotterStateAddr,
+		pollInterval,
 	)
 
 	return cacher, nil
