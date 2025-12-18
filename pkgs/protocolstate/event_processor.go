@@ -211,12 +211,6 @@ func (ep *EventProcessor) queryNodeBurned(contractAddr common.Address, fromBlock
 
 // parseSnapshotterAddressChanged parses a log into SnapshotterAddressChanged event
 func (ep *EventProcessor) parseSnapshotterAddressChanged(vLog types.Log) (*contract.SnapshotterStateContractSnapshotterAddressChanged, error) {
-	// Use the Filterer's Parse method which handles all the parsing logic
-	filterer := &contract.SnapshotterStateContractFilterer{}
-	// We need to create a filterer with the contract bound, but we can use the ABI directly
-	// Actually, let's use the contract's ParseSnapshotterAddressChanged method
-	// But we need access to the bound contract... let's parse manually using ABI
-
 	event := new(contract.SnapshotterStateContractSnapshotterAddressChanged)
 
 	// SnapshotterAddressChanged(uint256 nodeId, address oldSnapshotter, address newSnapshotter)
