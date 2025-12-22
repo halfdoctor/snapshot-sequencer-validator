@@ -31,6 +31,7 @@ import (
 	"github.com/powerloom/snapshot-sequencer-validator/pkgs/eventmonitor"
 	"github.com/powerloom/snapshot-sequencer-validator/pkgs/gossipconfig"
 	"github.com/powerloom/snapshot-sequencer-validator/pkgs/ipfs"
+	"github.com/powerloom/snapshot-sequencer-validator/pkgs/p2p"
 	"github.com/powerloom/snapshot-sequencer-validator/pkgs/protocolstate"
 	rediskeys "github.com/powerloom/snapshot-sequencer-validator/pkgs/redis"
 	"github.com/powerloom/snapshot-sequencer-validator/pkgs/submissions"
@@ -277,12 +278,17 @@ func main() {
 		}
 		log.Infof("Connection manager configured: LowWater=%d, HighWater=%d", cfg.ConnManagerLowWater, cfg.ConnManagerHighWater)
 
+		// Create RFC1918 connection gater to block reserved IP connections
+		// This is required by Hetzner to prevent scanning of internal networks
+		reservedIPGater := &p2p.RFC1918ConnectionGater{}
+
 		// Build libp2p options
 		opts := []libp2p.Option{
 			libp2p.Identity(privKey),
 			libp2p.ListenAddrStrings(fmt.Sprintf("/ip4/0.0.0.0/tcp/%s", p2pPort)),
 			libp2p.EnableNATService(),
 			libp2p.ConnectionManager(connMgr),
+			libp2p.ConnectionGater(reservedIPGater), // Block reserved IP connections at dial/accept level
 		}
 
 		// Add public IP address if configured
@@ -317,9 +323,17 @@ func main() {
 			log.Fatalf("Failed to bootstrap DHT: %v", err)
 		}
 
-		// Connect to bootstrap if configured
+		// Connect to bootstrap if configured (filter reserved IPs)
 		if len(cfg.BootstrapPeers) > 0 {
-			connectToBootstrap(ctx, h, cfg.BootstrapPeers[0])
+			for i, bootstrapAddr := range cfg.BootstrapPeers {
+				// Filter out bootstrap peers with reserved IP addresses
+				maddr, err := multiaddr.NewMultiaddr(bootstrapAddr)
+				if err == nil && p2p.HasReservedIPAddress(maddr) {
+					log.Warnf("Skipping bootstrap peer %d with reserved IP: %s", i+1, bootstrapAddr)
+					continue
+				}
+				connectToBootstrap(ctx, h, bootstrapAddr)
+			}
 		}
 
 		// Start discovery on rendezvous point
