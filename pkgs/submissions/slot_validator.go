@@ -28,13 +28,18 @@ type SlotInfo struct {
 
 // SlotValidator validates snapshotter addresses against cached slot info from smart contracts
 type SlotValidator struct {
-	redisClient *redis.Client
+	redisClient            *redis.Client
+	protocolStateAddr      common.Address
+	snapshotterStateAddr   common.Address
 }
 
 // NewSlotValidator creates a new slot validator
-func NewSlotValidator(redisClient *redis.Client) *SlotValidator {
+// protocolStateAddr and snapshotterStateAddr are used for namespaced Redis keys
+func NewSlotValidator(redisClient *redis.Client, protocolStateAddr, snapshotterStateAddr common.Address) *SlotValidator {
 	return &SlotValidator{
-		redisClient: redisClient,
+		redisClient:          redisClient,
+		protocolStateAddr:    protocolStateAddr,
+		snapshotterStateAddr: snapshotterStateAddr,
 	}
 }
 
@@ -45,12 +50,13 @@ func NewSlotValidator(redisClient *redis.Client) *SlotValidator {
 // 1. The slot exists and is active
 // 2. The signer is the authorized snapshotter for this slot
 //
-// Redis key format (from protocol-state-cacher): SlotInfo.{slotID}
+// Redis key format (namespaced): {protocolState}:{snapshotterState}:SlotInfo.{slotID}
 func (sv *SlotValidator) ValidateSnapshotterForSlot(slotID uint64, signerAddr common.Address) error {
 	ctx := context.Background()
 
 	// Get slot info from Redis (populated by protocol-state-cacher)
-	slotKey := fmt.Sprintf("SlotInfo.%d", slotID)
+	// Use namespaced key format: {protocolState}:{snapshotterState}:SlotInfo.{slotID}
+	slotKey := fmt.Sprintf("%s:%s:SlotInfo.%d", sv.protocolStateAddr.Hex(), sv.snapshotterStateAddr.Hex(), slotID)
 	slotData, err := sv.redisClient.Get(ctx, slotKey).Result()
 	if err == redis.Nil {
 		return fmt.Errorf("slot %d not found in protocol state cache - may not be registered", slotID)
@@ -83,7 +89,8 @@ func (sv *SlotValidator) ValidateSnapshotterForSlot(slotID uint64, signerAddr co
 func (sv *SlotValidator) GetSlotSnapshotter(slotID uint64) (common.Address, error) {
 	ctx := context.Background()
 
-	slotKey := fmt.Sprintf("SlotInfo.%d", slotID)
+	// Use namespaced key format: {protocolState}:{snapshotterState}:SlotInfo.{slotID}
+	slotKey := fmt.Sprintf("%s:%s:SlotInfo.%d", sv.protocolStateAddr.Hex(), sv.snapshotterStateAddr.Hex(), slotID)
 	slotData, err := sv.redisClient.Get(ctx, slotKey).Result()
 	if err == redis.Nil {
 		return common.Address{}, fmt.Errorf("slot %d not found", slotID)

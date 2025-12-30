@@ -123,7 +123,12 @@ type Settings struct {
 	StreamIdleTimeout   time.Duration // Idle timeout for stream consumers
 
 	// Slot Validation Configuration
-	EnableSlotValidation bool // Validate snapshotter addresses against protocol state cache (requires protocol-state-cacher)
+	EnableSlotValidation bool
+
+	// Protocol State Cacher Configuration
+	EnableProtocolStateCacher bool
+	SlotSyncInterval          time.Duration // Fallback cold sync interval
+	SlotSyncBatchSize         int           // Batch size for slot fetching // Validate snapshotter addresses against protocol state cache (requires protocol-state-cacher)
 
 	// IPFS Configuration
 	IPFSAPI string // IPFS API endpoint (e.g., "/ip4/127.0.0.1/tcp/5001")
@@ -198,8 +203,7 @@ func LoadConfig() error {
 		//   - Level 1 local finalization to complete
 		//   - Level 2 network-wide aggregation to complete
 		//   - Priority 1 validator to commit on-chain during P1 window
-		// Renamed from SUBMISSION_WINDOW_DURATION for clarity.
-		Level1FinalizationDelay: time.Duration(getEnvAsInt("LEVEL1_FINALIZATION_DELAY_SECONDS", getEnvAsInt("SUBMISSION_WINDOW_DURATION", 60))) * time.Second,
+		Level1FinalizationDelay: time.Duration(getEnvAsInt("LEVEL1_FINALIZATION_DELAY_SECONDS", 10)) * time.Second,
 		MaxConcurrentWindows:    getEnvAsInt("MAX_CONCURRENT_WINDOWS", 100),
 		WindowCleanupInterval:   5 * time.Minute,
 
@@ -238,7 +242,7 @@ func LoadConfig() error {
 		FinalizationBatchSize: getEnvAsInt("FINALIZATION_BATCH_SIZE", 20),
 
 		// Aggregation Configuration
-		AggregationWindowDuration: time.Duration(getEnvAsInt("AGGREGATION_WINDOW_SECONDS", 30)) * time.Second,
+		AggregationWindowDuration: time.Duration(getEnvAsInt("AGGREGATION_WINDOW_SECONDS", 20)) * time.Second,
 
 		// Validator Priority Assignment (VPA) Configuration
 		ValidatorAddress:        getEnv("VALIDATOR_ADDRESS", ""),
@@ -263,6 +267,11 @@ func LoadConfig() error {
 
 		// Slot Validation Configuration
 		EnableSlotValidation: getBoolEnv("ENABLE_SLOT_VALIDATION", false),
+
+		// Protocol State Cacher Configuration
+		EnableProtocolStateCacher: getBoolEnv("ENABLE_PROTOCOL_STATE_CACHER", false),
+		SlotSyncInterval:          time.Duration(getEnvAsInt("SLOT_SYNC_INTERVAL_SECONDS", 3600)) * time.Second,
+		SlotSyncBatchSize:         getEnvAsInt("SLOT_SYNC_BATCH_SIZE", 20),
 
 		// API Configuration
 		APIHost:      getEnv("API_HOST", "0.0.0.0"),

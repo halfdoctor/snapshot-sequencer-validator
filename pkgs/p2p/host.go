@@ -56,12 +56,17 @@ func NewP2PHost(ctx context.Context, cfg *config.Settings) (*P2PHost, error) {
 	}
 	log.Infof("Connection manager configured: LowWater=%d, HighWater=%d", cfg.ConnManagerLowWater, cfg.ConnManagerHighWater)
 
+	// Create RFC1918 connection gater to block reserved IP connections
+	// This is required by Hetzner to prevent scanning of internal networks
+	reservedIPGater := &RFC1918ConnectionGater{}
+
 	// Build libp2p options (EXACT copy from working implementation)
 	opts := []libp2p.Option{
 		libp2p.Identity(privKey),
 		libp2p.ListenAddrStrings(fmt.Sprintf("/ip4/0.0.0.0/tcp/%s", p2pPort)),
 		libp2p.EnableNATService(),
 		libp2p.ConnectionManager(connMgr),
+		libp2p.ConnectionGater(reservedIPGater), // Block reserved IP connections at dial/accept level
 	}
 
 	// Add public IP address if configured
@@ -103,7 +108,16 @@ func NewP2PHost(ctx context.Context, cfg *config.Settings) (*P2PHost, error) {
 	if len(cfg.BootstrapPeers) > 0 {
 		log.Infof("Attempting to connect to %d bootstrap peers", len(cfg.BootstrapPeers))
 		connectedCount := 0
+		skippedCount := 0
 		for i, bootstrapAddr := range cfg.BootstrapPeers {
+			// Filter out bootstrap peers with reserved IP addresses
+			maddr, err := multiaddr.NewMultiaddr(bootstrapAddr)
+			if err == nil && HasReservedIPAddress(maddr) {
+				log.Warnf("Skipping bootstrap peer %d with reserved IP: %s", i+1, bootstrapAddr)
+				skippedCount++
+				continue
+			}
+
 			if err := connectToBootstrap(hostCtx, h, bootstrapAddr); err != nil {
 				log.WithError(err).Warnf("Failed to connect to bootstrap peer %d: %s", i+1, bootstrapAddr)
 			} else {
@@ -111,7 +125,7 @@ func NewP2PHost(ctx context.Context, cfg *config.Settings) (*P2PHost, error) {
 				log.Infof("Successfully connected to bootstrap peer %d: %s", i+1, bootstrapAddr)
 			}
 		}
-		log.Infof("Connected to %d/%d bootstrap peers", connectedCount, len(cfg.BootstrapPeers))
+		log.Infof("Connected to %d/%d bootstrap peers (skipped %d with reserved IPs)", connectedCount, len(cfg.BootstrapPeers), skippedCount)
 		if connectedCount == 0 {
 			log.Warn("Failed to connect to any bootstrap peers - will continue with discovery only")
 		}

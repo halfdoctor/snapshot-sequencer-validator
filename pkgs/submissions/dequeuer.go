@@ -40,13 +40,18 @@ type DequeuerStats struct {
 }
 
 // NewDequeuer creates a new submission dequeuer
-func NewDequeuer(redisClient *redis.Client, keyBuilder *redislib.KeyBuilder, sequencerID string, chainID int64, protocolStateContract string, enableSlotValidation bool) (*Dequeuer, error) {
+// snapshotterStateAddr must be provided if enableSlotValidation is true
+func NewDequeuer(redisClient *redis.Client, keyBuilder *redislib.KeyBuilder, sequencerID string, chainID int64, protocolStateContract string, snapshotterStateAddr common.Address, enableSlotValidation bool) (*Dequeuer, error) {
+	if enableSlotValidation && snapshotterStateAddr == (common.Address{}) {
+		return nil, fmt.Errorf("snapshotterStateAddr is required when slot validation is enabled")
+	}
 	verifier, err := customcrypto.NewEIP712Verifier(chainID, protocolStateContract)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create EIP-712 verifier: %w", err)
 	}
 
-	slotValidator := NewSlotValidator(redisClient)
+	protocolStateAddr := common.HexToAddress(protocolStateContract)
+	slotValidator := NewSlotValidator(redisClient, protocolStateAddr, snapshotterStateAddr)
 
 	return &Dequeuer{
 		redisClient:           redisClient,

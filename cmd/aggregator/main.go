@@ -125,12 +125,18 @@ func NewAggregator(cfg *config.Settings) (*Aggregator, error) {
 		}
 
 		// Initialize VPA caching client with fetched address
+		// Use NEW data market address for Redis key building since we submit to new contracts
+		vpaDataMarket := cfg.NewDataMarket
+		if vpaDataMarket == "" {
+			// Fallback to old data market if new one not configured
+			vpaDataMarket = dataMarket
+		}
 		if vpaContractAddr != (common.Address{}) && cfg.VPAValidatorAddress != "" {
 			// Use first RPC node for VPA
 			rpcURL := cfg.RPCNodes[0]
 			vpaClient, err = vpa.NewPriorityCachingClient(
 				rpcURL, vpaContractAddr.Hex(), cfg.VPAValidatorAddress,
-				redisClient, protocolState, dataMarket)
+				redisClient, protocolState, vpaDataMarket, cfg.NewProtocolStateContract)
 			if err != nil {
 				cancel()
 				return nil, fmt.Errorf("failed to initialize VPA caching client: %w", err)
@@ -563,6 +569,7 @@ func (a *Aggregator) startAggregationWindow(epochIDStr string) {
 			"level2_status": "aggregating",
 			"last_updated":  time.Now().Unix(),
 		})
+		a.redisClient.Expire(a.ctx, epochStateKey, 7*24*time.Hour)
 
 		// Perform aggregation after window expires
 		a.aggregateEpoch(epochIDStr)
@@ -584,6 +591,7 @@ func (a *Aggregator) startAggregationWindow(epochIDStr string) {
 		"phase":             "level2_aggregation",
 		"last_updated":      timestamp,
 	})
+	a.redisClient.Expire(a.ctx, epochStateKey, 7*24*time.Hour)
 
 	log.WithFields(logrus.Fields{
 		"epoch":  epochID,
@@ -668,6 +676,7 @@ func (a *Aggregator) aggregateWorkerParts(epochIDStr string, totalParts int) {
 		"phase":               "level2_aggregation",
 		"last_updated":        timestamp,
 	})
+	a.redisClient.Expire(a.ctx, epochStateKey, 7*24*time.Hour)
 
 	// Add monitoring metrics for Level 1 aggregation
 
@@ -972,6 +981,7 @@ func (a *Aggregator) aggregateEpoch(epochIDStr string) {
 		"phase":               "onchain_submission",
 		"last_updated":        timestamp,
 	})
+	a.redisClient.Expire(a.ctx, epochStateKey, 7*24*time.Hour)
 
 	// Pipeline for monitoring metrics
 	pipe := a.redisClient.Pipeline()
@@ -1363,6 +1373,12 @@ func (a *Aggregator) submitBatchViaRelayer(epochID uint64, aggregatedBatch *cons
 		return nil
 	}
 
+	log.WithFields(logrus.Fields{
+		"epoch":       epochIDStr,
+		"data_market": dataMarketAddr,
+		"priority":    priority,
+	}).Info("🔍 GetMyPriority returned priority")
+
 	if priority == 0 {
 		log.WithFields(logrus.Fields{
 			"epoch":       epochIDStr,
@@ -1391,7 +1407,7 @@ func (a *Aggregator) submitBatchViaRelayer(epochID uint64, aggregatedBatch *cons
 	waitCtx, cancel := context.WithTimeout(a.ctx, 10*time.Minute)
 	defer cancel()
 
-	if err := a.vpaClient.WaitForSubmissionWindow(waitCtx, dataMarketAddr, epochID); err != nil {
+	if err := a.vpaClient.WaitForSubmissionWindow(waitCtx, dataMarketAddr, epochID, priority); err != nil {
 		if err == context.DeadlineExceeded {
 			log.WithFields(logrus.Fields{
 				"epoch":    epochIDStr,
@@ -1809,6 +1825,8 @@ func (a *Aggregator) storeSubmissionMetrics(epochID uint64, dataMarketAddr strin
 		}
 	}
 	a.redisClient.HSet(a.ctx, epochStateKey, stateUpdates)
+	// Refresh TTL on epoch state (7 days - same as initial creation)
+	a.redisClient.Expire(a.ctx, epochStateKey, 7*24*time.Hour)
 
 	// Add to submission timeline (namespaced by protocol:market)
 	timelineKey := kb.VPASubmissionTimeline()
@@ -1838,6 +1856,7 @@ func (a *Aggregator) storeSubmissionMetrics(epochID uint64, dataMarketAddr strin
 			"priority":     priority,
 			"last_updated": timestamp,
 		})
+		a.redisClient.Expire(a.ctx, epochStateKey, 7*24*time.Hour)
 	}
 
 	// Update combined epoch status (priority + submission status)

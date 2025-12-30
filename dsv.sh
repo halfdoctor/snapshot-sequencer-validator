@@ -44,7 +44,7 @@ show_usage() {
     echo "Usage: $0 <command> [options]"
     echo ""
     echo "Main Commands:"
-    echo "  start [--with-ipfs] [--with-vpa] [--no-monitor]  - Start services (monitoring enabled by default)"
+    echo "  start [--with-ipfs] [--with-vpa] [--no-monitor] [--rebuild]  - Start services (monitoring enabled by default)"
     echo "  stop                  - Stop all services"
     echo "  restart               - Restart all services"
     echo "  restart-monitor       - Restart only monitoring services (state-tracker, monitor-api)"
@@ -82,12 +82,62 @@ is_separated_running() {
     docker ps --format "{{.Names}}" | grep -qE "(dsv-|snapshot-sequencer-validator-)"
 }
 
+# Check if code has changed since last build
+check_code_changes() {
+    local last_build_file=".dsv-last-build"
+    local current_head=""
+    local last_build_head=""
+    
+    # Check if we're in a git repository
+    if ! git rev-parse --git-dir > /dev/null 2>&1; then
+        return 0  # Not a git repo, skip check
+    fi
+    
+    # Check for uncommitted changes
+    if ! git diff-index --quiet HEAD -- 2>/dev/null; then
+        print_color "$YELLOW" "⚠️  WARNING: You have uncommitted changes in your working directory"
+        print_color "$YELLOW" "   These changes will NOT be included unless you rebuild"
+        return 1
+    fi
+    
+    # Get current HEAD
+    current_head=$(git rev-parse HEAD 2>/dev/null)
+    if [ -z "$current_head" ]; then
+        return 0  # Can't get HEAD, skip check
+    fi
+    
+    # Check if last build file exists
+    if [ -f "$last_build_file" ]; then
+        last_build_head=$(cat "$last_build_file" 2>/dev/null)
+        
+        if [ -n "$last_build_head" ] && [ "$current_head" != "$last_build_head" ]; then
+            print_color "$YELLOW" "⚠️  WARNING: Code has changed since last build"
+            print_color "$CYAN" "   Last build: $(git log -1 --format='%h %s' "$last_build_head" 2>/dev/null || echo "$last_build_head")"
+            print_color "$CYAN" "   Current:    $(git log -1 --format='%h %s' "$current_head" 2>/dev/null || echo "$current_head")"
+            print_color "$YELLOW" "   You may be running old code. Use --rebuild to rebuild with latest changes."
+            return 1
+        fi
+    fi
+    
+    return 0
+}
+
+# Record current HEAD as last build
+record_build() {
+    local last_build_file=".dsv-last-build"
+    
+    if git rev-parse --git-dir > /dev/null 2>&1; then
+        git rev-parse HEAD > "$last_build_file" 2>/dev/null
+    fi
+}
+
 # Start production (separated) mode
 start_services() {
     # Check for flags
     local enable_monitoring=true
     local enable_ipfs=false
     local enable_vpa=false
+    local force_rebuild=false
     local compose_args="-f docker-compose.separated.yml"
 
     # Parse arguments
@@ -101,6 +151,9 @@ start_services() {
                 ;;
             --with-vpa)
                 enable_vpa=true
+                ;;
+            --rebuild)
+                force_rebuild=true
                 ;;
         esac
     done
@@ -152,7 +205,7 @@ start_services() {
         fi
 
         # Clone relayer-py repository (relative to current directory)
-        RELAYER_REPO="git@github.com:powerloom/relayer-py.git"
+        RELAYER_REPO="https://github.com/powerloom/relayer-py.git"
         RELAYER_DIR="./relayer-py"
 
         # Remove existing relayer-py directory if it exists
@@ -173,11 +226,11 @@ start_services() {
 
         # Switch to feat/tx-queue branch
         print_color "$CYAN" "🔄 Switching to feat/tx-queue branch..."
-        if ! (cd "$RELAYER_DIR" && git checkout feat/tx-queue); then
-            print_color "$RED" "❌ Failed to switch to feat/tx-queue branch"
+        if ! (cd "$RELAYER_DIR" && git checkout feat/tx-queue-memory-leak-fix); then
+            print_color "$RED" "❌ Failed to switch to feat/tx-queue-memory-leak-fix branch"
             print_color "$YELLOW" "Continuing with default branch"
         else
-            print_color "$GREEN" "✅ Switched to feat/tx-queue branch"
+            print_color "$GREEN" "✅ Switched to feat/tx-queue-memory-leak-fix branch"
         fi
 
         # relayer-py now reads settings directly from environment variables
@@ -209,17 +262,51 @@ start_services() {
         profile_args+=(--profile vpa)
     fi
 
+    # Check for code changes if not forcing rebuild
+    if [ "$force_rebuild" = false ]; then
+        if ! check_code_changes; then
+            echo ""
+            read -p "Continue without rebuilding? (y/N) " -n 1 -r
+            echo
+            if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+                print_color "$YELLOW" "Cancelled. Use --rebuild flag to rebuild: ./dsv.sh start --rebuild"
+                exit 1
+            fi
+        fi
+    fi
+    
     # Start services with specified profiles
     print_color "$CYAN" "Starting services..."
+    
+    # Build flag - only add if force_rebuild is true
+    local build_flag=""
+    if [ "$force_rebuild" = true ]; then
+        build_flag="--build"
+        print_color "$YELLOW" "⚠️  Force rebuild enabled - images will be rebuilt"
+    fi
+    
     if [ ${#profile_args[@]} -gt 0 ]; then
         print_color "$CYAN" "With profiles: ${profile_args[*]}"
-        $DOCKER_COMPOSE_CMD $compose_args "${profile_args[@]}" up -d --build
+        if [ -n "$build_flag" ]; then
+            $DOCKER_COMPOSE_CMD $compose_args "${profile_args[@]}" up -d $build_flag
+        else
+            $DOCKER_COMPOSE_CMD $compose_args "${profile_args[@]}" up -d
+        fi
     else
         print_color "$CYAN" "Without additional profiles"
-        $DOCKER_COMPOSE_CMD $compose_args up -d --build
+        if [ -n "$build_flag" ]; then
+            $DOCKER_COMPOSE_CMD $compose_args up -d $build_flag
+        else
+            $DOCKER_COMPOSE_CMD $compose_args up -d
+        fi
     fi
 
     if [ $? -eq 0 ]; then
+        # Record build if we rebuilt
+        if [ "$force_rebuild" = true ]; then
+            record_build
+        fi
+        
         print_color "$GREEN" "✅ Services started successfully"
         echo ""
         print_color "$CYAN" "Components:"

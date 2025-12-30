@@ -13,6 +13,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/ethereum/go-ethereum/common"
 	"github.com/libp2p/go-libp2p"
 	dht "github.com/libp2p/go-libp2p-kad-dht"
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
@@ -30,6 +31,8 @@ import (
 	"github.com/powerloom/snapshot-sequencer-validator/pkgs/eventmonitor"
 	"github.com/powerloom/snapshot-sequencer-validator/pkgs/gossipconfig"
 	"github.com/powerloom/snapshot-sequencer-validator/pkgs/ipfs"
+	"github.com/powerloom/snapshot-sequencer-validator/pkgs/p2p"
+	"github.com/powerloom/snapshot-sequencer-validator/pkgs/protocolstate"
 	rediskeys "github.com/powerloom/snapshot-sequencer-validator/pkgs/redis"
 	"github.com/powerloom/snapshot-sequencer-validator/pkgs/submissions"
 	"github.com/powerloom/snapshot-sequencer-validator/pkgs/workers"
@@ -38,7 +41,7 @@ import (
 )
 
 // detectPrimaryComponent identifies the main component role for logging purposes
-func detectPrimaryComponent(enableListener, enableDequeuer, enableFinalizer, enableBatchAggregation, enableEventMonitor bool) string {
+func detectPrimaryComponent(enableListener, enableDequeuer, enableFinalizer, enableBatchAggregation, enableEventMonitor, enableProtocolStateCacher bool) string {
 	// Count enabled components
 	enabledCount := 0
 	primaryComponent := "unknown"
@@ -63,6 +66,10 @@ func detectPrimaryComponent(enableListener, enableDequeuer, enableFinalizer, ena
 		enabledCount++
 		primaryComponent = "event-monitor"
 	}
+	if enableProtocolStateCacher {
+		enabledCount++
+		primaryComponent = "protocol-state-cacher"
+	}
 
 	// If multiple components are enabled, return "multi-component"
 	if enabledCount > 1 {
@@ -85,6 +92,8 @@ func getComponentEmoji(component string) string {
 		return "📡"
 	case "batch-aggregator":
 		return "🔄"
+	case "protocol-state-cacher":
+		return "💾"
 	case "multi-component":
 		return "🔧"
 	default:
@@ -169,7 +178,7 @@ func main() {
 	enableEventMonitor := cfg.EnableEventMonitor
 
 	// Detect primary component for clear identification
-	primaryComponent := detectPrimaryComponent(enableListener, enableDequeuer, enableFinalizer, enableBatchAggregation, enableEventMonitor)
+	primaryComponent := detectPrimaryComponent(enableListener, enableDequeuer, enableFinalizer, enableBatchAggregation, enableEventMonitor, cfg.EnableProtocolStateCacher)
 	componentEmoji := getComponentEmoji(primaryComponent)
 
 	// Component-specific startup banner
@@ -193,6 +202,9 @@ func main() {
 		if enableEventMonitor {
 			log.Infof("  - Event Monitor: %v", enableEventMonitor)
 		}
+		if cfg.EnableProtocolStateCacher {
+			log.Infof("  - Protocol State Cacher: %v", cfg.EnableProtocolStateCacher)
+		}
 	} else {
 		componentName := strings.ToUpper(strings.ReplaceAll(primaryComponent, "-", " "))
 		log.Infof("========================================")
@@ -206,7 +218,7 @@ func main() {
 
 	// Initialize Redis if any component needs it
 	var redisClient *redis.Client
-	if enableListener || enableDequeuer || enableFinalizer || enableEventMonitor {
+	if enableListener || enableDequeuer || enableFinalizer || enableEventMonitor || cfg.EnableProtocolStateCacher {
 		redisAddr := fmt.Sprintf("%s:%s", cfg.RedisHost, cfg.RedisPort)
 		componentPrefix := strings.ToUpper(primaryComponent)
 		log.Infof("[%s] Connecting to Redis at %s (DB: %d)", componentPrefix, redisAddr, cfg.RedisDB)
@@ -266,12 +278,17 @@ func main() {
 		}
 		log.Infof("Connection manager configured: LowWater=%d, HighWater=%d", cfg.ConnManagerLowWater, cfg.ConnManagerHighWater)
 
+		// Create RFC1918 connection gater to block reserved IP connections
+		// This is required by Hetzner to prevent scanning of internal networks
+		reservedIPGater := &p2p.RFC1918ConnectionGater{}
+
 		// Build libp2p options
 		opts := []libp2p.Option{
 			libp2p.Identity(privKey),
 			libp2p.ListenAddrStrings(fmt.Sprintf("/ip4/0.0.0.0/tcp/%s", p2pPort)),
 			libp2p.EnableNATService(),
 			libp2p.ConnectionManager(connMgr),
+			libp2p.ConnectionGater(reservedIPGater), // Block reserved IP connections at dial/accept level
 		}
 
 		// Add public IP address if configured
@@ -306,9 +323,17 @@ func main() {
 			log.Fatalf("Failed to bootstrap DHT: %v", err)
 		}
 
-		// Connect to bootstrap if configured
+		// Connect to bootstrap if configured (filter reserved IPs)
 		if len(cfg.BootstrapPeers) > 0 {
-			connectToBootstrap(ctx, h, cfg.BootstrapPeers[0])
+			for i, bootstrapAddr := range cfg.BootstrapPeers {
+				// Filter out bootstrap peers with reserved IP addresses
+				maddr, err := multiaddr.NewMultiaddr(bootstrapAddr)
+				if err == nil && p2p.HasReservedIPAddress(maddr) {
+					log.Warnf("Skipping bootstrap peer %d with reserved IP: %s", i+1, bootstrapAddr)
+					continue
+				}
+				connectToBootstrap(ctx, h, bootstrapAddr)
+			}
 		}
 
 		// Start discovery on rendezvous point
@@ -472,9 +497,113 @@ func main() {
 		primaryComponent:       primaryComponent,
 	}
 
+	// Wait for cold sync completion if slot validation is enabled
+	// This applies to ALL components, not just dequeuer, since slot validation
+	// affects the entire node's ability to process submissions correctly
+	var snapshotterStateAddr common.Address
+	if cfg.EnableSlotValidation && redisClient != nil {
+		if !cfg.EnableProtocolStateCacher {
+			log.Fatal("ENABLE_PROTOCOL_STATE_CACHER must be true when ENABLE_SLOT_VALIDATION is true")
+		}
+
+		// Get SnapshotterState address from ProtocolState contract (needed for Redis key)
+		rpcConfig := cfg.ToRPCConfig()
+		if rpcConfig == nil || len(rpcConfig.Nodes) == 0 {
+			log.Fatal("POWERLOOM_RPC_NODES must be configured for slot validation")
+		}
+
+		rpcHelper := rpchelper.NewRPCHelper(rpcConfig)
+		if err := rpcHelper.Initialize(context.Background()); err != nil {
+			log.Fatalf("Failed to initialize RPC helper for slot validation: %v", err)
+		}
+
+		var err error
+		snapshotterStateAddr, err = protocolstate.GetSnapshotterStateAddress(
+			context.Background(),
+			rpcHelper,
+			cfg.ProtocolStateContract,
+			cfg.ContractABIPath,
+		)
+		if err != nil {
+			log.Fatalf("Failed to get SnapshotterState address: %v", err)
+		}
+
+		// Wait for cacher service to complete cold sync (max 10 minutes)
+		if err := protocolstate.WaitForColdSyncCompletion(
+			context.Background(),
+			redisClient,
+			cfg.ProtocolStateContract,
+			snapshotterStateAddr.Hex(),
+			cfg.SlotSyncInterval,
+			10*time.Minute,
+		); err != nil {
+			log.Fatalf("Failed to wait for cold sync completion: %v", err)
+		}
+	}
+
+	// Initialize protocol state cacher if enabled (runs the cacher service)
+	if cfg.EnableProtocolStateCacher && redisClient != nil {
+		// Initialize RPC Helper for cacher
+		rpcConfig := cfg.ToRPCConfig()
+		if rpcConfig == nil || len(rpcConfig.Nodes) == 0 {
+			log.Fatal("POWERLOOM_RPC_NODES must be configured for protocol state cacher")
+		}
+
+		rpcHelper := rpchelper.NewRPCHelper(rpcConfig)
+		if err := rpcHelper.Initialize(context.Background()); err != nil {
+			log.Fatalf("Failed to initialize RPC helper for protocol state cacher: %v", err)
+		}
+
+		// Get SnapshotterState address from ProtocolState contract
+		var err error
+		if snapshotterStateAddr == (common.Address{}) {
+			// Only fetch if not already fetched above
+			snapshotterStateAddr, err = protocolstate.GetSnapshotterStateAddress(
+				context.Background(),
+				rpcHelper,
+				cfg.ProtocolStateContract,
+				cfg.ContractABIPath,
+			)
+			if err != nil {
+				log.Fatalf("Failed to get SnapshotterState address: %v", err)
+			}
+		}
+		log.Infof("✅ SnapshotterState contract address: %s", snapshotterStateAddr.Hex())
+
+		// Initialize cacher
+		cacherCfg := &protocolstate.Config{
+			RPCHelper:                rpcHelper,
+			ProtocolStateContract:    cfg.ProtocolStateContract,
+			SnapshotterStateContract: snapshotterStateAddr.Hex(),
+			ContractABIPath:          cfg.ContractABIPath,
+			RedisClient:              redisClient,
+			SlotSyncInterval:         cfg.SlotSyncInterval,
+			SlotSyncBatchSize:        cfg.SlotSyncBatchSize,
+		}
+
+		cacher, err := protocolstate.NewCacher(cacherCfg)
+		if err != nil {
+			log.Fatalf("Failed to create protocol state cacher: %v", err)
+		}
+
+		// Perform initial cold sync synchronously
+		log.Info("🔄 Starting protocol state cacher cold sync...")
+		if err := cacher.WaitForColdSync(context.Background()); err != nil {
+			log.Fatalf("Cold sync failed: %v", err)
+		}
+
+		// Start cacher background services (event processor, periodic sync)
+		sequencer.wg.Add(1)
+		go func() {
+			defer sequencer.wg.Done()
+			cacher.Start(sequencer.ctx)
+		}()
+		log.Info("✅ Protocol state cacher component started")
+	}
+
 	// Initialize components based on flags
 	if enableDequeuer && redisClient != nil {
-		dequeuer, err := submissions.NewDequeuer(redisClient, keyBuilder, sequencerID, cfg.ChainID, cfg.ProtocolStateContract, cfg.EnableSlotValidation)
+		dequeuer, err := submissions.NewDequeuer(redisClient, keyBuilder, sequencerID, cfg.ChainID, cfg.ProtocolStateContract, snapshotterStateAddr, cfg.EnableSlotValidation)
 		if err != nil {
 			log.Fatalf("Failed to create dequeuer: %v", err)
 		}

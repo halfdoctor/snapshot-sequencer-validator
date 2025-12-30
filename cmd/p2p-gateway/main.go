@@ -11,8 +11,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/libp2p/go-libp2p/core/peer"
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
+	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/powerloom/snapshot-sequencer-validator/config"
 	"github.com/powerloom/snapshot-sequencer-validator/pkgs/events"
 	"github.com/powerloom/snapshot-sequencer-validator/pkgs/metrics"
@@ -42,9 +42,9 @@ type SubmissionMessage struct {
 		EpochID     uint64 `json:"epochId"`
 		ProjectID   string `json:"projectId"`
 	} `json:"request"`
-	Signature   string `json:"signature"`
-	Header      string `json:"header"`
-	DataMarket  string `json:"dataMarket"`
+	Signature   string  `json:"signature"`
+	Header      string  `json:"header"`
+	DataMarket  string  `json:"dataMarket"`
 	NodeVersion *string `json:"nodeVersion,omitempty"`
 }
 
@@ -120,17 +120,17 @@ func (g *P2PGateway) storeSubmissionMetadata(metadata *SubmissionMetadata) error
 	metadataKey := g.keyBuilder.MetricsSubmissionsMetadata(metadata.EntityID)
 
 	metadataMap := map[string]interface{}{
-		"entityId":     metadata.EntityID,
-		"epochId":      metadata.EpochID,
-		"slotId":       metadata.SlotID,
-		"projectId":    metadata.ProjectID,
-		"peerId":       metadata.PeerID,
-		"timestamp":    metadata.Timestamp,
-		"dataMarket":   metadata.DataMarket,
-		"nodeVersion":  metadata.NodeVersion,
-		"messageSize":  metadata.MessageSize,
-		"topicName":    metadata.TopicName,
-		"storedAt":     time.Now().Unix(),
+		"entityId":    metadata.EntityID,
+		"epochId":     metadata.EpochID,
+		"slotId":      metadata.SlotID,
+		"projectId":   metadata.ProjectID,
+		"peerId":      metadata.PeerID,
+		"timestamp":   metadata.Timestamp,
+		"dataMarket":  metadata.DataMarket,
+		"nodeVersion": metadata.NodeVersion,
+		"messageSize": metadata.MessageSize,
+		"topicName":   metadata.TopicName,
+		"storedAt":    time.Now().Unix(),
 	}
 
 	// Store metadata with 24 hour TTL
@@ -191,12 +191,12 @@ func (g *P2PGateway) GetSubmissionMetadata(entityID string) (*SubmissionMetadata
 }
 
 type P2PGateway struct {
-	ctx        context.Context
-	cancel     context.CancelFunc
-	p2pHost    *p2p.P2PHost
+	ctx         context.Context
+	cancel      context.CancelFunc
+	p2pHost     *p2p.P2PHost
 	redisClient *redis.Client
-	keyBuilder *rediskeys.KeyBuilder
-	config     *config.Settings
+	keyBuilder  *rediskeys.KeyBuilder
+	config      *config.Settings
 
 	// Topic subscriptions
 	submissionSub *pubsub.Subscription
@@ -209,8 +209,8 @@ type P2PGateway struct {
 	presenceTopic   *pubsub.Topic
 
 	// Event and metrics
-	eventEmitter   *events.Emitter
-	eventPublisher *events.Publisher
+	eventEmitter    *events.Emitter
+	eventPublisher  *events.Publisher
 	metricsRegistry *metrics.Registry
 }
 
@@ -301,14 +301,14 @@ func NewP2PGateway(cfg *config.Settings) (*P2PGateway, error) {
 	metricsRegistry := metrics.NewRegistry(metricsConfig)
 
 	gateway := &P2PGateway{
-		ctx:            ctx,
-		cancel:         cancel,
-		p2pHost:        p2pHost,
-		redisClient:    redisClient,
-		keyBuilder:     keyBuilder,
-		config:         cfg,
-		eventEmitter:   eventEmitter,
-		eventPublisher: eventPublisher,
+		ctx:             ctx,
+		cancel:          cancel,
+		p2pHost:         p2pHost,
+		redisClient:     redisClient,
+		keyBuilder:      keyBuilder,
+		config:          cfg,
+		eventEmitter:    eventEmitter,
+		eventPublisher:  eventPublisher,
 		metricsRegistry: metricsRegistry,
 	}
 
@@ -416,10 +416,10 @@ func (g *P2PGateway) initializeStreams() error {
 			}
 
 			log.WithFields(logrus.Fields{
-				"stream":     streamKey,
-				"entries":    info.Length,
-				"last_id":    info.LastGeneratedID,
-				"groups":     info.Groups,
+				"stream":  streamKey,
+				"entries": info.Length,
+				"last_id": info.LastGeneratedID,
+				"groups":  info.Groups,
 			}).Info("Stream verified and ready")
 		} else {
 			return fmt.Errorf("failed to create consumer group and stream: %w", err)
@@ -487,20 +487,20 @@ func (g *P2PGateway) monitorStreamHealth() {
 
 			// Log stream health metrics
 			log.WithFields(logrus.Fields{
-				"stream":         streamKey,
-				"entries":        info.Length,
-				"pending":        ourGroup.Pending,
-				"last_id":        info.LastGeneratedID,
-				"consumers":      ourGroup.Consumers,
-				"group":          groupName,
+				"stream":    streamKey,
+				"entries":   info.Length,
+				"pending":   ourGroup.Pending,
+				"last_id":   info.LastGeneratedID,
+				"consumers": ourGroup.Consumers,
+				"group":     groupName,
 			}).Debug("Stream health check")
 
 			// Emit stream health event
 			payload, _ := json.Marshal(map[string]interface{}{
-				"stream_entries":  info.Length,
+				"stream_entries":   info.Length,
 				"pending_messages": ourGroup.Pending,
 				"active_consumers": ourGroup.Consumers,
-				"last_id":         info.LastGeneratedID,
+				"last_id":          info.LastGeneratedID,
 			})
 			if err := g.eventEmitter.Emit(&events.Event{
 				Type:      events.EventStreamHealth,
@@ -548,10 +548,10 @@ func (g *P2PGateway) cleanupOldStreamEntries() {
 
 			if result > 0 {
 				log.WithFields(logrus.Fields{
-					"stream":      streamKey,
-					"trimmed":     result,
-					"remaining":   info.Length - result,
-					"previous":    info.Length,
+					"stream":    streamKey,
+					"trimmed":   result,
+					"remaining": info.Length - result,
+					"previous":  info.Length,
 				}).Info("Cleaned up old stream entries")
 
 				// Emit stream cleanup event
@@ -961,9 +961,20 @@ func (g *P2PGateway) handleIncomingBatches() {
 				counter.Inc()
 			}
 
-			// Mark epoch as active
-			if err := g.redisClient.SAdd(g.ctx, g.keyBuilder.ActiveEpochs(), epochIDStr).Err(); err != nil {
+			// Mark epoch as active (with TTL to prevent unbounded growth)
+			// Note: We only set TTL if missing (don't refresh on every add)
+			// The set is also pruned periodically by state-tracker to remove old epochs
+			activeEpochsKey := g.keyBuilder.ActiveEpochs()
+			added, err := g.redisClient.SAdd(g.ctx, activeEpochsKey, epochIDStr).Result()
+			if err != nil {
 				log.WithError(err).Error("Failed to add epoch to ActiveEpochs set")
+			} else if added > 0 {
+				// Only set TTL if key doesn't already have one (24 hours - covers epoch lifecycle)
+				// This prevents unnecessary TTL refreshes that would prevent expiration
+				ttl := g.redisClient.TTL(g.ctx, activeEpochsKey).Val()
+				if ttl == -1 { // Key exists but has no TTL
+					g.redisClient.Expire(g.ctx, activeEpochsKey, 24*time.Hour)
+				}
 			}
 
 			// Track validator batch activity for monitoring with timeline entries
@@ -1005,7 +1016,7 @@ func (g *P2PGateway) handleIncomingBatches() {
 
 			log.WithFields(logrus.Fields{
 				"epoch": epochFormatted,
-				"from": validatorID,
+				"from":  validatorID,
 			}).Info("P2P Gateway: Received finalized batch from validator (stream-based aggregation)")
 		}
 	}
@@ -1098,9 +1109,9 @@ func (g *P2PGateway) sendPresenceHeartbeat() {
 			return
 		case <-ticker.C:
 			presence := map[string]interface{}{
-				"peer_id":    g.p2pHost.Host.ID().String(),
-				"timestamp":  time.Now().Unix(),
-				"version":    "1.0.0",
+				"peer_id":   g.p2pHost.Host.ID().String(),
+				"timestamp": time.Now().Unix(),
+				"version":   "1.0.0",
 			}
 
 			data, _ := json.Marshal(presence)
@@ -1151,14 +1162,14 @@ func (g *P2PGateway) Start() error {
 				}
 
 				log.WithFields(logrus.Fields{
-					"connected_peers":     len(peers),
-					"peer_ids":           peerIDs,
-					"submission_peers":   len(submissionPeers),
-					"batch_peers":        len(batchPeers),
-					"presence_peers":     len(presencePeers),
-					"bootstrap_config":   len(g.config.BootstrapPeers),
-					"dht_ready":          g.p2pHost.DHT != nil,
-					"pubsub_ready":       g.p2pHost.Pubsub != nil,
+					"connected_peers":  len(peers),
+					"peer_ids":         peerIDs,
+					"submission_peers": len(submissionPeers),
+					"batch_peers":      len(batchPeers),
+					"presence_peers":   len(presencePeers),
+					"bootstrap_config": len(g.config.BootstrapPeers),
+					"dht_ready":        g.p2pHost.DHT != nil,
+					"pubsub_ready":     g.p2pHost.Pubsub != nil,
 				}).Info("P2P Gateway status - DIAGNOSTIC")
 
 				// Add timeline entries for peer discovery events

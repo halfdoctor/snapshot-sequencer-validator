@@ -184,6 +184,8 @@ func (sw *StateWorker) aggregateCurrentMetrics(ctx context.Context) {
 				// Update submission count in epoch state hash
 				epochStateKey := sw.keyBuilder.EpochState(epochID)
 				sw.redis.HSet(ctx, epochStateKey, "submissions_count", count)
+				// Refresh TTL on epoch state (7 days - same as initial creation)
+				sw.redis.Expire(ctx, epochStateKey, 7*24*time.Hour)
 			}
 		}
 	}
@@ -742,10 +744,12 @@ func (sw *StateWorker) StartPruningWorker(ctx context.Context) {
 func (sw *StateWorker) pruneOldData(ctx context.Context) {
 	cutoff := time.Now().Add(-24 * time.Hour).Unix()
 
-	// Only prune main timeline sorted sets (no per-validator keys needed)
+	// Prune all timeline sorted sets (critical for preventing unbounded growth)
 	timelines := []string{
 		sw.keyBuilder.MetricsEpochsTimeline(),
 		sw.keyBuilder.MetricsBatchesTimeline(),
+		sw.keyBuilder.MetricsSubmissionsTimeline(),
+		sw.keyBuilder.MetricsValidationsTimeline(),
 	}
 
 	totalRemoved := int64(0)
@@ -757,12 +761,70 @@ func (sw *StateWorker) pruneOldData(ctx context.Context) {
 			log.WithError(err).WithField("timeline", timeline).Error("Failed to prune old data")
 			continue
 		}
+		if removed > 0 {
+			log.WithFields(logrus.Fields{
+				"timeline": timeline,
+				"removed":  removed,
+			}).Info("Pruned old timeline entries")
+		}
 		totalRemoved += removed
 	}
 
 	if totalRemoved > 0 {
 		log.WithField("removed_entries", totalRemoved).Info("Pruned old timeline data")
 	}
+
+	// Prune epochs:active SET to remove epochs older than 7 days
+	// This prevents unbounded growth when TTL keeps getting refreshed
+	activeEpochsKey := sw.keyBuilder.ActiveEpochs()
+	activeEpochs, err := sw.redis.SMembers(ctx, activeEpochsKey).Result()
+	if err == nil && len(activeEpochs) > 0 {
+		// Get current epoch from timeline to determine cutoff
+		currentEpochStr := ""
+		recentEpochs, err := sw.redis.ZRevRangeByScore(ctx, sw.keyBuilder.MetricsEpochsTimeline(),
+			&redis.ZRangeBy{
+				Min:    strconv.FormatInt(cutoff, 10),
+				Max:    "+inf",
+				Offset: 0,
+				Count:  1,
+			}).Result()
+		if err == nil && len(recentEpochs) > 0 {
+			// Extract epoch ID from timeline entry (format: "open:{epochId}" or "closed:{epochId}")
+			entry := recentEpochs[0]
+			parts := strings.Split(entry, ":")
+			if len(parts) >= 2 {
+				currentEpochStr = parts[1]
+			}
+		}
+
+		if currentEpochStr != "" {
+			currentEpoch, err := strconv.ParseInt(currentEpochStr, 10, 64)
+			if err == nil {
+				cutoffEpoch := currentEpoch - 10080 // Keep last 7 days (assuming ~1 epoch per minute)
+				epochsToRemove := []string{}
+				for _, epochStr := range activeEpochs {
+					epoch, err := strconv.ParseInt(epochStr, 10, 64)
+					if err == nil && epoch < cutoffEpoch {
+						epochsToRemove = append(epochsToRemove, epochStr)
+					}
+				}
+				if len(epochsToRemove) > 0 {
+					removed, err := sw.redis.SRem(ctx, activeEpochsKey, epochsToRemove).Result()
+					if err != nil {
+						log.WithError(err).Error("Failed to prune old epochs from ActiveEpochs set")
+					} else if removed > 0 {
+						log.WithFields(logrus.Fields{
+							"removed_epochs": removed,
+							"remaining":      len(activeEpochs) - int(removed),
+						}).Info("Pruned old epochs from ActiveEpochs set")
+					}
+				}
+			}
+		}
+	}
+
+	// Monitor Redis key sizes and alert if they exceed thresholds
+	sw.monitorRedisKeySizes(ctx)
 
 	// Also reset in-memory counters if they've been running for more than 24 hours
 	sw.mu.Lock()
@@ -776,6 +838,69 @@ func (sw *StateWorker) pruneOldData(ctx context.Context) {
 		log.Info("Reset in-memory counters after 24 hours")
 	}
 	sw.mu.Unlock()
+}
+
+// monitorRedisKeySizes monitors Redis key sizes and logs warnings if they exceed thresholds
+func (sw *StateWorker) monitorRedisKeySizes(ctx context.Context) {
+	thresholds := map[string]int64{
+		"zset": 1000000, // 1M members
+		"set":  100000,  // 100K members
+		"list": 10000,   // 10K items
+	}
+
+	// Check timeline zsets
+	timelineKeys := []string{
+		sw.keyBuilder.MetricsSubmissionsTimeline(),
+		sw.keyBuilder.MetricsValidationsTimeline(),
+		sw.keyBuilder.MetricsEpochsTimeline(),
+		sw.keyBuilder.MetricsBatchesTimeline(),
+	}
+
+	for _, key := range timelineKeys {
+		size, err := sw.redis.ZCard(ctx, key).Result()
+		if err == nil && size > thresholds["zset"] {
+			log.WithFields(logrus.Fields{
+				"key":   key,
+				"size":  size,
+				"limit": thresholds["zset"],
+			}).Warn("Timeline zset exceeds size threshold - pruning may not be working correctly")
+		}
+	}
+
+	// Check ActiveEpochs set
+	activeEpochsKey := sw.keyBuilder.ActiveEpochs()
+	size, err := sw.redis.SCard(ctx, activeEpochsKey).Result()
+	if err == nil && size > thresholds["set"] {
+		log.WithFields(logrus.Fields{
+			"key":   activeEpochsKey,
+			"size":  size,
+			"limit": thresholds["set"],
+		}).Warn("ActiveEpochs set exceeds size threshold - pruning may not be working correctly")
+	}
+
+	// Check aggregation queue (legacy) - auto-cleanup if exceeds threshold
+	aggregationQueueKey := sw.keyBuilder.AggregationQueue()
+	size, err = sw.redis.LLen(ctx, aggregationQueueKey).Result()
+	if err == nil && size > thresholds["list"] {
+		// Legacy queue is not used by active aggregation system (uses streams instead)
+		// Auto-cleanup if it exceeds threshold to prevent unbounded growth
+		log.WithFields(logrus.Fields{
+			"key":   aggregationQueueKey,
+			"size":  size,
+			"limit": thresholds["list"],
+		}).Warn("Legacy aggregation queue exceeds threshold - cleaning up")
+
+		// Delete the entire queue (it's legacy and not used)
+		deleted, err := sw.redis.Del(ctx, aggregationQueueKey).Result()
+		if err != nil {
+			log.WithError(err).WithField("key", aggregationQueueKey).Error("Failed to cleanup legacy aggregation queue")
+		} else if deleted > 0 {
+			log.WithFields(logrus.Fields{
+				"key":     aggregationQueueKey,
+				"deleted": deleted,
+			}).Info("Cleaned up legacy aggregation queue")
+		}
+	}
 }
 
 // aggregateParticipationMetrics calculates participation and inclusion rates
@@ -1197,10 +1322,10 @@ func (sw *StateWorker) detectEpochGaps(ctx context.Context) int64 {
 			continue
 		}
 
-		windowStatus, _ := stateData["window_status"]
-		level1Status, _ := stateData["level1_status"]
-		level2Status, _ := stateData["level2_status"]
-		onchainStatus, _ := stateData["onchain_status"]
+		windowStatus := stateData["window_status"]
+		level1Status := stateData["level1_status"]
+		level2Status := stateData["level2_status"]
+		onchainStatus := stateData["onchain_status"]
 
 		// Check for gaps
 		gapType := ""

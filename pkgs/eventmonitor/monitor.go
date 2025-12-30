@@ -246,6 +246,7 @@ func NewEventMonitor(cfg *Config) (*EventMonitor, error) {
 				cfg.RedisClient,
 				cfg.ProtocolState,
 				cfg.DataMarkets[0], // Use first data market as default
+				cfg.NewProtocolStateContract,
 			)
 			if err != nil {
 				cancel()
@@ -710,25 +711,21 @@ func (m *EventMonitor) handleEpochReleased(event *EpochReleasedEvent) {
 		if !m.newDataMarketContracts[dataMarketLower] {
 			log.WithFields(log.Fields{
 				"data_market": dataMarketAddr,
-			}).Debug("Legacy data market - fetching snapshotSubmissionWindow from legacy ProtocolState contract")
-			// For legacy contracts, query snapshotSubmissionWindow() function
-			legacyWindow, err := m.fetchLegacySubmissionWindow(dataMarketAddr)
-			if err != nil {
-				log.WithError(err).WithFields(log.Fields{
-					"data_market": dataMarketAddr,
-				}).Warn("⚠️  Failed to fetch snapshotSubmissionWindow from legacy contract, using fallback duration")
-				windowDuration = m.windowDuration
-				useFallback = true
-			} else {
-				windowDuration = time.Duration(legacyWindow.Uint64()) * time.Second
-				useFallback = false // Successfully fetched from legacy contract
-				isLegacyContract = true
-				log.WithFields(log.Fields{
-					"data_market":     dataMarketAddr,
-					"window_duration": windowDuration,
-					"source":          "legacy_contract_snapshotSubmissionWindow",
-				}).Info("✅ Using snapshotSubmissionWindow from legacy ProtocolState contract - Level 1 finalization will trigger when submission window closes (after collecting snapshot CIDs)")
-			}
+			}).Debug("Legacy data market - checking if we should use fallback delay or legacy window")
+			// For legacy contracts, we have two options:
+			// 1. Use legacy contract's snapshotSubmissionWindow() if commit/reveal is enabled (legacy behavior)
+			// 2. Use LEVEL1_FINALIZATION_DELAY_SECONDS if commit/reveal is disabled (matches new contract timing)
+			// Since we can't easily check commit/reveal status for legacy contracts, and the user wants
+			// LEVEL1_FINALIZATION_DELAY_SECONDS to be respected, we'll use the fallback delay when commit/reveal is disabled.
+			// For now, always use fallback delay to ensure consistent timing with new contracts.
+			windowDuration = m.windowDuration
+			useFallback = true
+			isLegacyContract = true
+			log.WithFields(log.Fields{
+				"data_market":     dataMarketAddr,
+				"window_duration": windowDuration,
+				"source":          "LEVEL1_FINALIZATION_DELAY_SECONDS",
+			}).Info("✅ Using LEVEL1_FINALIZATION_DELAY_SECONDS for legacy contract - Level 1 finalization will trigger after delay (ensures timing matches new contract)")
 		} else {
 			log.WithFields(log.Fields{
 				"data_market": dataMarketAddr,
@@ -838,12 +835,32 @@ func (m *EventMonitor) handleEpochReleased(event *EpochReleasedEvent) {
 	pipe.Expire(m.ctx, epochKey, 24*time.Hour)
 
 	// Also add to active epochs set (use namespaced keys)
+	// Only refresh TTL when adding NEW epochs (not when epoch already exists)
+	// The set is also pruned periodically by state-tracker to remove old epochs
 	kb := m.windowManager.getKeyBuilder(dataMarketAddr)
-	pipe.SAdd(m.ctx, kb.ActiveEpochs(), event.EpochID.String())
-	pipe.Expire(m.ctx, kb.ActiveEpochs(), 24*time.Hour)
+	activeEpochsKey := kb.ActiveEpochs()
+	pipe.SAdd(m.ctx, activeEpochsKey, event.EpochID.String())
 
-	if _, err := pipe.Exec(m.ctx); err != nil {
+	results, err := pipe.Exec(m.ctx)
+	if err != nil {
 		log.Errorf("Failed to store epoch info: %v", err)
+		return
+	}
+
+	// Check if epoch was actually added (new epoch) - SAdd returns 1 if added, 0 if already exists
+	// Pipeline order: [0] HMSet, [1] Expire(epochKey), [2] SAdd(activeEpochsKey)
+	if len(results) >= 3 {
+		if sAddResult, ok := results[2].(*redis.IntCmd); ok {
+			added := sAddResult.Val()
+			if added > 0 {
+				// Only refresh TTL when adding a NEW epoch
+				// Check if TTL exists first to avoid unnecessary refresh
+				ttl := m.redisClient.TTL(m.ctx, activeEpochsKey).Val()
+				if ttl == -1 { // Key exists but has no TTL
+					m.redisClient.Expire(m.ctx, activeEpochsKey, 24*time.Hour)
+				}
+			}
+		}
 	}
 
 	// Start submission window - this window is for collecting snapshot CIDs from snapshotter nodes
@@ -1048,6 +1065,8 @@ func (wm *WindowManager) closeWindow(dataMarket string, epochID *big.Int) {
 		"phase":         "level1_finalization",
 		"last_updated":  timestamp,
 	})
+	// Refresh TTL on epoch state (7 days - same as initial creation)
+	pipe.Expire(context.Background(), epochStateKey, 7*24*time.Hour)
 
 	// 4. Publish state change
 	pipe.Publish(context.Background(), "state:change", fmt.Sprintf("epoch:closed:%s", epochID.String()))
@@ -1076,6 +1095,7 @@ func (wm *WindowManager) triggerFinalization(dataMarket string, epochID *big.Int
 			"level1_reason":     "no_submissions_found",
 			"last_updated":      timestamp,
 		})
+		wm.redisClient.Expire(ctx, epochStateKey, 7*24*time.Hour)
 		return // Don't proceed with empty batches
 	}
 
@@ -1099,6 +1119,7 @@ func (wm *WindowManager) triggerFinalization(dataMarket string, epochID *big.Int
 			"level1_reason":     "no_batches_created",
 			"last_updated":      timestamp,
 		})
+		wm.redisClient.Expire(ctx, epochStateKey, 7*24*time.Hour)
 		return
 	}
 
@@ -1127,6 +1148,7 @@ func (wm *WindowManager) triggerFinalization(dataMarket string, epochID *big.Int
 		"level1_started_at": timestamp,
 		"last_updated":      timestamp,
 	})
+	wm.redisClient.Expire(ctx, epochStateKey, 7*24*time.Hour)
 
 	// Push each batch to finalization queue
 	queueKey := kb.FinalizationQueue()

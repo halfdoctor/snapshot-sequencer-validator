@@ -60,7 +60,8 @@ func (wc *WindowConfig) LocalFinalizationWindow(fallbackDelay time.Duration) tim
 		return time.Duration(totalSeconds.Uint64()) * time.Second
 	} else {
 		// Case 2: Snapshot Commit/Reveal disabled - trigger after fallback delay
-		// This delay must be well before P1 window closes to allow time for Level 2 aggregation
+		// This delay (LEVEL1_FINALIZATION_DELAY_SECONDS) must be well before P1 window closes
+		// to allow time for Level 1 finalization and Level 2 aggregation before on-chain submission
 		return fallbackDelay
 	}
 }
@@ -268,4 +269,3 @@ func (f *WindowConfigFetcher) fetchFromContract(ctx context.Context, dataMarketA
 		PreSubmissionWindow:       preSubmissionWindow,
 	}, nil
 }
-
