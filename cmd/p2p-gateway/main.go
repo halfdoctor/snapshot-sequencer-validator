@@ -774,7 +774,11 @@ func (g *P2PGateway) handleSubmissionMessages(sub *pubsub.Subscription, topicNam
 			"peer_id": msg.ReceivedFrom.String(),
 			"data":    string(msg.Data),
 		}
-		wrappedData, _ := json.Marshal(submissionWithMetadata)
+		wrappedData, err := json.Marshal(submissionWithMetadata)
+		if err != nil {
+			log.WithError(err).Error("Failed to marshal wrapped submission")
+			continue
+		}
 
 		// Route to Redis for dequeuer processing (namespaced by protocol:market)
 		queueKey := g.keyBuilder.SubmissionQueue()

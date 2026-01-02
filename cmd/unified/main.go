@@ -1140,11 +1140,16 @@ func (s *UnifiedSequencer) runDequeuerWorker(workerID int) {
 				if p, ok := wrappedSubmission["peer_id"].(string); ok {
 					peerID = p
 				}
-				if dataStr, ok := wrappedSubmission["data"].(string); ok {
+				// Handle json.RawMessage ([]byte), string, or legacy []byte formats
+				if rawMsg, ok := wrappedSubmission["data"].(json.RawMessage); ok {
+					submissionData = []byte(rawMsg)
+				} else if dataStr, ok := wrappedSubmission["data"].(string); ok {
+					// Legacy format: data was stored as escaped JSON string
 					submissionData = []byte(dataStr)
 				} else if data, ok := wrappedSubmission["data"].([]byte); ok {
 					submissionData = data
 				} else {
+					log.Warnf("Worker %d: Unexpected data type in wrapped submission, using raw data", workerID)
 					submissionData = rawSubmissionData // fallback to raw data
 				}
 			} else {
@@ -1154,7 +1159,8 @@ func (s *UnifiedSequencer) runDequeuerWorker(workerID int) {
 
 			// First try to parse as P2P batch submission
 			var p2pSubmission submissions.P2PSnapshotSubmission
-			if err := json.Unmarshal(submissionData, &p2pSubmission); err == nil && p2pSubmission.Submissions != nil {
+			unmarshalErr := json.Unmarshal(submissionData, &p2pSubmission)
+			if unmarshalErr == nil && p2pSubmission.Submissions != nil {
 				// This is a P2P batch submission
 				log.Debugf("Worker %d: Processing P2P batch with %d submissions for epoch %d",
 					workerID, len(p2pSubmission.Submissions), p2pSubmission.EpochID)
@@ -1193,10 +1199,18 @@ func (s *UnifiedSequencer) runDequeuerWorker(workerID int) {
 					}
 				}
 			} else {
+				// P2P batch unmarshalling failed or Submissions was nil - log and try single submission format
+				if unmarshalErr != nil {
+					log.Warnf("Worker %d: Failed to unmarshal as P2P batch submission: %v", workerID, unmarshalErr)
+					log.Debugf("Worker %d: Raw submission data (first 500 bytes): %s", workerID, string(submissionData[:min(500, len(submissionData))]))
+				} else if p2pSubmission.Submissions == nil {
+					log.Debugf("Worker %d: P2P batch submission has nil Submissions array, trying single submission format", workerID)
+				}
+
 				// Try parsing as single submission (fallback)
 				var submission submissions.SnapshotSubmission
 				if err := json.Unmarshal(submissionData, &submission); err != nil {
-					log.Errorf("Worker %d: Failed to parse submission: %v", workerID, err)
+					log.Errorf("Worker %d: Failed to parse submission (both P2P batch and single formats failed): %v", workerID, err)
 					log.Debugf("Worker %d: Raw submission data: %s", workerID, string(submissionData[:min(200, len(submissionData))]))
 					continue
 				}
