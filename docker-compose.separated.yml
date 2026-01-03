@@ -43,6 +43,9 @@ services:
       - GOSSIPSUB_VALIDATOR_PRESENCE_TOPIC=${GOSSIPSUB_VALIDATOR_PRESENCE_TOPIC:-/powerloom/validator/presence}
       - GOSSIPSUB_CONSENSUS_VOTES_TOPIC=${GOSSIPSUB_CONSENSUS_VOTES_TOPIC:-/powerloom/consensus/votes}
       - GOSSIPSUB_CONSENSUS_PROPOSALS_TOPIC=${GOSSIPSUB_CONSENSUS_PROPOSALS_TOPIC:-/powerloom/consensus/proposals}
+      # P2P Gateway submission processing configuration
+      - P2P_GATEWAY_SUBMISSION_WORKERS=${P2P_GATEWAY_SUBMISSION_WORKERS:-10}
+      - P2P_GATEWAY_SUBMISSION_CHAN_SIZE=${P2P_GATEWAY_SUBMISSION_CHAN_SIZE:-1000}
     depends_on:
       redis:
         condition: service_healthy

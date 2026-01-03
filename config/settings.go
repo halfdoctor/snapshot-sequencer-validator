@@ -155,6 +155,10 @@ type Settings struct {
 	// Performance Tuning
 	BatchProcessingTimeout time.Duration
 	ContractQueryTimeout   time.Duration
+
+	// P2P Gateway Submission Processing Configuration
+	P2PGatewaySubmissionWorkers  int // Number of worker goroutines for async message processing
+	P2PGatewaySubmissionChanSize int // Buffer size for submission message channel
 }
 
 var (
@@ -302,6 +306,10 @@ func LoadConfig() error {
 		// Contract Addresses
 		ProtocolStateContract:    getEnv("PROTOCOL_STATE_CONTRACT", ""),
 		NewProtocolStateContract: getEnv("NEW_PROTOCOL_STATE_CONTRACT", ""),
+
+		// P2P Gateway Submission Processing Configuration
+		P2PGatewaySubmissionWorkers:  getEnvAsInt("P2P_GATEWAY_SUBMISSION_WORKERS", 10),
+		P2PGatewaySubmissionChanSize: getEnvAsInt("P2P_GATEWAY_SUBMISSION_CHAN_SIZE", 1000),
 	}
 
 	// Load complex configurations that require additional parsing
