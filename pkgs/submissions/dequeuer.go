@@ -282,7 +282,7 @@ func (d *Dequeuer) verifySignature(submission *SnapshotSubmission) (common.Addre
 		return common.Address{}, fmt.Errorf("signature verification failed: %w", err)
 	}
 
-	log.Infof("EIP-712 signature verified: epoch=%d, slot=%d, deadline=%d, project=%s, signer=%s, CID=%s",
+	log.Infof("EIP-712 signer extracted: epoch=%d, slot=%d, deadline=%d, project=%s, signer=%s, CID=%s",
 		submission.Request.EpochId, submission.Request.SlotId, submission.Request.Deadline,
 		submission.Request.ProjectId, signerAddr.Hex(), submission.Request.SnapshotCid)
 
@@ -339,23 +339,26 @@ func (d *Dequeuer) storeProcessingResult(submissionID string, processed *Process
 
 	// Add submission ID to ZSET for deterministic ordering (score = timestamp)
 	submissionsIdsKey := epochKeyBuilder.EpochSubmissionsIds(epochIDStr)
-	if err := d.redisClient.ZAdd(ctx, submissionsIdsKey, redis.Z{
+	zsetErr := d.redisClient.ZAdd(ctx, submissionsIdsKey, redis.Z{
 		Score:  float64(time.Now().Unix()),
 		Member: submissionID,
-	}).Err(); err != nil {
-		log.Errorf("❌ CRITICAL: Failed to add submission %s to ZSET %s: %v", submissionID, submissionsIdsKey, err)
+	}).Err()
+	if zsetErr != nil {
+		log.Errorf("❌ CRITICAL: Failed to add submission %s to ZSET %s: %v", submissionID, submissionsIdsKey, zsetErr)
 		// Continue - don't fail entire operation, but this is a critical error
-	} else {
-		log.Debugf("✅ Added submission %s to ZSET %s", submissionID, submissionsIdsKey)
 	}
 
 	// Store submission data in epoch-keyed HASH for deterministic lookup
 	submissionsDataKey := epochKeyBuilder.EpochSubmissionsData(epochIDStr)
-	if err := d.redisClient.HSet(ctx, submissionsDataKey, submissionID, data).Err(); err != nil {
-		log.Errorf("❌ CRITICAL: Failed to store submission %s in HASH %s: %v", submissionID, submissionsDataKey, err)
+	hashErr := d.redisClient.HSet(ctx, submissionsDataKey, submissionID, data).Err()
+	if hashErr != nil {
+		log.Errorf("❌ CRITICAL: Failed to store submission %s in HASH %s: %v", submissionID, submissionsDataKey, hashErr)
 		// Continue - don't fail entire operation, but this is a critical error
-	} else {
-		log.Debugf("✅ Stored submission %s in HASH %s", submissionID, submissionsDataKey)
+	}
+
+	// Combined log for both operations (only when both succeed)
+	if zsetErr == nil && hashErr == nil {
+		log.Debugf("✅ Added and stored submission %s to ZSET %s and HASH %s", submissionID, submissionsIdsKey, submissionsDataKey)
 	}
 
 	// Set TTL on BOTH epoch structures (2 hours covers finalization window + buffer)

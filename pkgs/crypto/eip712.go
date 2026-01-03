@@ -93,10 +93,6 @@ func (v *EIP712Verifier) HashRequest(request *SnapshotRequest) ([]byte, error) {
 	rawData = append(rawData, typedDataHash...)
 	hash := crypto.Keccak256Hash(rawData)
 
-	log.Debugf("EIP-712 hash components: slotId=%d, deadline=%d, epochId=%d, projectId=%s, CID=%s, domainSep=0x%x, typedHash=0x%x, final=0x%x",
-		request.SlotId, request.Deadline, request.EpochId, request.ProjectId, request.SnapshotCid,
-		domainSeparator, typedDataHash, hash.Bytes())
-
 	return hash.Bytes(), nil
 }
 
@@ -144,9 +140,6 @@ func (v *EIP712Verifier) VerifySignature(request *SnapshotRequest, signatureStr 
 		return common.Address{}, fmt.Errorf("invalid signature length: got %d bytes, expected 65 (input was %d chars)", len(signature), len(signatureStr))
 	}
 
-	log.Debugf("EIP-712 signature decode: hex_input=%s, r=%x, s=%x, v=%d",
-		signatureStr[:20]+"...", signature[0:4], signature[32:36], signature[64])
-
 	// Hash the request
 	msgHash, err := v.HashRequest(request)
 	if err != nil {
@@ -159,10 +152,6 @@ func (v *EIP712Verifier) VerifySignature(request *SnapshotRequest, signatureStr 
 		return common.Address{}, fmt.Errorf("address recovery failed (msgHash=0x%x, sig_v=%d): %w",
 			msgHash, signature[64], err)
 	}
-
-	// Debug logging to trace signature verification
-	log.Debugf("EIP-712 verification details: slotId=%d, deadline=%d, epochId=%d, projectId=%s, CID=%s, msgHash=0x%x, signer=%s",
-		request.SlotId, request.Deadline, request.EpochId, request.ProjectId, request.SnapshotCid, msgHash, signerAddr.Hex())
 
 	return signerAddr, nil
 }
