@@ -738,138 +738,138 @@ func (g *P2PGateway) handleSubmissionMessages(sub *pubsub.Subscription, topicNam
 func (g *P2PGateway) processSubmissionMessage(msg *pubsub.Message, topicName string) {
 	// Get discovery topic to compare
 	discoveryTopic, _ := g.config.GetSnapshotSubmissionTopics()
-	topicLabel := "SUBMISSION"
-	if topicName == discoveryTopic {
-		topicLabel = "TEST/DISCOVERY"
-	}
-	log.Infof("📨 RECEIVED %s on %s from peer %s (size: %d bytes)",
-		topicLabel, topicName, msg.ReceivedFrom.ShortString(), len(msg.Data))
-
-	// Emit submission received event
-	payload, _ := json.Marshal(map[string]interface{}{
-		"peer_id":    msg.ReceivedFrom.String(),
-		"topic_name": topicName,
-		"size":       len(msg.Data),
-	})
-	if err := g.eventEmitter.Emit(&events.Event{
-		Type:      events.EventSubmissionReceived,
-		Severity:  events.SeverityInfo,
-		Component: "p2p-gateway",
-		Timestamp: time.Now(),
-		Payload:   json.RawMessage(payload),
-	}); err != nil {
-		log.WithError(err).Error("Failed to emit submission received event")
-	}
-
-	// Update metrics
-	submissionsCounter := g.metricsRegistry.GetOrCreate(metrics.MetricConfig{
-		Name:   "submissions.received.total",
-		Type:   metrics.MetricTypeCounter,
-		Help:   "Total submissions received",
-		Labels: metrics.Labels{},
-	})
-	if counter, ok := submissionsCounter.(*metrics.Counter); ok {
-		counter.Inc()
-	}
-
-	bytesCounter := g.metricsRegistry.GetOrCreate(metrics.MetricConfig{
-		Name:   "submissions.received.bytes",
-		Type:   metrics.MetricTypeCounter,
-		Help:   "Total bytes received",
-		Labels: metrics.Labels{},
-	})
-	if counter, ok := bytesCounter.(*metrics.Counter); ok {
-		counter.Add(float64(len(msg.Data)))
-	}
-
-	// Write to submissions timeline with enhanced entity ID generation
-	timestamp := time.Now().Unix()
-	timelineKey := g.keyBuilder.MetricsSubmissionsTimeline()
-
-	// Extract detailed metadata from the submission message
-	metadata, err := g.extractSubmissionMetadata(msg.Data, msg.ReceivedFrom, timestamp, topicName)
-	if err != nil {
-		log.WithError(err).Warn("Failed to extract submission metadata, using basic info")
-	}
-
-	// Generate enhanced entity ID
-	entityID, idType := g.generateEntityID(metadata)
-	metadata.EntityID = entityID
-
-	// Add entity ID to timeline
-	if err := g.redisClient.ZAdd(g.ctx, timelineKey, redis.Z{
-		Score:  float64(timestamp),
-		Member: entityID,
-	}).Err(); err != nil {
-		log.WithError(err).Error("Failed to write submission to timeline")
-	}
-
-	// Store detailed metadata for enhanced monitoring
-	if idType == "enhanced" {
-		if err := g.storeSubmissionMetadata(metadata); err != nil {
-			log.WithError(err).Warn("Failed to store submission metadata")
+		topicLabel := "SUBMISSION"
+		if topicName == discoveryTopic {
+			topicLabel = "TEST/DISCOVERY"
 		}
-		log.Infof("📝 Enhanced submission timeline entry: %s (epoch=%d, slot=%d, project=%s, peer=%s)",
-			entityID, metadata.EpochID, metadata.SlotID, metadata.ProjectID, msg.ReceivedFrom.ShortString())
-	} else {
-		log.Infof("📝 Legacy submission timeline entry: %s (peer=%s)", entityID, msg.ReceivedFrom.ShortString())
-	}
+		log.Infof("📨 RECEIVED %s on %s from peer %s (size: %d bytes)",
+			topicLabel, topicName, msg.ReceivedFrom.ShortString(), len(msg.Data))
 
-	// Wrap submission data with peer ID metadata for dequeuer
-	submissionWithMetadata := map[string]interface{}{
-		"peer_id": msg.ReceivedFrom.String(),
-		"data":    string(msg.Data),
-	}
+		// Emit submission received event
+		payload, _ := json.Marshal(map[string]interface{}{
+			"peer_id":    msg.ReceivedFrom.String(),
+			"topic_name": topicName,
+			"size":       len(msg.Data),
+		})
+		if err := g.eventEmitter.Emit(&events.Event{
+			Type:      events.EventSubmissionReceived,
+			Severity:  events.SeverityInfo,
+			Component: "p2p-gateway",
+			Timestamp: time.Now(),
+			Payload:   json.RawMessage(payload),
+		}); err != nil {
+			log.WithError(err).Error("Failed to emit submission received event")
+		}
+
+		// Update metrics
+		submissionsCounter := g.metricsRegistry.GetOrCreate(metrics.MetricConfig{
+			Name:   "submissions.received.total",
+			Type:   metrics.MetricTypeCounter,
+			Help:   "Total submissions received",
+			Labels: metrics.Labels{},
+		})
+		if counter, ok := submissionsCounter.(*metrics.Counter); ok {
+			counter.Inc()
+		}
+
+		bytesCounter := g.metricsRegistry.GetOrCreate(metrics.MetricConfig{
+			Name:   "submissions.received.bytes",
+			Type:   metrics.MetricTypeCounter,
+			Help:   "Total bytes received",
+			Labels: metrics.Labels{},
+		})
+		if counter, ok := bytesCounter.(*metrics.Counter); ok {
+			counter.Add(float64(len(msg.Data)))
+		}
+
+		// Write to submissions timeline with enhanced entity ID generation
+		timestamp := time.Now().Unix()
+		timelineKey := g.keyBuilder.MetricsSubmissionsTimeline()
+
+		// Extract detailed metadata from the submission message
+		metadata, err := g.extractSubmissionMetadata(msg.Data, msg.ReceivedFrom, timestamp, topicName)
+		if err != nil {
+			log.WithError(err).Warn("Failed to extract submission metadata, using basic info")
+		}
+
+		// Generate enhanced entity ID
+		entityID, idType := g.generateEntityID(metadata)
+		metadata.EntityID = entityID
+
+		// Add entity ID to timeline
+		if err := g.redisClient.ZAdd(g.ctx, timelineKey, redis.Z{
+			Score:  float64(timestamp),
+			Member: entityID,
+		}).Err(); err != nil {
+			log.WithError(err).Error("Failed to write submission to timeline")
+		}
+
+		// Store detailed metadata for enhanced monitoring
+		if idType == "enhanced" {
+			if err := g.storeSubmissionMetadata(metadata); err != nil {
+				log.WithError(err).Warn("Failed to store submission metadata")
+			}
+			log.Infof("📝 Enhanced submission timeline entry: %s (epoch=%d, slot=%d, project=%s, peer=%s)",
+				entityID, metadata.EpochID, metadata.SlotID, metadata.ProjectID, msg.ReceivedFrom.ShortString())
+		} else {
+			log.Infof("📝 Legacy submission timeline entry: %s (peer=%s)", entityID, msg.ReceivedFrom.ShortString())
+		}
+
+		// Wrap submission data with peer ID metadata for dequeuer
+		submissionWithMetadata := map[string]interface{}{
+			"peer_id": msg.ReceivedFrom.String(),
+			"data":    string(msg.Data),
+		}
 	wrappedData, err := json.Marshal(submissionWithMetadata)
 	if err != nil {
 		log.WithError(err).Error("Failed to marshal wrapped submission")
 		return
 	}
 
-	// Route to Redis for dequeuer processing (namespaced by protocol:market)
-	queueKey := g.keyBuilder.SubmissionQueue()
-	queueDepthBefore, _ := g.redisClient.LLen(g.ctx, queueKey).Result()
+		// Route to Redis for dequeuer processing (namespaced by protocol:market)
+		queueKey := g.keyBuilder.SubmissionQueue()
+		queueDepthBefore, _ := g.redisClient.LLen(g.ctx, queueKey).Result()
 
-	if err := g.redisClient.LPush(g.ctx, queueKey, wrappedData).Err(); err != nil {
-		log.WithError(err).Error("Failed to push submission to Redis")
-		failedCounter := g.metricsRegistry.GetOrCreate(metrics.MetricConfig{
-			Name:   "submissions.routing.failed",
-			Type:   metrics.MetricTypeCounter,
-			Help:   "Failed routing attempts",
-			Labels: metrics.Labels{},
-		})
-		if counter, ok := failedCounter.(*metrics.Counter); ok {
-			counter.Inc()
-		}
-	} else {
-		log.Infof("✅ P2P Gateway: Routed %s to Redis queue", topicLabel)
-		successCounter := g.metricsRegistry.GetOrCreate(metrics.MetricConfig{
-			Name:   "submissions.routing.success",
-			Type:   metrics.MetricTypeCounter,
-			Help:   "Successful routing attempts",
-			Labels: metrics.Labels{},
-		})
-		if counter, ok := successCounter.(*metrics.Counter); ok {
-			counter.Inc()
-		}
+		if err := g.redisClient.LPush(g.ctx, queueKey, wrappedData).Err(); err != nil {
+			log.WithError(err).Error("Failed to push submission to Redis")
+			failedCounter := g.metricsRegistry.GetOrCreate(metrics.MetricConfig{
+				Name:   "submissions.routing.failed",
+				Type:   metrics.MetricTypeCounter,
+				Help:   "Failed routing attempts",
+				Labels: metrics.Labels{},
+			})
+			if counter, ok := failedCounter.(*metrics.Counter); ok {
+				counter.Inc()
+			}
+		} else {
+			log.Infof("✅ P2P Gateway: Routed %s to Redis queue", topicLabel)
+			successCounter := g.metricsRegistry.GetOrCreate(metrics.MetricConfig{
+				Name:   "submissions.routing.success",
+				Type:   metrics.MetricTypeCounter,
+				Help:   "Successful routing attempts",
+				Labels: metrics.Labels{},
+			})
+			if counter, ok := successCounter.(*metrics.Counter); ok {
+				counter.Inc()
+			}
 
-		// Emit queue depth change event
-		queuePayload, _ := json.Marshal(map[string]interface{}{
-			"queue_name":     "submission",
-			"current_depth":  int(queueDepthBefore) + 1,
-			"previous_depth": int(queueDepthBefore),
-		})
-		if err := g.eventEmitter.Emit(&events.Event{
-			Type:      events.EventQueueDepthChanged,
-			Severity:  events.SeverityDebug,
-			Component: "p2p-gateway",
-			Timestamp: time.Now(),
-			Payload:   json.RawMessage(queuePayload),
-		}); err != nil {
-			log.WithError(err).Error("Failed to emit queue depth changed event")
+			// Emit queue depth change event
+			queuePayload, _ := json.Marshal(map[string]interface{}{
+				"queue_name":     "submission",
+				"current_depth":  int(queueDepthBefore) + 1,
+				"previous_depth": int(queueDepthBefore),
+			})
+			if err := g.eventEmitter.Emit(&events.Event{
+				Type:      events.EventQueueDepthChanged,
+				Severity:  events.SeverityDebug,
+				Component: "p2p-gateway",
+				Timestamp: time.Now(),
+				Payload:   json.RawMessage(queuePayload),
+			}); err != nil {
+				log.WithError(err).Error("Failed to emit queue depth changed event")
+			}
 		}
 	}
-}
 
 // startSubmissionWorkers starts worker goroutines to process submission messages asynchronously
 func (g *P2PGateway) startSubmissionWorkers() {
