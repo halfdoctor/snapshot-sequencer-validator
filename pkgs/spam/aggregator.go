@@ -194,7 +194,7 @@ func (a *SpamAggregator) processSpamReportDirect(data []byte) {
 		"window_id":       windowID,
 		"validator_count": aggregated.ValidatorCount,
 		"reporter_id":     report.ReporterID,
-	}).Debugf("Aggregated spam report for peer %s (window %d, validators: %d)", report.PeerID, windowID, aggregated.ValidatorCount)
+	}).Infof("Aggregated spam report for peer %s (window %d, validators: %d)", report.PeerID, windowID, aggregated.ValidatorCount)
 }
 
 // CheckWindowForConsensus checks a specific window for consensus and flags if reached
@@ -290,6 +290,11 @@ func (a *SpamAggregator) periodicConsensusCheck() {
 			if err := a.pruneExpiredWindows(a.ctx); err != nil {
 				log.Warnf("Failed to prune expired windows: %v", err)
 			}
+
+			// Prune old epoch peer sets (fallback cleanup - they should be deleted after aggregation)
+			if err := a.pruneOldEpochPeerSets(a.ctx); err != nil {
+				log.Warnf("Failed to prune old epoch peer sets: %v", err)
+			}
 		}
 	}
 }
@@ -330,6 +335,66 @@ func (a *SpamAggregator) pruneExpiredWindows(ctx context.Context) error {
 			return fmt.Errorf("failed to remove expired windows: %w", err)
 		}
 		log.Debugf("Pruned %d expired windows from master set", len(expiredWindows))
+	}
+
+	return nil
+}
+
+// pruneOldEpochPeerSets removes epoch peer sets that are older than the oldest active window
+// This is a fallback cleanup - epoch peer sets should be deleted immediately after aggregation
+func (a *SpamAggregator) pruneOldEpochPeerSets(ctx context.Context) error {
+	// Get all windows to find the oldest active window
+	windowsSetKey := a.getWindowsSetKey()
+	windowIDs, err := a.redisClient.SMembers(ctx, windowsSetKey).Result()
+	if err != nil {
+		return fmt.Errorf("failed to get windows set: %w", err)
+	}
+
+	if len(windowIDs) == 0 {
+		return nil // No windows, nothing to prune
+	}
+
+	// Find the oldest window ID
+	oldestWindowID := -1
+	for _, windowIDStr := range windowIDs {
+		windowID, err := strconv.Atoi(windowIDStr)
+		if err != nil {
+			continue
+		}
+		if oldestWindowID == -1 || windowID < oldestWindowID {
+			oldestWindowID = windowID
+		}
+	}
+
+	if oldestWindowID == -1 {
+		return nil
+	}
+
+	// Calculate the oldest epoch we need to keep (oldest window start - 1 for safety margin)
+	oldestEpochToKeep := uint64(oldestWindowID - a.windowSize - 1)
+
+	// Delete epoch peer sets older than oldestEpochToKeep
+	// We check a reasonable range (e.g., up to 100 epochs back) to avoid checking too many
+	maxEpochsToCheck := uint64(100)
+	prunedCount := 0
+	for epoch := uint64(1); epoch < oldestEpochToKeep && epoch < maxEpochsToCheck; epoch++ {
+		// Construct epoch peers key directly (same format as tracker)
+		epochPeersKey := fmt.Sprintf("%s:%s:spam:epoch:%d:peers", a.keyBuilder.ProtocolState, a.keyBuilder.DataMarket, epoch)
+		exists, err := a.redisClient.Exists(ctx, epochPeersKey).Result()
+		if err != nil {
+			continue
+		}
+		if exists > 0 {
+			if err := a.redisClient.Del(ctx, epochPeersKey).Err(); err != nil {
+				log.Warnf("Failed to delete old epoch peers set for epoch %d: %v", epoch, err)
+			} else {
+				prunedCount++
+			}
+		}
+	}
+
+	if prunedCount > 0 {
+		log.Debugf("Pruned %d old epoch peer sets (older than epoch %d)", prunedCount, oldestEpochToKeep)
 	}
 
 	return nil
@@ -381,4 +446,177 @@ func (a *SpamAggregator) storeAggregatedReport(windowKey string, aggregated *Agg
 // getAggregationWindowKey returns the Redis key for an aggregation window
 func (a *SpamAggregator) getAggregationWindowKey(peerID string, windowID int) string {
 	return fmt.Sprintf("%s:%s:spam:reports:peer:%s:window:%d", a.keyBuilder.ProtocolState, a.keyBuilder.DataMarket, peerID, windowID)
+}
+
+// CreateWindowAndAggregateLocalData creates a window at epoch boundary and aggregates all local tracking data
+// This is called when epochID % windowSize == 0 (e.g., epochs 10, 20, 30, etc.)
+// It scans all local tracking data from the last 10 epochs and aggregates it into the window
+func (a *SpamAggregator) CreateWindowAndAggregateLocalData(ctx context.Context, epochID uint64, tracker *SpamTracker) error {
+	// Calculate window ID (end epoch of the window)
+	windowID := ((int(epochID) + a.windowSize - 1) / a.windowSize) * a.windowSize
+
+	// Window start epoch (inclusive)
+	windowStartEpoch := uint64(windowID - a.windowSize + 1)
+	// Window end epoch (inclusive)
+	windowEndEpoch := uint64(windowID)
+
+	log.WithFields(log.Fields{
+		"epoch_id":     epochID,
+		"window_id":    windowID,
+		"window_start": windowStartEpoch,
+		"window_end":   windowEndEpoch,
+	}).Infof("Creating spam aggregation window %d for epochs %d-%d", windowID, windowStartEpoch, windowEndEpoch)
+
+	// Ensure window is added to master set
+	windowsSetKey := a.getWindowsSetKey()
+	windowIDStr := fmt.Sprintf("%d", windowID)
+	if err := a.redisClient.SAdd(ctx, windowsSetKey, windowIDStr).Err(); err != nil {
+		log.Errorf("Failed to add window to master set: %v", err)
+	}
+
+	// Get window peers set key
+	windowPeersKey := a.getWindowPeersKey(windowID)
+
+	// Collect all peer IDs from epoch peer sets (deterministic, no SCAN)
+	peersInWindow := make(map[string]bool)
+
+	// Get peer IDs from each epoch's peer set
+	for epoch := windowStartEpoch; epoch <= windowEndEpoch; epoch++ {
+		epochPeersKey := tracker.GetEpochPeersKey(epoch)
+		peerIDs, err := a.redisClient.SMembers(ctx, epochPeersKey).Result()
+		if err != nil {
+			if err != redis.Nil {
+				log.Warnf("Failed to get epoch peers set for epoch %d: %v", epoch, err)
+			}
+			continue
+		}
+		for _, peerID := range peerIDs {
+			peersInWindow[peerID] = true
+		}
+	}
+
+	// For each peer found, aggregate their data into the window
+	for peerID := range peersInWindow {
+		// Skip whitelisted peers
+		if a.whitelist != nil && a.whitelist.IsWhitelisted(peerID) {
+			continue
+		}
+
+		// Get or create aggregated report for this peer in this window
+		windowKey := a.getAggregationWindowKey(peerID, windowID)
+		aggregated, err := a.getOrCreateAggregatedReport(windowKey, peerID)
+		if err != nil {
+			log.Errorf("Failed to get/create aggregated report for peer %s: %v", peerID, err)
+			continue
+		}
+
+		// Aggregate local tracking data from all epochs in the window
+		firstEpoch := uint64(0)
+		lastEpoch := uint64(0)
+		totalSubmissions := 0
+		totalValidationFailures := 0
+		snapshotterAddrs := make(map[string]bool)
+
+		for epoch := windowStartEpoch; epoch <= windowEndEpoch; epoch++ {
+			// Get submission count
+			submissionCount, err := tracker.GetSubmissionCount(ctx, peerID, epoch)
+			if err != nil {
+				log.Warnf("Failed to get submission count for peer %s epoch %d: %v", peerID, epoch, err)
+			} else if submissionCount > 0 {
+				totalSubmissions += submissionCount
+				if firstEpoch == 0 {
+					firstEpoch = epoch
+				}
+				lastEpoch = epoch
+
+				// Get snapshotter addresses for this epoch
+				assocKey := tracker.GetPeerSnapshotterMapKey(peerID, epoch)
+				addrs, err := a.redisClient.SMembers(ctx, assocKey).Result()
+				if err == nil {
+					for _, addr := range addrs {
+						snapshotterAddrs[addr] = true
+					}
+				}
+			}
+
+			// Get validation failure count
+			failureCount, err := tracker.GetValidationFailureCount(ctx, peerID, epoch)
+			if err != nil {
+				log.Warnf("Failed to get validation failure count for peer %s epoch %d: %v", peerID, epoch, err)
+			} else if failureCount > 0 {
+				totalValidationFailures += failureCount
+				if firstEpoch == 0 {
+					firstEpoch = epoch
+				}
+				if epoch > lastEpoch {
+					lastEpoch = epoch
+				}
+			}
+		}
+
+		// Update aggregated report with local tracking data
+		if firstEpoch > 0 {
+			if aggregated.FirstEpoch == 0 || firstEpoch < aggregated.FirstEpoch {
+				aggregated.FirstEpoch = firstEpoch
+			}
+			if lastEpoch > aggregated.LastEpoch {
+				aggregated.LastEpoch = lastEpoch
+			}
+		}
+
+		// Add snapshotter addresses
+		for addr := range snapshotterAddrs {
+			addrExists := false
+			for _, existingAddr := range aggregated.SnapshotterAddrs {
+				if existingAddr == addr {
+					addrExists = true
+					break
+				}
+			}
+			if !addrExists {
+				aggregated.SnapshotterAddrs = append(aggregated.SnapshotterAddrs, addr)
+			}
+		}
+
+		// Store aggregated report
+		if err := a.storeAggregatedReport(windowKey, aggregated); err != nil {
+			log.Errorf("Failed to store aggregated report for peer %s: %v", peerID, err)
+			continue
+		}
+
+		// Add peer to window peers set
+		if err := a.redisClient.SAdd(ctx, windowPeersKey, peerID).Err(); err != nil {
+			log.Errorf("Failed to add peer to window peers set: %v", err)
+		} else {
+			// Set TTL on the set
+			if err := a.redisClient.Expire(ctx, windowPeersKey, AGGREGATION_TTL).Err(); err != nil {
+				log.Warnf("Failed to set TTL on window peers set: %v", err)
+			}
+		}
+
+		log.WithFields(log.Fields{
+			"peer_id":                   peerID,
+			"window_id":                 windowID,
+			"total_submissions":         totalSubmissions,
+			"total_validation_failures": totalValidationFailures,
+			"epoch_range":               fmt.Sprintf("%d-%d", firstEpoch, lastEpoch),
+		}).Debugf("Aggregated local tracking data for peer %s in window %d", peerID, windowID)
+	}
+
+	log.WithFields(log.Fields{
+		"window_id":   windowID,
+		"peers_count": len(peersInWindow),
+		"epoch_range": fmt.Sprintf("%d-%d", windowStartEpoch, windowEndEpoch),
+	}).Infof("Created spam aggregation window %d with %d peers", windowID, len(peersInWindow))
+
+	// Clean up epoch peer sets after aggregation (they've been aggregated into the window)
+	// This prevents accumulation of old epoch peer sets
+	for epoch := windowStartEpoch; epoch <= windowEndEpoch; epoch++ {
+		epochPeersKey := tracker.GetEpochPeersKey(epoch)
+		if err := a.redisClient.Del(ctx, epochPeersKey).Err(); err != nil {
+			log.Warnf("Failed to delete epoch peers set for epoch %d: %v", epoch, err)
+		}
+	}
+
+	return nil
 }

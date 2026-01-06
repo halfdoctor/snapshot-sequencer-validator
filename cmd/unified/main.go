@@ -688,6 +688,9 @@ func main() {
 				}
 				return []string{}
 			}(),
+
+			// Spam protection components
+			SpamComponents: spamComponents,
 		}
 
 		var err error

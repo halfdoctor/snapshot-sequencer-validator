@@ -59,6 +59,17 @@ func (t *SpamTracker) TrackValidationFailure(ctx context.Context, peerID, snapsh
 		log.Warnf("Failed to set TTL on peer validation failure key: %v", err)
 	}
 
+	// Add peer ID to epoch's peer set (for deterministic discovery at epoch boundaries)
+	epochPeersKey := t.getEpochPeersKey(epochID)
+	if err := t.redisClient.SAdd(ctx, epochPeersKey, peerID).Err(); err != nil {
+		log.Warnf("Failed to add peer to epoch peers set: %v", err)
+	} else {
+		// Set TTL on epoch peers set (same as tracking TTL)
+		if err := t.redisClient.Expire(ctx, epochPeersKey, SPAM_TRACKING_TTL).Err(); err != nil {
+			log.Warnf("Failed to set TTL on epoch peers set: %v", err)
+		}
+	}
+
 	// Track by snapshotter address (secondary, if available)
 	if snapshotterAddr != "" {
 		snapshotterKey := t.getSnapshotterValidationFailureKey(snapshotterAddr, epochID)
@@ -98,6 +109,17 @@ func (t *SpamTracker) TrackSubmissionCount(ctx context.Context, peerID, snapshot
 	}
 	if err := t.redisClient.Expire(ctx, peerKey, SPAM_TRACKING_TTL).Err(); err != nil {
 		log.Warnf("Failed to set TTL on peer submission count key: %v", err)
+	}
+
+	// Add peer ID to epoch's peer set (for deterministic discovery at epoch boundaries)
+	epochPeersKey := t.getEpochPeersKey(epochID)
+	if err := t.redisClient.SAdd(ctx, epochPeersKey, peerID).Err(); err != nil {
+		log.Warnf("Failed to add peer to epoch peers set: %v", err)
+	} else {
+		// Set TTL on epoch peers set (same as tracking TTL)
+		if err := t.redisClient.Expire(ctx, epochPeersKey, SPAM_TRACKING_TTL).Err(); err != nil {
+			log.Warnf("Failed to set TTL on epoch peers set: %v", err)
+		}
 	}
 
 	// Track by snapshotter address (secondary, for evidence)
@@ -165,8 +187,8 @@ func (t *SpamTracker) ShouldReportSpam(ctx context.Context, peerID string, epoch
 		return true, "validation_failure", nil
 	}
 
-	// Check submission count (requires consecutive epochs with violations)
-	// Check if current epoch has violation
+	// Check submission count (requires consecutive epochs with violations for network reports)
+	// Local tracking happens every epoch, but network reports only sent when threshold met
 	submissionCount, err := t.GetSubmissionCount(ctx, peerID, epochID)
 	if err != nil {
 		return false, "", err
@@ -237,4 +259,18 @@ func (t *SpamTracker) getSnapshotterSubmissionCountKey(snapshotterAddr string, e
 
 func (t *SpamTracker) getPeerSnapshotterMapKey(peerID string, epochID uint64) string {
 	return fmt.Sprintf("%s:%s:spam:peer_snapshotter_map:%s:%d", t.keyBuilder.ProtocolState, t.keyBuilder.DataMarket, peerID, epochID)
+}
+
+// GetPeerSnapshotterMapKey returns the Redis key for peer-snapshotter mapping (public access)
+func (t *SpamTracker) GetPeerSnapshotterMapKey(peerID string, epochID uint64) string {
+	return t.getPeerSnapshotterMapKey(peerID, epochID)
+}
+
+func (t *SpamTracker) getEpochPeersKey(epochID uint64) string {
+	return fmt.Sprintf("%s:%s:spam:epoch:%d:peers", t.keyBuilder.ProtocolState, t.keyBuilder.DataMarket, epochID)
+}
+
+// GetEpochPeersKey returns the Redis key for epoch peers set (public access)
+func (t *SpamTracker) GetEpochPeersKey(epochID uint64) string {
+	return t.getEpochPeersKey(epochID)
 }

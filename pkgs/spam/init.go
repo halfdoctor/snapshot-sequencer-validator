@@ -87,6 +87,7 @@ func InitializeSpamProtection(ctx context.Context, cfg *config.Settings, redisCl
 		RateLimiter: rateLimiter,
 		Flagging:    flagging,
 		Reporter:    reporter,
+		Aggregator:  aggregator,
 	}, nil
 }
 
@@ -96,4 +97,15 @@ type SpamComponents struct {
 	RateLimiter *RateLimiter
 	Flagging    *FlaggingService
 	Reporter    *SpamReporter
+	Aggregator  *SpamAggregator
+}
+
+// GetAggregator returns the spam aggregator (for use in other packages)
+func (sc *SpamComponents) GetAggregator() *SpamAggregator {
+	return sc.Aggregator
+}
+
+// GetTracker returns the spam tracker (for use in other packages)
+func (sc *SpamComponents) GetTracker() *SpamTracker {
+	return sc.Tracker
 }

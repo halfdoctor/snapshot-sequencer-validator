@@ -114,8 +114,11 @@ func (r *SpamReporter) CheckAndReport(ctx context.Context, peerID, snapshotterAd
 	}
 
 	if !shouldReport {
+		log.Debugf("Spam check for peer %s epoch %d: shouldReport=false (thresholds not met)", peerID, epochID)
 		return nil
 	}
+
+	log.Infof("Spam check for peer %s epoch %d: shouldReport=true, violationType=%s", peerID, epochID, violationType)
 
 	// Get counts for evidence
 	var count int

@@ -54,6 +54,9 @@ type EventMonitor struct {
 	dataMarkets          []string      // List of data market addresses to monitor
 	estimatedMaxPriority int           // Estimated max priority for total window calculation (default: 10)
 
+	// Spam protection components (optional)
+	spamComponents interface{} // *spam.SpamComponents - using interface{} to avoid circular import
+
 	ctx    context.Context
 	cancel context.CancelFunc
 }
@@ -128,6 +131,9 @@ type Config struct {
 	WindowConfigCacheTTL   time.Duration // Cache TTL for window configs (default: 5 minutes)
 	EstimatedMaxPriority   int           // Estimated max priority for total window calculation (default: 10)
 	NewDataMarketContracts []string      // List of NEW data market addresses that support getSubmissionWindowConfig
+
+	// Spam protection components (optional)
+	SpamComponents interface{} // *spam.SpamComponents - using interface{} to avoid circular import
 }
 
 // NewEventMonitor creates a new event monitor
@@ -369,6 +375,9 @@ func NewEventMonitor(cfg *Config) (*EventMonitor, error) {
 		pollInterval:         cfg.PollInterval,
 		dataMarkets:          cfg.DataMarkets,
 		estimatedMaxPriority: estimatedMaxPriority,
+
+		// Spam protection components
+		spamComponents: cfg.SpamComponents,
 
 		ctx:    ctx,
 		cancel: cancel,
@@ -858,6 +867,37 @@ func (m *EventMonitor) handleEpochReleased(event *EpochReleasedEvent) {
 				ttl := m.redisClient.TTL(m.ctx, activeEpochsKey).Val()
 				if ttl == -1 { // Key exists but has no TTL
 					m.redisClient.Expire(m.ctx, activeEpochsKey, 24*time.Hour)
+				}
+			}
+		}
+	}
+
+	// Check if this is a 10-epoch boundary for spam aggregation windows
+	// Windows are created at epochs 10, 20, 30, etc. (epochID % 10 == 0)
+	epochIDInt := event.EpochID.Uint64()
+	if epochIDInt > 0 && epochIDInt%10 == 0 {
+		// This is a window boundary - create window and aggregate local tracking data
+		// Note: spamComponents may be nil if spam protection is disabled
+		// Use type assertion to access spam components (avoiding circular import)
+		if m.spamComponents != nil {
+			type SpamComponentsInterface interface {
+				GetAggregator() interface{}
+				GetTracker() interface{}
+			}
+			if sc, ok := m.spamComponents.(SpamComponentsInterface); ok {
+				aggregator := sc.GetAggregator()
+				tracker := sc.GetTracker()
+				if aggregator != nil && tracker != nil {
+					// Type assert to actual types (we know they're *SpamAggregator and *SpamTracker)
+					// This is safe because we control the SpamComponents struct
+					type AggregatorInterface interface {
+						CreateWindowAndAggregateLocalData(ctx context.Context, epochID uint64, tracker interface{}) error
+					}
+					if agg, ok := aggregator.(AggregatorInterface); ok {
+						if err := agg.CreateWindowAndAggregateLocalData(m.ctx, epochIDInt, tracker); err != nil {
+							log.Errorf("Failed to create spam aggregation window at epoch boundary %d: %v", epochIDInt, err)
+						}
+					}
 				}
 			}
 		}
