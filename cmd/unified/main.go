@@ -1152,17 +1152,31 @@ func (s *UnifiedSequencer) runDequeuerWorker(workerID int) {
 				if p, ok := wrappedSubmission["peer_id"].(string); ok {
 					peerID = p
 				}
-				// Handle json.RawMessage ([]byte), string, or legacy []byte formats
-				if rawMsg, ok := wrappedSubmission["data"].(json.RawMessage); ok {
-					submissionData = []byte(rawMsg)
-				} else if dataStr, ok := wrappedSubmission["data"].(string); ok {
-					// Legacy format: data was stored as escaped JSON string
+				if dataStr, ok := wrappedSubmission["data"].(string); ok {
 					submissionData = []byte(dataStr)
+				} else if dataMap, ok := wrappedSubmission["data"].(map[string]interface{}); ok {
+					var err error
+					submissionData, err = json.Marshal(dataMap)
+					if err != nil {
+						log.Warnf("Worker %d: Failed to marshal data map: %v", workerID, err)
+						submissionData = rawSubmissionData
+					}
+				} else if dataArray, ok := wrappedSubmission["data"].([]interface{}); ok {
+					var err error
+					submissionData, err = json.Marshal(dataArray)
+					if err != nil {
+						log.Warnf("Worker %d: Failed to marshal data array: %v", workerID, err)
+						submissionData = rawSubmissionData
+					}
 				} else if data, ok := wrappedSubmission["data"].([]byte); ok {
 					submissionData = data
 				} else {
-					log.Warnf("Worker %d: Unexpected data type in wrapped submission, using raw data", workerID)
-					submissionData = rawSubmissionData // fallback to raw data
+					var err error
+					submissionData, err = json.Marshal(wrappedSubmission["data"])
+					if err != nil {
+						log.Warnf("Worker %d: Unexpected data type in wrapped submission, using raw data: %T", workerID, wrappedSubmission["data"])
+						submissionData = rawSubmissionData
+					}
 				}
 			} else {
 				// Legacy format - no wrapper
