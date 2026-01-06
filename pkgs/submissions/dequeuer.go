@@ -160,18 +160,6 @@ func (d *Dequeuer) ProcessSubmission(submission *SnapshotSubmission, submissionI
 		}
 	}
 
-	// Spam protection: Check rate limit (if enabled)
-	if d.enableSpamProtection && d.rateLimiter != nil && peerID != "" {
-		exceeded, err := d.rateLimiter.CheckRateLimit(ctx, peerID, submission.Request.EpochId)
-		if err != nil {
-			log.Warnf("Failed to check rate limit: %v", err)
-		} else if exceeded {
-			d.updateStats(false, time.Since(startTime))
-			log.Warnf("Rejected submission: rate limit exceeded for peer %s (epoch %d)", peerID, submission.Request.EpochId)
-			return fmt.Errorf("rate limit exceeded for peer: %s", peerID)
-		}
-	}
-
 	// Validate snapshotter address against slot registration (if enabled)
 	if d.enableSlotValidation && snapshotterAddr != (common.Address{}) {
 		if err := d.slotValidator.ValidateSnapshotterForSlot(submission.Request.SlotId, snapshotterAddr); err != nil {
@@ -191,12 +179,14 @@ func (d *Dequeuer) ProcessSubmission(submission *SnapshotSubmission, submissionI
 	}
 
 	// Spam protection: Track submission count (if enabled)
+	// NOTE: We track FIRST, then check if spam should be reported
+	// Rate limiting is NOT enforced here - only flagged peers (after consensus) are rejected
 	if d.enableSpamProtection && d.spamTracker != nil && peerID != "" {
 		_, err := d.spamTracker.TrackSubmissionCount(ctx, peerID, snapshotterAddr.Hex(), submission.Request.EpochId)
 		if err != nil {
 			log.Warnf("Failed to track submission count: %v", err)
 		} else {
-			// Check if spam should be reported
+			// Check if spam should be reported (checks consecutive violations threshold)
 			if d.spamReporter != nil {
 				if err := d.spamReporter.CheckAndReport(ctx, peerID, snapshotterAddr.Hex(), submission.Request.EpochId); err != nil {
 					log.Warnf("Failed to check/report spam: %v", err)
