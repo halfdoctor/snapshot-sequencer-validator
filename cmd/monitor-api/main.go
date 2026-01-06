@@ -2513,12 +2513,14 @@ func (m *MonitorAPI) PeerSpamInfo(c *gin.Context) {
 	}
 
 	// Get aggregation window info (if available)
-	// Window ID = epochID / windowSize (hardcoded to 10 for consensus consistency)
+	// Window ID = round up to next multiple of 10 (end epoch of the 10-epoch range)
+	// Formula: ((epochID + 9) / 10) * 10
+	// Epochs 1-10 → Window 10, Epochs 11-20 → Window 20, etc.
 	const windowSize = 10
 	if epochIDStr != "" {
 		epochID, err := strconv.ParseUint(epochIDStr, 10, 64)
 		if err == nil {
-			windowID := epochID / uint64(windowSize)
+			windowID := ((epochID + uint64(windowSize) - 1) / uint64(windowSize)) * uint64(windowSize)
 			aggKey := fmt.Sprintf("%s:%s:spam:reports:peer:%s:window:%d", kb.ProtocolState, kb.DataMarket, peerID, windowID)
 			aggData, err := m.redis.Get(m.ctx, aggKey).Result()
 			if err == nil {
@@ -2548,6 +2550,161 @@ func (m *MonitorAPI) PeerSpamInfo(c *gin.Context) {
 
 	result["timestamp"] = time.Now()
 	c.JSON(http.StatusOK, result)
+}
+
+// @Summary List all aggregation windows with reports
+// @Description Get list of all windows that have spam reports (for discovery/indexing)
+// @Tags spam
+// @Produce json
+// @Param protocol query string false "Protocol state identifier"
+// @Param market query string false "Data market address"
+// @Success 200 {object} map[string]interface{} "List of window IDs with basic info"
+// @Router /spam/windows [get]
+func (m *MonitorAPI) SpamWindows(c *gin.Context) {
+	protocol := c.Query("protocol")
+	market := c.Query("market")
+
+	kb := m.keyBuilder
+	if protocol != "" || market != "" {
+		if protocol == "" {
+			protocol = m.keyBuilder.ProtocolState
+		}
+		if market == "" {
+			market = m.keyBuilder.DataMarket
+		}
+		kb = keys.NewKeyBuilder(protocol, market)
+	}
+
+	windowsSetKey := fmt.Sprintf("%s:%s:spam:reports:windows", kb.ProtocolState, kb.DataMarket)
+	windowIDs, err := m.redis.SMembers(m.ctx, windowsSetKey).Result()
+	if err != nil {
+		c.JSON(http.StatusOK, gin.H{
+			"windows": []interface{}{},
+			"count":   0,
+		})
+		return
+	}
+
+	// Sort window IDs numerically and get details for each
+	windows := make([]map[string]interface{}, 0)
+	for _, windowIDStr := range windowIDs {
+		windowID, err := strconv.Atoi(windowIDStr)
+		if err != nil {
+			continue
+		}
+
+		// Get peer count in this window
+		windowPeersKey := fmt.Sprintf("%s:%s:spam:reports:window:%d:peers", kb.ProtocolState, kb.DataMarket, windowID)
+		peerCount, _ := m.redis.SCard(m.ctx, windowPeersKey).Result()
+
+		// Calculate epoch range
+		firstEpoch := windowID - 9
+		lastEpoch := windowID
+
+		windows = append(windows, map[string]interface{}{
+			"window_id":   windowID,
+			"epoch_range": fmt.Sprintf("%d-%d", firstEpoch, lastEpoch),
+			"first_epoch": firstEpoch,
+			"last_epoch":  lastEpoch,
+			"peer_count":  peerCount,
+		})
+	}
+
+	// Sort by window ID descending (latest first)
+	sort.Slice(windows, func(i, j int) bool {
+		return windows[i]["window_id"].(int) > windows[j]["window_id"].(int)
+	})
+
+	c.JSON(http.StatusOK, gin.H{
+		"windows":   windows,
+		"count":     len(windows),
+		"timestamp": time.Now(),
+	})
+}
+
+// @Summary Get details for a specific aggregation window
+// @Description Get all peers and their aggregated reports for a specific window
+// @Tags spam
+// @Produce json
+// @Param windowID path int true "Window ID (end epoch of 10-epoch range)"
+// @Param protocol query string false "Protocol state identifier"
+// @Param market query string false "Data market address"
+// @Success 200 {object} map[string]interface{} "Window details with all peers and reports"
+// @Router /spam/windows/{windowID} [get]
+func (m *MonitorAPI) SpamWindowDetails(c *gin.Context) {
+	windowIDStr := c.Param("windowID")
+	protocol := c.Query("protocol")
+	market := c.Query("market")
+
+	windowID, err := strconv.Atoi(windowIDStr)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid window ID"})
+		return
+	}
+
+	kb := m.keyBuilder
+	if protocol != "" || market != "" {
+		if protocol == "" {
+			protocol = m.keyBuilder.ProtocolState
+		}
+		if market == "" {
+			market = m.keyBuilder.DataMarket
+		}
+		kb = keys.NewKeyBuilder(protocol, market)
+	}
+
+	// Calculate epoch range
+	firstEpoch := windowID - 9
+	lastEpoch := windowID
+
+	// Get all peers in this window
+	windowPeersKey := fmt.Sprintf("%s:%s:spam:reports:window:%d:peers", kb.ProtocolState, kb.DataMarket, windowID)
+	peerIDs, err := m.redis.SMembers(m.ctx, windowPeersKey).Result()
+	if err != nil {
+		c.JSON(http.StatusOK, gin.H{
+			"window_id":   windowID,
+			"epoch_range": fmt.Sprintf("%d-%d", firstEpoch, lastEpoch),
+			"peers":       []interface{}{},
+			"peer_count":  0,
+		})
+		return
+	}
+
+	// Get aggregated reports for each peer
+	peers := make([]map[string]interface{}, 0)
+	for _, peerID := range peerIDs {
+		aggKey := fmt.Sprintf("%s:%s:spam:reports:peer:%s:window:%d", kb.ProtocolState, kb.DataMarket, peerID, windowID)
+		aggData, err := m.redis.Get(m.ctx, aggKey).Result()
+		if err != nil {
+			continue
+		}
+
+		var aggregated map[string]interface{}
+		if json.Unmarshal([]byte(aggData), &aggregated) == nil {
+			reportCount := 0
+			if reports, ok := aggregated["reports"].([]interface{}); ok {
+				reportCount = len(reports)
+			}
+			peers = append(peers, map[string]interface{}{
+				"peer_id":         peerID,
+				"validator_count": aggregated["validator_count"],
+				"first_epoch":     aggregated["first_epoch"],
+				"last_epoch":      aggregated["last_epoch"],
+				"report_count":    reportCount,
+				"reports":         aggregated["reports"],
+			})
+		}
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"window_id":   windowID,
+		"epoch_range": fmt.Sprintf("%d-%d", firstEpoch, lastEpoch),
+		"first_epoch": firstEpoch,
+		"last_epoch":  lastEpoch,
+		"peers":       peers,
+		"peer_count":  len(peers),
+		"timestamp":   time.Now(),
+	})
 }
 
 // @Summary Get spam protection statistics
@@ -2696,6 +2853,8 @@ func main() {
 		v1.GET("/spam/flagged/peers", api.FlaggedPeers)
 		v1.GET("/spam/flagged/snapshotters", api.FlaggedSnapshotters)
 		v1.GET("/spam/peer/:peerID", api.PeerSpamInfo)
+		v1.GET("/spam/windows", api.SpamWindows)
+		v1.GET("/spam/windows/:windowID", api.SpamWindowDetails)
 		v1.GET("/spam/stats", api.SpamStats)
 	}
 

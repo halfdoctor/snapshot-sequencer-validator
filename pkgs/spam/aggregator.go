@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"time"
 
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
@@ -179,6 +180,14 @@ func (a *SpamAggregator) processSpamReport(data []byte) {
 		}
 	}
 
+	// Add window ID to master windows set (for discovery/indexing)
+	windowsSetKey := a.getWindowsSetKey()
+	windowIDStr := fmt.Sprintf("%d", windowID)
+	if err := a.redisClient.SAdd(a.ctx, windowsSetKey, windowIDStr).Err(); err != nil {
+		log.Errorf("Failed to add window to master set: %v", err)
+		// Continue - non-critical, but log error
+	}
+
 	log.WithFields(log.Fields{
 		"peer_id":         report.PeerID,
 		"epoch_id":        report.EpochID,
@@ -255,6 +264,12 @@ func (a *SpamAggregator) getWindowPeersKey(windowID int) string {
 	return fmt.Sprintf("%s:%s:spam:reports:window:%d:peers", a.keyBuilder.ProtocolState, a.keyBuilder.DataMarket, windowID)
 }
 
+// getWindowsSetKey returns the Redis key for the master set of all windows with reports
+// Format: {protocol}:{market}:spam:reports:windows
+func (a *SpamAggregator) getWindowsSetKey() string {
+	return fmt.Sprintf("%s:%s:spam:reports:windows", a.keyBuilder.ProtocolState, a.keyBuilder.DataMarket)
+}
+
 // periodicConsensusCheck periodically checks for consensus on flagged peers
 // This is called periodically, but actual consensus checking should be triggered
 // when epochID % windowSize == 0 (handled by the component that tracks epochs)
@@ -270,8 +285,54 @@ func (a *SpamAggregator) periodicConsensusCheck() {
 			// Note: Actual consensus checking should be triggered by epoch transitions
 			// This periodic check is a fallback safety mechanism
 			log.Debug("Periodic consensus check (fallback - epoch-based checking preferred)")
+
+			// Prune expired windows from master set
+			if err := a.pruneExpiredWindows(a.ctx); err != nil {
+				log.Warnf("Failed to prune expired windows: %v", err)
+			}
 		}
 	}
+}
+
+// pruneExpiredWindows removes expired windows from the master windows set
+// Windows expire after AGGREGATION_TTL (2 hours) - check if window peers set still exists
+func (a *SpamAggregator) pruneExpiredWindows(ctx context.Context) error {
+	windowsSetKey := a.getWindowsSetKey()
+	windowIDs, err := a.redisClient.SMembers(ctx, windowsSetKey).Result()
+	if err != nil {
+		return fmt.Errorf("failed to get windows set: %w", err)
+	}
+
+	expiredWindows := make([]string, 0)
+	for _, windowIDStr := range windowIDs {
+		windowID, err := strconv.Atoi(windowIDStr)
+		if err != nil {
+			continue
+		}
+
+		// Check if window peers set still exists (if not, window has expired)
+		windowPeersKey := a.getWindowPeersKey(windowID)
+		exists, err := a.redisClient.Exists(ctx, windowPeersKey).Result()
+		if err != nil {
+			log.Warnf("Failed to check window %s existence: %v", windowIDStr, err)
+			continue
+		}
+
+		if exists == 0 {
+			// Window has expired - remove from master set
+			expiredWindows = append(expiredWindows, windowIDStr)
+		}
+	}
+
+	// Remove expired windows from master set
+	if len(expiredWindows) > 0 {
+		if err := a.redisClient.SRem(ctx, windowsSetKey, expiredWindows).Err(); err != nil {
+			return fmt.Errorf("failed to remove expired windows: %w", err)
+		}
+		log.Debugf("Pruned %d expired windows from master set", len(expiredWindows))
+	}
+
+	return nil
 }
 
 // getOrCreateAggregatedReport gets an existing aggregated report or creates a new one

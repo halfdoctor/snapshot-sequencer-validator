@@ -680,6 +680,14 @@ State-tracker manages rolling windows for metrics aggregation. Timeline keys are
   - TTL: 2 hours (set on first peer added, matches aggregation window TTL)
   - Purpose: **Deterministic key** to track all peer IDs with reports in a window - enables efficient consensus checking
 
+**Master Windows Set** (for discovery/indexing):
+- `{protocol}:{market}:spam:reports:windows` - SET (window IDs as strings)
+  - Written by: Spam Aggregator (when adding first report for any peer in a window)
+  - Read by: Monitoring API (to list all windows with reports)
+  - Pruned by: Spam Aggregator (periodically removes expired windows - windows expire when their peers set TTL expires after 2 hours)
+  - TTL: None (persistent index, pruned when windows expire)
+  - Purpose: **Master index** of all windows that have spam reports - enables window discovery without knowing window IDs
+
 **Report Sent Tracking**:
 - `{protocol}:{market}:spam:report:sent:reporter:{reporterID}:peer:{peerID}:epoch:{epochID}:reason:{reason}` - String ("true")
   - Written by: Spam Reporter (to prevent duplicate reports)
@@ -781,8 +789,8 @@ State-tracker manages rolling windows for metrics aggregation. Timeline keys are
 - Purpose: Broadcast spam reports when thresholds exceeded
 
 **Spam Aggregator**:
-- Writes: `{protocol}:{market}:spam:reports:peer:{peerID}:window:{windowID}`, `{protocol}:{market}:spam:reports:window:{windowID}:peers` (SET)
-- Reads: Aggregated report keys, window peers set (`{protocol}:{market}:spam:reports:window:{windowID}:peers`), `{protocol}:{market}:active:validators`
+- Writes: `{protocol}:{market}:spam:reports:peer:{peerID}:window:{windowID}`, `{protocol}:{market}:spam:reports:window:{windowID}:peers` (SET), `{protocol}:{market}:spam:reports:windows` (master set)
+- Reads: Aggregated report keys, window peers set (`{protocol}:{market}:spam:reports:window:{windowID}:peers`), master windows set (`{protocol}:{market}:spam:reports:windows`), `{protocol}:{market}:active:validators`
 - Purpose: Aggregate reports from multiple validators, check consensus, trigger flagging
 
 **Flagging Service**:

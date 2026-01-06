@@ -870,6 +870,83 @@
                     }
                 }
             }
+        },
+        "/spam/windows": {
+            "get": {
+                "description": "Get list of all windows that have spam reports (for discovery/indexing)",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "spam"
+                ],
+                "summary": "List all aggregation windows with reports",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Protocol state identifier",
+                        "name": "protocol",
+                        "in": "query"
+                    },
+                    {
+                        "type": "string",
+                        "description": "Data market address",
+                        "name": "market",
+                        "in": "query"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "List of window IDs with basic info",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": true
+                        }
+                    }
+                }
+            }
+        },
+        "/spam/windows/{windowID}": {
+            "get": {
+                "description": "Get all peers and their aggregated reports for a specific window",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "spam"
+                ],
+                "summary": "Get details for a specific aggregation window",
+                "parameters": [
+                    {
+                        "type": "integer",
+                        "description": "Window ID (end epoch of 10-epoch range)",
+                        "name": "windowID",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "Protocol state identifier",
+                        "name": "protocol",
+                        "in": "query"
+                    },
+                    {
+                        "type": "string",
+                        "description": "Data market address",
+                        "name": "market",
+                        "in": "query"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "Window details with all peers and reports",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": true
+                        }
+                    }
+                }
+            }
         }
     },
     "definitions": {
