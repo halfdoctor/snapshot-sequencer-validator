@@ -239,7 +239,7 @@ func LoadConfig() error {
 		// Spam Protection Configuration
 		EnableSpamProtection:      getBoolEnv("ENABLE_SPAM_PROTECTION", true),
 		EnableSpamReportBroadcast: getBoolEnv("ENABLE_SPAM_REPORT_BROADCAST", true),
-		SpamReportTopic:           "", // Empty = auto-construct from validator presence prefix + "/spam-reports"
+		SpamReportTopic:           getEnv("SPAM_REPORT_TOPIC", ""), // Empty = auto-construct from validator presence prefix + "/spam-reports"
 		SpamCacheTTLHours:         getEnvAsInt("SPAM_CACHE_TTL_HOURS", 24),
 		// NOTE: The following configs are for FUTURE onchain implementation (not yet used):
 		// SpamFlagExpiryDays:        getEnvAsInt("SPAM_FLAG_EXPIRY_DAYS", 7),
