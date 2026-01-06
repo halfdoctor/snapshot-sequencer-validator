@@ -28,8 +28,8 @@ services:
       - REDIS_PORT=6379
       - REDIS_DB=${REDIS_DB:-0}
       - REDIS_PASSWORD=${REDIS_PASSWORD:-}
-      - BOOTSTRAP_PEERS=${BOOTSTRAP_PEERS}
-      - BOOTSTRAP_MULTIADDR=${BOOTSTRAP_MULTIADDR}
+      - BOOTSTRAP_PEERS=${BOOTSTRAP_PEERS:-}
+      - BOOTSTRAP_MULTIADDR=${BOOTSTRAP_MULTIADDR:-}
       - RENDEZVOUS_POINT=${RENDEZVOUS_POINT:-powerloom-snapshot-sequencer-network}
       - PRIVATE_KEY=${PRIVATE_KEY}
       - PUBLIC_IP=${PUBLIC_IP}
@@ -123,7 +123,7 @@ services:
       - REDIS_PASSWORD=${REDIS_PASSWORD:-}
       - DEBUG_MODE=${DEBUG_MODE:-false}
       # VPA Configuration for priority monitoring
-      - VPA_CONTRACT_ADDRESS=${VPA_CONTRACT_ADDRESS}
+      - VPA_CONTRACT_ADDRESS=${VPA_CONTRACT_ADDRESS:-}
       - VPA_VALIDATOR_ADDRESS=${VPA_VALIDATOR_ADDRESS}
       - NEW_PROTOCOL_STATE_CONTRACT=${NEW_PROTOCOL_STATE_CONTRACT}
       - NEW_DATA_MARKET_CONTRACT=${NEW_DATA_MARKET_CONTRACT}
@@ -275,7 +275,7 @@ services:
       - USE_NEW_CONTRACTS=${USE_NEW_CONTRACTS}
       # VPA Configuration - Required for VPA client initialization
       - ENABLE_ONCHAIN_SUBMISSION=${ENABLE_ONCHAIN_SUBMISSION:-true}
-      - VPA_CONTRACT_ADDRESS=${VPA_CONTRACT_ADDRESS}
+      - VPA_CONTRACT_ADDRESS=${VPA_CONTRACT_ADDRESS:-}
       - VPA_VALIDATOR_ADDRESS=${VPA_VALIDATOR_ADDRESS}
       - RELAYER_PY_ENDPOINT=${RELAYER_PY_ENDPOINT:-http://relayer-py:8080}
       # Aggregation Configuration
@@ -455,7 +455,6 @@ services:
       # Cleanup configuration
       - DATA_CLEANUP_DAYS=${IPFS_CLEANUP_MAX_AGE_DAYS:-7}
       - IPFS_CLEANUP_INTERVAL_HOURS=${IPFS_CLEANUP_INTERVAL_HOURS:-72}
-      - CLEANUP_SCHEDULE=0 */${IPFS_CLEANUP_INTERVAL_HOURS:-72} * * *
     entrypoint: >
       sh -c '
         echo "Setting up data cleanup cron job..."
@@ -463,11 +462,14 @@ services:
 
         # Cleanup command: Remove old .data files AND run IPFS garbage collection
         # Garbage collection is critical to free inodes from unpinned blocks
+        DATA_CLEANUP_DAYS=${DATA_CLEANUP_DAYS:-7}
+        IPFS_CLEANUP_INTERVAL_HOURS=${IPFS_CLEANUP_INTERVAL_HOURS:-72}
+        CLEANUP_SCHEDULE="0 */${IPFS_CLEANUP_INTERVAL_HOURS} * * *"
         cleanup_cmd="date && echo Starting IPFS cleanup process... && find /data/ipfs -type f -mtime +${DATA_CLEANUP_DAYS} -name '\''*.data'\'' -print -delete && echo Running IPFS garbage collection to free inodes... && ipfs repo gc && echo Cleanup process completed."
         echo "${CLEANUP_SCHEDULE} ${cleanup_cmd} >> /proc/1/fd/1 2>&1" > /var/spool/cron/crontabs/root
         chmod 0644 /var/spool/cron/crontabs/root
 
-        echo "Cron job set up. Will clean files older than ${DATA_CLEANUP_DAYS} days and run garbage collection every ${IPFS_CLEANUP_INTERVAL_HOURS:-72} hours (${CLEANUP_SCHEDULE})"
+        echo "Cron job set up. Will clean files older than ${DATA_CLEANUP_DAYS} days and run garbage collection every ${IPFS_CLEANUP_INTERVAL_HOURS} hours (${CLEANUP_SCHEDULE})"
 
         # Initialize IPFS repository if not exists
         if [ ! -f /data/ipfs/config ]; then
