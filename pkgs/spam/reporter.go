@@ -29,6 +29,7 @@ type SpamReporter struct {
 	tracker    *SpamTracker
 	whitelist  *PeerWhitelist
 	reporterID string
+	aggregator *SpamAggregator
 }
 
 // NewSpamReporter creates a new SpamReporter instance
@@ -38,6 +39,17 @@ func NewSpamReporter(topic *pubsub.Topic, tracker *SpamTracker, whitelist *PeerW
 		tracker:    tracker,
 		whitelist:  whitelist,
 		reporterID: reporterID,
+	}
+}
+
+// NewSpamReporterWithAggregator creates a new SpamReporter with aggregator for direct injection
+func NewSpamReporterWithAggregator(topic *pubsub.Topic, tracker *SpamTracker, whitelist *PeerWhitelist, reporterID string, aggregator *SpamAggregator) *SpamReporter {
+	return &SpamReporter{
+		topic:      topic,
+		tracker:    tracker,
+		whitelist:  whitelist,
+		reporterID: reporterID,
+		aggregator: aggregator,
 	}
 }
 
@@ -64,6 +76,11 @@ func (r *SpamReporter) ReportSpam(ctx context.Context, peerID, snapshotterAddr s
 	data, err := json.Marshal(report)
 	if err != nil {
 		return fmt.Errorf("failed to marshal spam report: %w", err)
+	}
+
+	// Inject directly into aggregator (Gossipsub doesn't deliver self-messages)
+	if r.aggregator != nil {
+		go r.aggregator.processSpamReportDirect(data)
 	}
 
 	// Broadcast to validator mesh

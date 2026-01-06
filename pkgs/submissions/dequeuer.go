@@ -10,8 +10,8 @@ import (
 
 	"github.com/ethereum/go-ethereum/common"
 	customcrypto "github.com/powerloom/snapshot-sequencer-validator/pkgs/crypto"
-	"github.com/powerloom/snapshot-sequencer-validator/pkgs/spam"
 	redislib "github.com/powerloom/snapshot-sequencer-validator/pkgs/redis"
+	"github.com/powerloom/snapshot-sequencer-validator/pkgs/spam"
 	"github.com/redis/go-redis/v9"
 	log "github.com/sirupsen/logrus"
 )
@@ -29,12 +29,12 @@ type Dequeuer struct {
 	stats                 DequeuerStats
 	statsMutex            sync.RWMutex
 	protocolStateContract string // Protocol state contract address for Redis key namespacing
-	
+
 	// Spam protection components
-	spamTracker   *spam.SpamTracker
-	rateLimiter   *spam.RateLimiter
-	flagging      *spam.FlaggingService
-	spamReporter  *spam.SpamReporter
+	spamTracker          *spam.SpamTracker
+	rateLimiter          *spam.RateLimiter
+	flagging             *spam.FlaggingService
+	spamReporter         *spam.SpamReporter
 	enableSpamProtection bool
 }
 
@@ -84,17 +84,17 @@ func NewDequeuer(redisClient *redis.Client, keyBuilder *redislib.KeyBuilder, seq
 	return d, nil
 }
 
-
 // ProcessSubmission validates and stores a submission
-func (d *Dequeuer) ProcessSubmission(submission *SnapshotSubmission, submissionID string, metaData map[string]interface{}) error {
+// Returns error and snapshotter address (empty if signature verification failed)
+func (d *Dequeuer) ProcessSubmission(submission *SnapshotSubmission, submissionID string, metaData map[string]interface{}) (string, error) {
 	startTime := time.Now()
 
 	// Check for duplicate
 	d.submissionsMutex.RLock()
-	if _, exists := d.processedSubmissions[submissionID]; exists {
+	if processed, exists := d.processedSubmissions[submissionID]; exists {
 		d.submissionsMutex.RUnlock()
 		log.Debugf("Submission %s already processed", submissionID)
-		return nil
+		return processed.SnapshotterAddr, nil
 	}
 	d.submissionsMutex.RUnlock()
 
@@ -118,7 +118,7 @@ func (d *Dequeuer) ProcessSubmission(submission *SnapshotSubmission, submissionI
 			} else if flagged {
 				d.updateStats(false, time.Since(startTime))
 				log.Warnf("Rejected submission from flagged peer: %s", peerID)
-				return fmt.Errorf("peer is flagged: %s", peerID)
+				return "", fmt.Errorf("peer is flagged: %s", peerID)
 			}
 		}
 	}
@@ -132,7 +132,7 @@ func (d *Dequeuer) ProcessSubmission(submission *SnapshotSubmission, submissionI
 			}
 		}
 		d.updateStats(false, time.Since(startTime))
-		return fmt.Errorf("validation failed: %w", err)
+		return "", fmt.Errorf("validation failed: %w", err)
 	}
 
 	// Verify signature and extract snapshotter address
@@ -145,7 +145,7 @@ func (d *Dequeuer) ProcessSubmission(submission *SnapshotSubmission, submissionI
 			}
 		}
 		d.updateStats(false, time.Since(startTime))
-		return fmt.Errorf("signature verification failed: %w", err)
+		return "", fmt.Errorf("signature verification failed: %w", err)
 	}
 
 	// Spam protection: Check flagged snapshotter address (if enabled)
@@ -156,7 +156,7 @@ func (d *Dequeuer) ProcessSubmission(submission *SnapshotSubmission, submissionI
 		} else if flagged {
 			d.updateStats(false, time.Since(startTime))
 			log.Warnf("Rejected submission from flagged snapshotter: %s", snapshotterAddr.Hex())
-			return fmt.Errorf("snapshotter is flagged: %s", snapshotterAddr.Hex())
+			return snapshotterAddr.Hex(), fmt.Errorf("snapshotter is flagged: %s", snapshotterAddr.Hex())
 		}
 	}
 
@@ -172,7 +172,7 @@ func (d *Dequeuer) ProcessSubmission(submission *SnapshotSubmission, submissionI
 			d.updateStats(false, time.Since(startTime))
 			log.Errorf("Slot validation failed for submission (epoch=%d, slot=%d, signer=%s): %v",
 				submission.Request.EpochId, submission.Request.SlotId, snapshotterAddr.Hex(), err)
-			return fmt.Errorf("slot validation failed: %w", err)
+			return snapshotterAddr.Hex(), fmt.Errorf("slot validation failed: %w", err)
 		}
 		log.Debugf("Slot validation passed: slot %d is registered to %s",
 			submission.Request.SlotId, snapshotterAddr.Hex())
@@ -316,7 +316,7 @@ func (d *Dequeuer) ProcessSubmission(submission *SnapshotSubmission, submissionI
 		log.Debugf("Failed to write monitoring metrics: %v", err)
 	}
 
-	return nil
+	return snapshotterAddr.Hex(), nil
 }
 
 func (d *Dequeuer) validateSubmission(submission *SnapshotSubmission) error {

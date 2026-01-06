@@ -1200,11 +1200,6 @@ func (s *UnifiedSequencer) runDequeuerWorker(workerID int) {
 						submission.Request.SlotId,
 						submission.Request.SnapshotCid)
 
-					// Log processing
-					log.Infof("Worker %d processing: Epoch=%d, Project=%s, Slot=%d, Market=%s, CID=%s",
-						workerID, submission.Request.EpochId, submission.Request.ProjectId,
-						submission.Request.SlotId, submission.DataMarket, submission.Request.SnapshotCid)
-
 					// Prepare metadata for dequeuer
 					metaData := map[string]interface{}{
 						"peer_id": peerID,
@@ -1212,15 +1207,20 @@ func (s *UnifiedSequencer) runDequeuerWorker(workerID int) {
 
 					// Process and store the submission
 					if s.dequeuer != nil {
-						if err := s.dequeuer.ProcessSubmission(submission, submissionID, metaData); err != nil {
+						snapshotterAddr, err := s.dequeuer.ProcessSubmission(submission, submissionID, metaData)
+						if err != nil {
 							// Epoch 0 heartbeats are expected to fail validation - log as debug, not error
 							if strings.Contains(err.Error(), "epoch 0 heartbeat") {
 								log.Debugf("Worker %d: Skipped epoch 0 heartbeat (P2P mesh maintenance)", workerID)
 							} else {
-								log.Errorf("Worker %d: Failed to process submission %s: %v", workerID, submissionID, err)
+								log.Errorf("Worker %d: Failed to process submission: Epoch=%d, Project=%s, Slot=%d, Market=%s, CID=%s, Peer=%s, Snapshotter=%s: %v", workerID, submission.Request.EpochId, submission.Request.ProjectId,
+									submission.Request.SlotId, submission.DataMarket, submission.Request.SnapshotCid, peerID, snapshotterAddr, err)
 							}
 						} else {
-							log.Debugf("Worker %d: Successfully processed and stored submission %s", workerID, submissionID)
+							// Log with snapshotter address extracted from EIP-712 signature
+							log.Infof("Worker %d processed and stored submission: Epoch=%d, Project=%s, Slot=%d, Market=%s, CID=%s, Peer=%s, Snapshotter=%s",
+								workerID, submission.Request.EpochId, submission.Request.ProjectId,
+								submission.Request.SlotId, submission.DataMarket, submission.Request.SnapshotCid, peerID, snapshotterAddr)
 						}
 					}
 				}
@@ -1248,11 +1248,6 @@ func (s *UnifiedSequencer) runDequeuerWorker(workerID int) {
 					submission.Request.SlotId,
 					submission.Request.SnapshotCid)
 
-				// Log processing
-				log.Infof("Worker %d processing: Epoch=%d, Project=%s, Slot=%d, Market=%s, CID=%s",
-					workerID, submission.Request.EpochId, submission.Request.ProjectId,
-					submission.Request.SlotId, submission.DataMarket, submission.Request.SnapshotCid)
-
 				// Prepare metadata for dequeuer
 				metaData := map[string]interface{}{
 					"peer_id": peerID,
@@ -1260,15 +1255,20 @@ func (s *UnifiedSequencer) runDequeuerWorker(workerID int) {
 
 				// Process and store the submission
 				if s.dequeuer != nil {
-					if err := s.dequeuer.ProcessSubmission(&submission, submissionID, metaData); err != nil {
+					snapshotterAddr, err := s.dequeuer.ProcessSubmission(&submission, submissionID, metaData)
+					if err != nil {
 						// Epoch 0 heartbeats are expected to fail validation - log as debug, not error
 						if strings.Contains(err.Error(), "epoch 0 heartbeat") {
 							log.Debugf("Worker %d: Skipped epoch 0 heartbeat (P2P mesh maintenance)", workerID)
 						} else {
-							log.Errorf("Worker %d: Failed to process submission %s: %v", workerID, submissionID, err)
+							log.Errorf("Worker %d: Failed to process submission: Epoch=%d, Project=%s, Slot=%d, Market=%s, CID=%s, Peer=%s, Snapshotter=%s: %v", workerID, submission.Request.EpochId, submission.Request.ProjectId,
+								submission.Request.SlotId, submission.DataMarket, submission.Request.SnapshotCid, peerID, snapshotterAddr, err)
 						}
 					} else {
-						log.Debugf("Worker %d: Successfully processed and stored submission %s", workerID, submissionID)
+						// Log with snapshotter address extracted from EIP-712 signature
+						log.Infof("Worker %d processed and stored submission: Epoch=%d, Project=%s, Slot=%d, Market=%s, CID=%s, Peer=%s, Snapshotter=%s",
+							workerID, submission.Request.EpochId, submission.Request.ProjectId,
+							submission.Request.SlotId, submission.DataMarket, submission.Request.SnapshotCid, peerID, snapshotterAddr)
 					}
 				} else {
 					log.Warnf("Worker %d: Dequeuer not initialized, skipping storage", workerID)

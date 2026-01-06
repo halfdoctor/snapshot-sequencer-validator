@@ -32,20 +32,8 @@ func InitializeSpamProtection(ctx context.Context, cfg *config.Settings, redisCl
 	// Initialize flagging service
 	flagging := NewFlaggingService(redisClient, keyBuilder, whitelist)
 
-	// Initialize spam reporter (if broadcast enabled)
-	var reporter *SpamReporter
-	if cfg.EnableSpamReportBroadcast && ps != nil {
-		// Get spam report topic (constructed from validator presence prefix + "/spam-reports")
-		spamReportTopic := cfg.GetSpamReportTopic()
-		spamTopic, err := ps.Join(spamReportTopic)
-		if err != nil {
-			return nil, fmt.Errorf("failed to join spam reports topic: %w", err)
-		}
-		reporter = NewSpamReporter(spamTopic, tracker, whitelist, sequencerID)
-		log.Infof("Initialized spam reporter for topic: %s", spamReportTopic)
-	}
-
-	// Initialize spam aggregator (if broadcast enabled)
+	// Initialize spam aggregator FIRST (if broadcast enabled)
+	// This allows the reporter to directly inject reports into the aggregator
 	var aggregator *SpamAggregator
 	if cfg.EnableSpamReportBroadcast && ps != nil {
 		// Get spam report topic (constructed from validator presence prefix + "/spam-reports")
@@ -62,6 +50,20 @@ func InitializeSpamProtection(ctx context.Context, cfg *config.Settings, redisCl
 		aggregator = NewSpamAggregator(ctx, redisClient, keyBuilder, whitelist, sub, flagging, DEFAULT_AGGREGATION_WINDOW_SIZE)
 		aggregator.Start()
 		log.Infof("Initialized spam aggregator with window size: %d", DEFAULT_AGGREGATION_WINDOW_SIZE)
+	}
+
+	// Initialize spam reporter (if broadcast enabled)
+	// Pass aggregator so it can inject reports directly (Gossipsub doesn't deliver self-messages)
+	var reporter *SpamReporter
+	if cfg.EnableSpamReportBroadcast && ps != nil {
+		// Get spam report topic (constructed from validator presence prefix + "/spam-reports")
+		spamReportTopic := cfg.GetSpamReportTopic()
+		spamTopic, err := ps.Join(spamReportTopic)
+		if err != nil {
+			return nil, fmt.Errorf("failed to join spam reports topic: %w", err)
+		}
+		reporter = NewSpamReporterWithAggregator(spamTopic, tracker, whitelist, sequencerID, aggregator)
+		log.Infof("Initialized spam reporter for topic: %s", spamReportTopic)
 	}
 
 	// TODO: Initialize state sync service (if enabled)

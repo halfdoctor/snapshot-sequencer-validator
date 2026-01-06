@@ -84,13 +84,13 @@ func (a *SpamAggregator) handleSpamReports() {
 			}
 
 			// Process spam report
-			go a.processSpamReport(msg.Data)
+			go a.processSpamReportDirect(msg.Data)
 		}
 	}
 }
 
-// processSpamReport processes a single spam report
-func (a *SpamAggregator) processSpamReport(data []byte) {
+// processSpamReportDirect processes a single spam report (can be called directly or from subscription)
+func (a *SpamAggregator) processSpamReportDirect(data []byte) {
 	var report SpamReport
 	if err := json.Unmarshal(data, &report); err != nil {
 		log.Errorf("Failed to unmarshal spam report: %v", err)
