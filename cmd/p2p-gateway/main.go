@@ -882,10 +882,9 @@ func (g *P2PGateway) queueSubmission(msg *pubsub.Message, topicName string) {
 		topicLabel = "TEST/DISCOVERY"
 	}
 
-	// Wrap submission with peer ID metadata
 	wrappedData := map[string]interface{}{
 		"peer_id": msg.ReceivedFrom.String(),
-		"data":    msg.Data,
+		"data":    json.RawMessage(msg.Data),
 	}
 	wrappedJSON, _ := json.Marshal(wrappedData)
 
