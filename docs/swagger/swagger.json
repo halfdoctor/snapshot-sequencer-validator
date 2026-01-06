@@ -717,6 +717,159 @@
                     }
                 }
             }
+        },
+        "/spam/flagged/peers": {
+            "get": {
+                "description": "Get list of all flagged peer IDs (from Redis cache, synced from onchain)",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "spam"
+                ],
+                "summary": "Get flagged peers",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Protocol state identifier",
+                        "name": "protocol",
+                        "in": "query"
+                    },
+                    {
+                        "type": "string",
+                        "description": "Data market address",
+                        "name": "market",
+                        "in": "query"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "List of flagged peers with metadata",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": true
+                        }
+                    }
+                }
+            }
+        },
+        "/spam/flagged/snapshotters": {
+            "get": {
+                "description": "Get list of all flagged snapshotter addresses (from Redis cache, synced from onchain)",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "spam"
+                ],
+                "summary": "Get flagged snapshotters",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Protocol state identifier",
+                        "name": "protocol",
+                        "in": "query"
+                    },
+                    {
+                        "type": "string",
+                        "description": "Data market address",
+                        "name": "market",
+                        "in": "query"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "List of flagged snapshotters with metadata",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": true
+                        }
+                    }
+                }
+            }
+        },
+        "/spam/peer/{peerID}": {
+            "get": {
+                "description": "Get validation failures, submission counts, and aggregation info for a specific peer",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "spam"
+                ],
+                "summary": "Get spam tracking info for a peer",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Peer ID (libp2p)",
+                        "name": "peerID",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "Protocol state identifier",
+                        "name": "protocol",
+                        "in": "query"
+                    },
+                    {
+                        "type": "string",
+                        "description": "Data market address",
+                        "name": "market",
+                        "in": "query"
+                    },
+                    {
+                        "type": "integer",
+                        "description": "Specific epoch ID (optional, defaults to current epoch)",
+                        "name": "epochID",
+                        "in": "query"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "Spam tracking information for peer",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": true
+                        }
+                    }
+                }
+            }
+        },
+        "/spam/stats": {
+            "get": {
+                "description": "Get aggregated spam protection statistics including flagged counts, reports, and enforcement metrics",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "spam"
+                ],
+                "summary": "Get spam protection statistics",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Protocol state identifier",
+                        "name": "protocol",
+                        "in": "query"
+                    },
+                    {
+                        "type": "string",
+                        "description": "Data market address",
+                        "name": "market",
+                        "in": "query"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "Spam protection statistics",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": true
+                        }
+                    }
+                }
+            }
         }
     },
     "definitions": {

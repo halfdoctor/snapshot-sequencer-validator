@@ -10,6 +10,7 @@ import (
 
 	"github.com/ethereum/go-ethereum/common"
 	customcrypto "github.com/powerloom/snapshot-sequencer-validator/pkgs/crypto"
+	"github.com/powerloom/snapshot-sequencer-validator/pkgs/spam"
 	redislib "github.com/powerloom/snapshot-sequencer-validator/pkgs/redis"
 	"github.com/redis/go-redis/v9"
 	log "github.com/sirupsen/logrus"
@@ -28,6 +29,13 @@ type Dequeuer struct {
 	stats                 DequeuerStats
 	statsMutex            sync.RWMutex
 	protocolStateContract string // Protocol state contract address for Redis key namespacing
+	
+	// Spam protection components
+	spamTracker   *spam.SpamTracker
+	rateLimiter   *spam.RateLimiter
+	flagging      *spam.FlaggingService
+	spamReporter  *spam.SpamReporter
+	enableSpamProtection bool
 }
 
 // DequeuerStats tracks processing metrics
@@ -41,7 +49,7 @@ type DequeuerStats struct {
 
 // NewDequeuer creates a new submission dequeuer
 // snapshotterStateAddr must be provided if enableSlotValidation is true
-func NewDequeuer(redisClient *redis.Client, keyBuilder *redislib.KeyBuilder, sequencerID string, chainID int64, protocolStateContract string, snapshotterStateAddr common.Address, enableSlotValidation bool) (*Dequeuer, error) {
+func NewDequeuer(redisClient *redis.Client, keyBuilder *redislib.KeyBuilder, sequencerID string, chainID int64, protocolStateContract string, snapshotterStateAddr common.Address, enableSlotValidation bool, spamComponents *spam.SpamComponents) (*Dequeuer, error) {
 	if enableSlotValidation && snapshotterStateAddr == (common.Address{}) {
 		return nil, fmt.Errorf("snapshotterStateAddr is required when slot validation is enabled")
 	}
@@ -53,7 +61,7 @@ func NewDequeuer(redisClient *redis.Client, keyBuilder *redislib.KeyBuilder, seq
 	protocolStateAddr := common.HexToAddress(protocolStateContract)
 	slotValidator := NewSlotValidator(redisClient, protocolStateAddr, snapshotterStateAddr)
 
-	return &Dequeuer{
+	d := &Dequeuer{
 		redisClient:           redisClient,
 		keyBuilder:            keyBuilder,
 		sequencerID:           sequencerID,
@@ -62,8 +70,20 @@ func NewDequeuer(redisClient *redis.Client, keyBuilder *redislib.KeyBuilder, seq
 		enableSlotValidation:  enableSlotValidation,
 		processedSubmissions:  make(map[string]*ProcessedSubmission),
 		protocolStateContract: protocolStateContract, // Store for Redis key namespacing
-	}, nil
+	}
+
+	// Initialize spam protection components if provided
+	if spamComponents != nil {
+		d.spamTracker = spamComponents.Tracker
+		d.rateLimiter = spamComponents.RateLimiter
+		d.flagging = spamComponents.Flagging
+		d.spamReporter = spamComponents.Reporter
+		d.enableSpamProtection = true
+	}
+
+	return d, nil
 }
+
 
 // ProcessSubmission validates and stores a submission
 func (d *Dequeuer) ProcessSubmission(submission *SnapshotSubmission, submissionID string, metaData map[string]interface{}) error {
@@ -78,8 +98,39 @@ func (d *Dequeuer) ProcessSubmission(submission *SnapshotSubmission, submissionI
 	}
 	d.submissionsMutex.RUnlock()
 
+	// Extract peer ID from metadata
+	var peerID string
+	if metaData != nil {
+		if p, ok := metaData["peer_id"].(string); ok {
+			peerID = p
+		}
+	}
+
+	ctx := context.Background()
+
+	// Spam protection: Check flagged peers and snapshotters (if enabled)
+	if d.enableSpamProtection && d.flagging != nil {
+		// Check if peer is flagged
+		if peerID != "" {
+			flagged, err := d.flagging.IsPeerFlagged(ctx, peerID)
+			if err != nil {
+				log.Warnf("Failed to check if peer is flagged: %v", err)
+			} else if flagged {
+				d.updateStats(false, time.Since(startTime))
+				log.Warnf("Rejected submission from flagged peer: %s", peerID)
+				return fmt.Errorf("peer is flagged: %s", peerID)
+			}
+		}
+	}
+
 	// Validate submission
 	if err := d.validateSubmission(submission); err != nil {
+		// Track validation failure for spam protection
+		if d.enableSpamProtection && d.spamTracker != nil && peerID != "" {
+			if err := d.spamTracker.TrackValidationFailure(ctx, peerID, "", submission.Request.EpochId, err); err != nil {
+				log.Warnf("Failed to track validation failure: %v", err)
+			}
+		}
 		d.updateStats(false, time.Since(startTime))
 		return fmt.Errorf("validation failed: %w", err)
 	}
@@ -87,13 +138,49 @@ func (d *Dequeuer) ProcessSubmission(submission *SnapshotSubmission, submissionI
 	// Verify signature and extract snapshotter address
 	snapshotterAddr, err := d.verifySignature(submission)
 	if err != nil {
+		// Track validation failure for spam protection
+		if d.enableSpamProtection && d.spamTracker != nil && peerID != "" {
+			if err := d.spamTracker.TrackValidationFailure(ctx, peerID, "", submission.Request.EpochId, err); err != nil {
+				log.Warnf("Failed to track validation failure: %v", err)
+			}
+		}
 		d.updateStats(false, time.Since(startTime))
 		return fmt.Errorf("signature verification failed: %w", err)
+	}
+
+	// Spam protection: Check flagged snapshotter address (if enabled)
+	if d.enableSpamProtection && d.flagging != nil && snapshotterAddr != (common.Address{}) {
+		flagged, err := d.flagging.IsSnapshotterFlagged(ctx, snapshotterAddr.Hex())
+		if err != nil {
+			log.Warnf("Failed to check if snapshotter is flagged: %v", err)
+		} else if flagged {
+			d.updateStats(false, time.Since(startTime))
+			log.Warnf("Rejected submission from flagged snapshotter: %s", snapshotterAddr.Hex())
+			return fmt.Errorf("snapshotter is flagged: %s", snapshotterAddr.Hex())
+		}
+	}
+
+	// Spam protection: Check rate limit (if enabled)
+	if d.enableSpamProtection && d.rateLimiter != nil && peerID != "" {
+		exceeded, err := d.rateLimiter.CheckRateLimit(ctx, peerID, submission.Request.EpochId)
+		if err != nil {
+			log.Warnf("Failed to check rate limit: %v", err)
+		} else if exceeded {
+			d.updateStats(false, time.Since(startTime))
+			log.Warnf("Rejected submission: rate limit exceeded for peer %s (epoch %d)", peerID, submission.Request.EpochId)
+			return fmt.Errorf("rate limit exceeded for peer: %s", peerID)
+		}
 	}
 
 	// Validate snapshotter address against slot registration (if enabled)
 	if d.enableSlotValidation && snapshotterAddr != (common.Address{}) {
 		if err := d.slotValidator.ValidateSnapshotterForSlot(submission.Request.SlotId, snapshotterAddr); err != nil {
+			// Track validation failure for spam protection
+			if d.enableSpamProtection && d.spamTracker != nil && peerID != "" {
+				if err := d.spamTracker.TrackValidationFailure(ctx, peerID, snapshotterAddr.Hex(), submission.Request.EpochId, err); err != nil {
+					log.Warnf("Failed to track validation failure: %v", err)
+				}
+			}
 			d.updateStats(false, time.Since(startTime))
 			log.Errorf("Slot validation failed for submission (epoch=%d, slot=%d, signer=%s): %v",
 				submission.Request.EpochId, submission.Request.SlotId, snapshotterAddr.Hex(), err)
@@ -101,6 +188,21 @@ func (d *Dequeuer) ProcessSubmission(submission *SnapshotSubmission, submissionI
 		}
 		log.Debugf("Slot validation passed: slot %d is registered to %s",
 			submission.Request.SlotId, snapshotterAddr.Hex())
+	}
+
+	// Spam protection: Track submission count (if enabled)
+	if d.enableSpamProtection && d.spamTracker != nil && peerID != "" {
+		_, err := d.spamTracker.TrackSubmissionCount(ctx, peerID, snapshotterAddr.Hex(), submission.Request.EpochId)
+		if err != nil {
+			log.Warnf("Failed to track submission count: %v", err)
+		} else {
+			// Check if spam should be reported
+			if d.spamReporter != nil {
+				if err := d.spamReporter.CheckAndReport(ctx, peerID, snapshotterAddr.Hex(), submission.Request.EpochId); err != nil {
+					log.Warnf("Failed to check/report spam: %v", err)
+				}
+			}
+		}
 	}
 
 	// Store in local state
@@ -132,9 +234,8 @@ func (d *Dequeuer) ProcessSubmission(submission *SnapshotSubmission, submissionI
 	log.Debugf("Successfully processed submission %s for epoch %d, slot %d",
 		submissionID, submission.Request.EpochId, submission.Request.SlotId)
 
-	// Get peer ID from submission metadata if available
-	var peerID string
-	if processed.MetaData != nil {
+	// Get peer ID from submission metadata if available (already extracted above for spam protection)
+	if processed.MetaData != nil && peerID == "" {
 		if p, ok := processed.MetaData["peer_id"].(string); ok {
 			peerID = p
 		}

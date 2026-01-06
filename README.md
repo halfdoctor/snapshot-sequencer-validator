@@ -51,7 +51,40 @@ The p2p-gateway includes enhanced submission entity ID generation with detailed 
 - **Legacy Format**: `received:peer-{peer-truncated}-{timestamp}:{timestamp}` (backward compatible)
 - **Automatic Detection**: System automatically determines format based on message content
 
-For comprehensive documentation, see the **[DSV Node Setup Guide](docs/DSV_NODE_SETUP.md)**.
+### DDoS Protection & Spam Prevention
+
+The DSV node includes a multi-layer DDoS protection system to prevent malicious peers from flooding the network with invalid submissions.
+
+#### Key Features
+- **Peer ID-based tracking**: Primary identifier for spam detection (harder to spoof than Ethereum addresses)
+- **Validator coordination**: Validators exchange spam reports via P2P before on-chain flagging
+- **Dual enforcement**: Early rejection at P2P Gateway + defense in depth at Dequeuer
+- **Consensus-based flagging**: Peers flagged on-chain when multiple validators agree
+- **Rate limiting**: Enforces 2 submissions/epoch limit for lite nodes (whitelisted peers bypass)
+- **Peer ID whitelisting**: Full nodes and bulk service snapshotters can be whitelisted by Peer ID
+
+#### Environment Variables
+```bash
+# Enable spam protection
+ENABLE_SPAM_PROTECTION=true
+ENABLE_SPAM_REPORT_BROADCAST=true
+
+# Peer ID Whitelisting (comma-separated libp2p peer IDs)
+FULL_NODE_PEER_IDS=QmPeerID1,QmPeerID2
+BULK_SERVICE_PEER_IDS=QmBulkPeerID1,QmBulkPeerID2
+
+# Note: SPAM_AGGREGATION_WINDOW_SIZE is hardcoded to 10 in code for consensus consistency
+```
+
+#### Monitoring
+- Prometheus metrics: `spam_reports_sent_total`, `spam_consensus_reached_total`, `spam_submissions_dropped_gateway_total`
+- Redis keys: Per-epoch tracking, aggregation windows, flagged state cache
+- Log messages: Flagged peer rejections, rate limit violations, consensus reached
+
+For comprehensive documentation, see:
+- **[DSV Node Setup Guide](docs/DSV_NODE_SETUP.md)**
+- **[Spam Protection Monitoring Guide](docs/SPAM_PROTECTION_MONITORING.md)**
+- **[DDoS Protection Plan](../ai-coord-docs/phase3/DDoS_PROTECTION_PLAN.md)**
 
 ## EIP-712 Signature Verification and Slot Validation
 

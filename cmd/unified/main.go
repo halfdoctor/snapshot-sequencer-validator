@@ -34,6 +34,7 @@ import (
 	"github.com/powerloom/snapshot-sequencer-validator/pkgs/p2p"
 	"github.com/powerloom/snapshot-sequencer-validator/pkgs/protocolstate"
 	rediskeys "github.com/powerloom/snapshot-sequencer-validator/pkgs/redis"
+	"github.com/powerloom/snapshot-sequencer-validator/pkgs/spam"
 	"github.com/powerloom/snapshot-sequencer-validator/pkgs/submissions"
 	"github.com/powerloom/snapshot-sequencer-validator/pkgs/workers"
 	"github.com/redis/go-redis/v9"
@@ -601,9 +602,20 @@ func main() {
 		log.Info("✅ Protocol state cacher component started")
 	}
 
+	// Initialize spam protection components (if enabled)
+	var spamComponents *spam.SpamComponents
+	if cfg.EnableSpamProtection && redisClient != nil {
+		var err error
+		spamComponents, err = spam.InitializeSpamProtection(ctx, cfg, redisClient, keyBuilder, ps, sequencerID)
+		if err != nil {
+			log.Errorf("Failed to initialize spam protection: %v (continuing without spam protection)", err)
+			spamComponents = nil
+		}
+	}
+
 	// Initialize components based on flags
 	if enableDequeuer && redisClient != nil {
-		dequeuer, err := submissions.NewDequeuer(redisClient, keyBuilder, sequencerID, cfg.ChainID, cfg.ProtocolStateContract, snapshotterStateAddr, cfg.EnableSlotValidation)
+		dequeuer, err := submissions.NewDequeuer(redisClient, keyBuilder, sequencerID, cfg.ChainID, cfg.ProtocolStateContract, snapshotterStateAddr, cfg.EnableSlotValidation, spamComponents)
 		if err != nil {
 			log.Fatalf("Failed to create dequeuer: %v", err)
 		}

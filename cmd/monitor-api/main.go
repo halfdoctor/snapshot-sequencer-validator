@@ -2337,6 +2337,266 @@ func (m *MonitorAPI) EpochLifecycle(c *gin.Context) {
 	c.JSON(http.StatusOK, lifecycle)
 }
 
+// @Summary Get flagged peers
+// @Description Get list of all flagged peer IDs (from Redis cache, synced from on-chain)
+// @Tags spam
+// @Produce json
+// @Param protocol query string false "Protocol state identifier"
+// @Param market query string false "Data market address"
+// @Success 200 {object} map[string]interface{} "List of flagged peers with metadata"
+// @Router /spam/flagged/peers [get]
+func (m *MonitorAPI) FlaggedPeers(c *gin.Context) {
+	protocol := c.Query("protocol")
+	market := c.Query("market")
+
+	kb := m.keyBuilder
+	if protocol != "" || market != "" {
+		if protocol == "" {
+			protocol = m.keyBuilder.ProtocolState
+		}
+		if market == "" {
+			market = m.keyBuilder.DataMarket
+		}
+		kb = keys.NewKeyBuilder(protocol, market)
+	}
+
+	// Get flagged peers set
+	flaggedSetKey := fmt.Sprintf("flagged_peers:%s", kb.DataMarket)
+	peerIDs, err := m.redis.SMembers(m.ctx, flaggedSetKey).Result()
+	if err != nil {
+		c.JSON(http.StatusOK, gin.H{
+			"flagged_peers": []string{},
+			"count":         0,
+			"timestamp":     time.Now(),
+		})
+		return
+	}
+
+	// Get metadata for each flagged peer
+	peers := make([]map[string]interface{}, 0)
+	for _, peerID := range peerIDs {
+		peerKey := fmt.Sprintf("%s:%s:spam:consensus_flagged:peer:%s", kb.ProtocolState, kb.DataMarket, peerID)
+		peerData, err := m.redis.Get(m.ctx, peerKey).Result()
+		if err == nil {
+			var metadata map[string]interface{}
+			if json.Unmarshal([]byte(peerData), &metadata) == nil {
+				metadata["peer_id"] = peerID
+				peers = append(peers, metadata)
+			}
+		} else {
+			// Peer is in set but no metadata - still include it
+			peers = append(peers, map[string]interface{}{
+				"peer_id": peerID,
+			})
+		}
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"flagged_peers": peers,
+		"count":         len(peers),
+		"timestamp":     time.Now(),
+	})
+}
+
+// @Summary Get flagged snapshotters
+// @Description Get list of all flagged snapshotter addresses (from Redis cache, synced from on-chain)
+// @Tags spam
+// @Produce json
+// @Param protocol query string false "Protocol state identifier"
+// @Param market query string false "Data market address"
+// @Success 200 {object} map[string]interface{} "List of flagged snapshotters with metadata"
+// @Router /spam/flagged/snapshotters [get]
+func (m *MonitorAPI) FlaggedSnapshotters(c *gin.Context) {
+	protocol := c.Query("protocol")
+	market := c.Query("market")
+
+	kb := m.keyBuilder
+	if protocol != "" || market != "" {
+		if protocol == "" {
+			protocol = m.keyBuilder.ProtocolState
+		}
+		if market == "" {
+			market = m.keyBuilder.DataMarket
+		}
+		kb = keys.NewKeyBuilder(protocol, market)
+	}
+
+	// Get flagged snapshotters set
+	flaggedSetKey := fmt.Sprintf("flagged_snapshotters:%s", kb.DataMarket)
+	snapshotterAddrs, err := m.redis.SMembers(m.ctx, flaggedSetKey).Result()
+	if err != nil {
+		c.JSON(http.StatusOK, gin.H{
+			"flagged_snapshotters": []string{},
+			"count":                0,
+			"timestamp":            time.Now(),
+		})
+		return
+	}
+
+	// Get metadata for each flagged snapshotter
+	snapshotters := make([]map[string]interface{}, 0)
+	for _, addr := range snapshotterAddrs {
+		snapshotterKey := fmt.Sprintf("%s:%s:spam:consensus_flagged:snapshotter:%s", kb.ProtocolState, kb.DataMarket, addr)
+		snapshotterData, err := m.redis.Get(m.ctx, snapshotterKey).Result()
+		if err == nil {
+			var metadata map[string]interface{}
+			if json.Unmarshal([]byte(snapshotterData), &metadata) == nil {
+				metadata["snapshotter_addr"] = addr
+				snapshotters = append(snapshotters, metadata)
+			}
+		} else {
+			// Snapshotter is in set but no metadata - still include it
+			snapshotters = append(snapshotters, map[string]interface{}{
+				"snapshotter_addr": addr,
+			})
+		}
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"flagged_snapshotters": snapshotters,
+		"count":                len(snapshotters),
+		"timestamp":            time.Now(),
+	})
+}
+
+// @Summary Get spam tracking info for a peer
+// @Description Get validation failures, submission counts, and aggregation info for a specific peer
+// @Tags spam
+// @Produce json
+// @Param peerID path string true "Peer ID (libp2p)"
+// @Param protocol query string false "Protocol state identifier"
+// @Param market query string false "Data market address"
+// @Param epochID query int false "Specific epoch ID (optional, defaults to current epoch)"
+// @Success 200 {object} map[string]interface{} "Spam tracking information for peer"
+// @Router /spam/peer/{peerID} [get]
+func (m *MonitorAPI) PeerSpamInfo(c *gin.Context) {
+	peerID := c.Param("peerID")
+	protocol := c.Query("protocol")
+	market := c.Query("market")
+	epochIDStr := c.Query("epochID")
+
+	kb := m.keyBuilder
+	if protocol != "" || market != "" {
+		if protocol == "" {
+			protocol = m.keyBuilder.ProtocolState
+		}
+		if market == "" {
+			market = m.keyBuilder.DataMarket
+		}
+		kb = keys.NewKeyBuilder(protocol, market)
+	}
+
+	result := make(map[string]interface{})
+	result["peer_id"] = peerID
+
+	// If epochID specified, get per-epoch tracking
+	if epochIDStr != "" {
+		epochID, err := strconv.ParseUint(epochIDStr, 10, 64)
+		if err == nil {
+			// Get validation failures for this epoch
+			failureKey := fmt.Sprintf("%s:%s:spam:validation_failures:peer:%s:%d", kb.ProtocolState, kb.DataMarket, peerID, epochID)
+			failures, _ := m.redis.Get(m.ctx, failureKey).Int64()
+
+			// Get submission count for this epoch
+			submissionKey := fmt.Sprintf("%s:%s:spam:submissions:peer:%s:%d", kb.ProtocolState, kb.DataMarket, peerID, epochID)
+			submissions, _ := m.redis.Get(m.ctx, submissionKey).Int64()
+
+			// Get peer-snapshotter associations
+			mapKey := fmt.Sprintf("%s:%s:spam:peer_snapshotter_map:%s:%d", kb.ProtocolState, kb.DataMarket, peerID, epochID)
+			snapshotterAddrs, _ := m.redis.SMembers(m.ctx, mapKey).Result()
+
+			result["epoch_id"] = epochID
+			result["validation_failures"] = failures
+			result["submission_count"] = submissions
+			result["snapshotter_addresses"] = snapshotterAddrs
+		}
+	}
+
+	// Get aggregation window info (if available)
+	// Window ID = epochID / windowSize (hardcoded to 10 for consensus consistency)
+	const windowSize = 10
+	if epochIDStr != "" {
+		epochID, err := strconv.ParseUint(epochIDStr, 10, 64)
+		if err == nil {
+			windowID := epochID / uint64(windowSize)
+			aggKey := fmt.Sprintf("%s:%s:spam:reports:peer:%s:window:%d", kb.ProtocolState, kb.DataMarket, peerID, windowID)
+			aggData, err := m.redis.Get(m.ctx, aggKey).Result()
+			if err == nil {
+				var aggregated map[string]interface{}
+				if json.Unmarshal([]byte(aggData), &aggregated) == nil {
+					result["aggregation_window"] = windowID
+					result["aggregated_reports"] = aggregated
+				}
+			}
+		}
+	}
+
+	// Check if peer is flagged
+	flaggedKey := fmt.Sprintf("%s:%s:spam:consensus_flagged:peer:%s", kb.ProtocolState, kb.DataMarket, peerID)
+	flagged, _ := m.redis.Exists(m.ctx, flaggedKey).Result()
+	result["is_flagged"] = flagged > 0
+
+	if flagged > 0 {
+		flaggedData, err := m.redis.Get(m.ctx, flaggedKey).Result()
+		if err == nil {
+			var flagMetadata map[string]interface{}
+			if json.Unmarshal([]byte(flaggedData), &flagMetadata) == nil {
+				result["flag_metadata"] = flagMetadata
+			}
+		}
+	}
+
+	result["timestamp"] = time.Now()
+	c.JSON(http.StatusOK, result)
+}
+
+// @Summary Get spam protection statistics
+// @Description Get aggregated spam protection statistics including flagged counts, reports, and enforcement metrics
+// @Tags spam
+// @Produce json
+// @Param protocol query string false "Protocol state identifier"
+// @Param market query string false "Data market address"
+// @Success 200 {object} map[string]interface{} "Spam protection statistics"
+// @Router /spam/stats [get]
+func (m *MonitorAPI) SpamStats(c *gin.Context) {
+	protocol := c.Query("protocol")
+	market := c.Query("market")
+
+	kb := m.keyBuilder
+	if protocol != "" || market != "" {
+		if protocol == "" {
+			protocol = m.keyBuilder.ProtocolState
+		}
+		if market == "" {
+			market = m.keyBuilder.DataMarket
+		}
+		kb = keys.NewKeyBuilder(protocol, market)
+	}
+
+	stats := make(map[string]interface{})
+
+	// Count flagged peers
+	flaggedPeersKey := fmt.Sprintf("flagged_peers:%s", kb.DataMarket)
+	flaggedPeerCount, _ := m.redis.SCard(m.ctx, flaggedPeersKey).Result()
+	stats["flagged_peers_count"] = flaggedPeerCount
+
+	// Count flagged snapshotters
+	flaggedSnapshottersKey := fmt.Sprintf("flagged_snapshotters:%s", kb.DataMarket)
+	flaggedSnapshotterCount, _ := m.redis.SCard(m.ctx, flaggedSnapshottersKey).Result()
+	stats["flagged_snapshotters_count"] = flaggedSnapshotterCount
+
+	// Count active validators (for consensus calculation)
+	activeValidatorsKey := fmt.Sprintf("%s:%s:active:validators", kb.ProtocolState, kb.DataMarket)
+	activeValidatorCount, _ := m.redis.SCard(m.ctx, activeValidatorsKey).Result()
+	stats["active_validators_count"] = activeValidatorCount
+
+	// Note: Per-epoch tracking keys are ephemeral (24h TTL) and would require scanning
+	// For production, these should be aggregated by state-tracker or queried via Prometheus metrics
+
+	stats["timestamp"] = time.Now()
+	c.JSON(http.StatusOK, stats)
+}
+
 func main() {
 	// Configure logger
 	log.SetFormatter(&logrus.JSONFormatter{})
@@ -2431,6 +2691,12 @@ func main() {
 		v1.GET("/vpa/epoch/:epochID/lifecycle", api.EpochLifecycle)
 		v1.GET("/vpa/timeline", api.VPATimeline)
 		v1.GET("/vpa/stats", api.VPAStats)
+
+		// Spam Protection endpoints
+		v1.GET("/spam/flagged/peers", api.FlaggedPeers)
+		v1.GET("/spam/flagged/snapshotters", api.FlaggedSnapshotters)
+		v1.GET("/spam/peer/:peerID", api.PeerSpamInfo)
+		v1.GET("/spam/stats", api.SpamStats)
 	}
 
 	// Swagger documentation

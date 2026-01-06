@@ -76,6 +76,19 @@ type Settings struct {
 	FlaggedSnapshottersCheck bool
 	VerificationCacheTTL     time.Duration
 
+	// Spam Protection Configuration
+	EnableSpamProtection      bool     // Master switch for spam protection
+	EnableSpamReportBroadcast bool     // Enable validator coordination via spam reports
+	SpamReportTopic           string   // Dedicated topic for spam reports (empty = auto-construct from validator presence prefix + "/spam-reports")
+	SpamCacheTTLHours         int      // Redis cache TTL in hours (onchain is source of truth)
+	FullNodePeerIDs           []string // Full node Peer IDs (comma-separated) - whitelisted for rate limit bypass
+	BulkServicePeerIDs        []string // Bulk service snapshotter Peer IDs (comma-separated) - whitelisted for rate limit bypass
+	// NOTE: The following fields are for FUTURE onchain implementation (not yet used in code):
+	SpamFlagExpiryDays    int  // Days before flagged peers can be cleared (onchain) - FUTURE
+	SpamFlagExpiryEpochs  int  // Epochs before flagged peers can be cleared (onchain) - FUTURE
+	SpamSyncOnStartup     bool // Sync flagged state from onchain on node startup - FUTURE
+	SpamSyncIntervalHours int  // Periodic sync interval in hours - FUTURE
+
 	// Dequeuer Configuration
 	DequeueWorkers         int
 	DequeueBatchSize       int
@@ -223,6 +236,17 @@ func LoadConfig() error {
 		FlaggedSnapshottersCheck: getBoolEnv("CHECK_FLAGGED_SNAPSHOTTERS", true),
 		VerificationCacheTTL:     time.Duration(getEnvAsInt("VERIFICATION_CACHE_TTL", 600)) * time.Second,
 
+		// Spam Protection Configuration
+		EnableSpamProtection:      getBoolEnv("ENABLE_SPAM_PROTECTION", true),
+		EnableSpamReportBroadcast: getBoolEnv("ENABLE_SPAM_REPORT_BROADCAST", true),
+		SpamReportTopic:           "", // Empty = auto-construct from validator presence prefix + "/spam-reports"
+		SpamCacheTTLHours:         getEnvAsInt("SPAM_CACHE_TTL_HOURS", 24),
+		// NOTE: The following configs are for FUTURE onchain implementation (not yet used):
+		// SpamFlagExpiryDays:        getEnvAsInt("SPAM_FLAG_EXPIRY_DAYS", 7),
+		// SpamFlagExpiryEpochs:      getEnvAsInt("SPAM_FLAG_EXPIRY_EPOCHS", 100),
+		// SpamSyncOnStartup:         getBoolEnv("SPAM_SYNC_ON_STARTUP", true),
+		// SpamSyncIntervalHours:     getEnvAsInt("SPAM_SYNC_INTERVAL_HOURS", 1),
+
 		// Dequeuer Configuration
 		DequeueWorkers:         getEnvAsInt("DEQUEUER_WORKERS", 5),
 		DequeueBatchSize:       getEnvAsInt("DEQUEUE_BATCH_SIZE", 10),
@@ -323,6 +347,7 @@ func LoadConfig() error {
 
 	loadBootstrapPeers()
 	loadFullNodeAddresses()
+	loadPeerIDWhitelists()
 
 	// DATA_SOURCES removed - project IDs generated directly from contract addresses
 
@@ -472,6 +497,35 @@ func loadFullNodeAddresses() {
 	// Clean and lowercase
 	for i := range SettingsObj.FullNodeAddresses {
 		SettingsObj.FullNodeAddresses[i] = strings.ToLower(strings.TrimSpace(SettingsObj.FullNodeAddresses[i]))
+	}
+}
+
+// loadPeerIDWhitelists loads Peer ID whitelists for spam protection
+func loadPeerIDWhitelists() {
+	// Load full node Peer IDs
+	fullNodePeerIDsStr := getEnv("FULL_NODE_PEER_IDS", "")
+	if strings.HasPrefix(fullNodePeerIDsStr, "[") {
+		json.Unmarshal([]byte(fullNodePeerIDsStr), &SettingsObj.FullNodePeerIDs)
+	} else if fullNodePeerIDsStr != "" {
+		SettingsObj.FullNodePeerIDs = strings.Split(fullNodePeerIDsStr, ",")
+	}
+
+	// Clean Peer IDs
+	for i := range SettingsObj.FullNodePeerIDs {
+		SettingsObj.FullNodePeerIDs[i] = strings.TrimSpace(SettingsObj.FullNodePeerIDs[i])
+	}
+
+	// Load bulk service Peer IDs
+	bulkServicePeerIDsStr := getEnv("BULK_SERVICE_PEER_IDS", "")
+	if strings.HasPrefix(bulkServicePeerIDsStr, "[") {
+		json.Unmarshal([]byte(bulkServicePeerIDsStr), &SettingsObj.BulkServicePeerIDs)
+	} else if bulkServicePeerIDsStr != "" {
+		SettingsObj.BulkServicePeerIDs = strings.Split(bulkServicePeerIDsStr, ",")
+	}
+
+	// Clean Peer IDs
+	for i := range SettingsObj.BulkServicePeerIDs {
+		SettingsObj.BulkServicePeerIDs[i] = strings.TrimSpace(SettingsObj.BulkServicePeerIDs[i])
 	}
 }
 
@@ -698,4 +752,18 @@ func (s *Settings) GetSnapshotSubmissionTopics() (discoveryTopic, submissionsTop
 // GetFinalizedBatchTopics returns the discovery and batch topics
 func (s *Settings) GetFinalizedBatchTopics() (discoveryTopic, batchTopic string) {
 	return s.GossipsubFinalizedBatchPrefix + "/0", s.GossipsubFinalizedBatchPrefix + "/all"
+}
+
+// GetSpamReportTopic returns the spam report topic, constructed from validator presence prefix
+// Format: {validator_presence_prefix_base}/spam-reports
+// Example: /powerloom/validator/spam-reports (if GOSSIPSUB_VALIDATOR_PRESENCE_TOPIC=/powerloom/validator/presence)
+// If SPAM_REPORT_TOPIC is explicitly set, use it; otherwise construct from prefix
+func (s *Settings) GetSpamReportTopic() string {
+	// If explicitly set, use it
+	if s.SpamReportTopic != "" {
+		return s.SpamReportTopic
+	}
+	// Extract base prefix from validator presence topic (remove /presence suffix if present)
+	basePrefix := strings.TrimSuffix(s.GossipsubValidatorPresenceTopic, "/presence")
+	return basePrefix + "/spam-reports"
 }
