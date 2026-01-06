@@ -223,13 +223,13 @@ start_services() {
         fi
         print_color "$GREEN" "✅ Successfully cloned relayer-py"
 
-        # Switch to feat/tx-queue branch
-        print_color "$CYAN" "🔄 Switching to feat/tx-queue branch..."
-        if ! (cd "$RELAYER_DIR" && git checkout feat/tx-queue-memory-leak-fix); then
-            print_color "$RED" "❌ Failed to switch to feat/tx-queue-memory-leak-fix branch"
+        # Switch to master branch
+        print_color "$CYAN" "🔄 Switching to master branch..."
+        if ! (cd "$RELAYER_DIR" && git checkout master); then
+            print_color "$RED" "❌ Failed to switch to master branch"
             print_color "$YELLOW" "Continuing with default branch"
         else
-            print_color "$GREEN" "✅ Switched to feat/tx-queue-memory-leak-fix branch"
+            print_color "$GREEN" "✅ Switched to master branch"
         fi
 
         # relayer-py now reads settings directly from environment variables
