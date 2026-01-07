@@ -58,6 +58,7 @@ show_usage() {
     echo "  logs          - Show all logs"
     echo "  p2p-logs      - P2P Gateway logs"
     echo "  aggregator-logs - Aggregator logs"
+    echo "  spam-aggregator-logs - Spam Aggregator logs"
     echo "  finalizer-logs - Finalizer logs"
     echo "  dequeuer-logs - Dequeuer logs"
     echo "  event-logs    - Event monitor logs"
@@ -316,6 +317,7 @@ start_services() {
         print_color "$CYAN" "Components:"
         echo "  • P2P Gateway (port ${P2P_PORT:-9001})"
         echo "  • Aggregator (consensus)"
+        echo "  • Spam Aggregator (DDoS protection)"
         echo "  • Finalizer (batch creation)"
         echo "  • Dequeuer (submission processing)"
         echo "  • Event Monitor (epoch tracking)"
@@ -802,6 +804,9 @@ case "${1:-}" in
         ;;
     aggregator-logs)
         show_service_logs "aggregator" "$2"
+        ;;
+    spam-aggregator-logs)
+        show_service_logs "spam-aggregator" "$2"
         ;;
     finalizer-logs)
         show_service_logs "finalizer" "$2"

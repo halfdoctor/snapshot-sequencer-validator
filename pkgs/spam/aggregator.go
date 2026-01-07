@@ -28,8 +28,10 @@ type SpamAggregator struct {
 	keyBuilder  *redislib.KeyBuilder
 	whitelist   *PeerWhitelist
 	windowSize  int
-	sub         *pubsub.Subscription
+	sub         *pubsub.Subscription // Subscription for receiving reports
+	topic       *pubsub.Topic        // Topic for broadcasting reports
 	flagging    *FlaggingService
+	sequencerID string // Validator/sequencer ID for generating local reports
 }
 
 // AggregatedReport represents aggregated spam reports for a peer in a window
@@ -46,7 +48,7 @@ type AggregatedReport struct {
 }
 
 // NewSpamAggregator creates a new SpamAggregator instance
-func NewSpamAggregator(ctx context.Context, redisClient *redis.Client, keyBuilder *redislib.KeyBuilder, whitelist *PeerWhitelist, sub *pubsub.Subscription, flagging *FlaggingService, windowSize int) *SpamAggregator {
+func NewSpamAggregator(ctx context.Context, redisClient *redis.Client, keyBuilder *redislib.KeyBuilder, whitelist *PeerWhitelist, sub *pubsub.Subscription, topic *pubsub.Topic, flagging *FlaggingService, windowSize int) *SpamAggregator {
 	if windowSize <= 0 {
 		windowSize = DEFAULT_AGGREGATION_WINDOW_SIZE
 	}
@@ -57,8 +59,15 @@ func NewSpamAggregator(ctx context.Context, redisClient *redis.Client, keyBuilde
 		whitelist:   whitelist,
 		windowSize:  windowSize,
 		sub:         sub,
+		topic:       topic,
 		flagging:    flagging,
+		sequencerID: "", // Will be set via SetSequencerID if needed
 	}
+}
+
+// SetSequencerID sets the sequencer ID for generating local reports
+func (a *SpamAggregator) SetSequencerID(sequencerID string) {
+	a.sequencerID = sequencerID
 }
 
 // Start begins listening for spam reports and aggregating them
@@ -100,6 +109,16 @@ func (a *SpamAggregator) processSpamReportDirect(data []byte) {
 	if err := json.Unmarshal(data, &report); err != nil {
 		log.Errorf("Failed to unmarshal spam report: %v", err)
 		return
+	}
+
+	// Log receipt of report from another validator (only if reporter ID differs from our own)
+	if report.ReporterID != a.sequencerID {
+		log.WithFields(log.Fields{
+			"peer_id":     report.PeerID,
+			"epoch_id":    report.EpochID,
+			"reporter_id": report.ReporterID,
+			"violation":   report.ViolationType,
+		}).Infof("📨 Received spam report from validator %s for peer %s epoch %d", report.ReporterID, report.PeerID, report.EpochID)
 	}
 
 	// Skip if peer is whitelisted
@@ -521,6 +540,7 @@ func (a *SpamAggregator) CreateWindowAndAggregateLocalData(ctx context.Context, 
 		totalSubmissions := 0
 		totalValidationFailures := 0
 		snapshotterAddrs := make(map[string]bool)
+		localReportsGenerated := false
 
 		for epoch := windowStartEpoch; epoch <= windowEndEpoch; epoch++ {
 			// Get submission count
@@ -557,6 +577,102 @@ func (a *SpamAggregator) CreateWindowAndAggregateLocalData(ctx context.Context, 
 					lastEpoch = epoch
 				}
 			}
+
+			// Generate spam report for this epoch if thresholds are met
+			shouldReport, violationType, err := tracker.ShouldReportSpam(ctx, peerID, epoch)
+			if err != nil {
+				log.Warnf("Failed to check if spam should be reported for peer %s epoch %d: %v", peerID, epoch, err)
+				continue
+			}
+
+			if shouldReport && a.sequencerID != "" {
+				// Get snapshotter address for this epoch (use first one found)
+				snapshotterAddr := ""
+				if len(snapshotterAddrs) > 0 {
+					// Get first snapshotter address
+					for addr := range snapshotterAddrs {
+						snapshotterAddr = addr
+						break
+					}
+				}
+
+				// Create spam report
+				var count int
+				var evidence []string
+				switch violationType {
+				case "validation_failure":
+					count = failureCount
+					evidence = []string{fmt.Sprintf("validation_failures: %d", count)}
+				case "rate_limit":
+					count = submissionCount
+					consecutiveViolations, err := tracker.CheckConsecutiveRateLimitViolations(ctx, peerID, epoch)
+					if err != nil {
+						log.Warnf("Failed to get consecutive violations count: %v", err)
+						consecutiveViolations = 1
+					}
+					evidence = []string{
+						fmt.Sprintf("submissions: %d (limit: %d)", count, MAX_SUBMISSIONS_PER_EPOCH_LITE),
+						fmt.Sprintf("consecutive_epochs_with_violations: %d (threshold: %d)", consecutiveViolations, CONSISTENT_VIOLATIONS_THRESHOLD),
+					}
+				default:
+					count = 0
+					evidence = []string{}
+				}
+
+				if count > 0 {
+					report := SpamReport{
+						PeerID:          peerID,
+						SnapshotterAddr: snapshotterAddr,
+						ViolationType:   violationType,
+						EpochID:         epoch,
+						Count:           count,
+						Evidence:        evidence,
+						ReporterID:      a.sequencerID,
+						Timestamp:       time.Now().Unix(),
+					}
+
+					aggregated.Reports = append(aggregated.Reports, report)
+					localReportsGenerated = true
+
+					// Add validator ID if not already present
+					validatorExists := false
+					for _, vid := range aggregated.ValidatorIDs {
+						if vid == a.sequencerID {
+							validatorExists = true
+							break
+						}
+					}
+					if !validatorExists {
+						aggregated.ValidatorIDs = append(aggregated.ValidatorIDs, a.sequencerID)
+						aggregated.ValidatorCount = len(aggregated.ValidatorIDs)
+					}
+
+					log.WithFields(log.Fields{
+						"peer_id":        peerID,
+						"epoch_id":       epoch,
+						"violation_type": violationType,
+						"count":          count,
+					}).Debugf("Generated local spam report for peer %s epoch %d", peerID, epoch)
+
+					// Broadcast report via P2P if topic is available
+					if a.topic != nil {
+						reportData, err := json.Marshal(report)
+						if err != nil {
+							log.Warnf("Failed to marshal spam report for broadcasting: %v", err)
+						} else {
+							if err := a.topic.Publish(a.ctx, reportData); err != nil {
+								log.Warnf("Failed to broadcast spam report for peer %s epoch %d: %v", peerID, epoch, err)
+							} else {
+								log.WithFields(log.Fields{
+									"peer_id":        peerID,
+									"epoch_id":       epoch,
+									"violation_type": violationType,
+								}).Debugf("Broadcasted local spam report for peer %s epoch %d", peerID, epoch)
+							}
+						}
+					}
+				}
+			}
 		}
 
 		// Update aggregated report with local tracking data
@@ -581,6 +697,14 @@ func (a *SpamAggregator) CreateWindowAndAggregateLocalData(ctx context.Context, 
 			if !addrExists {
 				aggregated.SnapshotterAddrs = append(aggregated.SnapshotterAddrs, addr)
 			}
+		}
+
+		// Update timestamps if reports were generated
+		if localReportsGenerated {
+			if aggregated.FirstSeen == 0 {
+				aggregated.FirstSeen = time.Now().Unix()
+			}
+			aggregated.LastUpdated = time.Now().Unix()
 		}
 
 		// Store aggregated report

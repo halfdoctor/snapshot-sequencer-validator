@@ -256,7 +256,8 @@ func main() {
 		log.Infof("Deduplicator initialized with local cache size %d and TTL %v", localCacheSize, dedupTTL)
 	}
 
-	// Initialize P2P if listener or consensus is enabled
+	// Initialize P2P if listener or batch aggregation is enabled
+	// Note: Spam protection P2P is handled by separate spam-aggregator component
 	var h host.Host
 	var ps *pubsub.PubSub
 	if enableListener || enableBatchAggregation {
@@ -603,13 +604,18 @@ func main() {
 	}
 
 	// Initialize spam protection components (if enabled)
+	// Dequeuer only needs local components (tracker, rateLimiter, flagging) - no P2P needed
+	// Spam-aggregator component handles all P2P functionality (aggregator, reporter)
 	var spamComponents *spam.SpamComponents
 	if cfg.EnableSpamProtection && redisClient != nil {
 		var err error
-		spamComponents, err = spam.InitializeSpamProtection(ctx, cfg, redisClient, keyBuilder, ps, sequencerID)
+		// Pass nil for pubsub - dequeuer doesn't need P2P, spam-aggregator component handles it
+		spamComponents, err = spam.InitializeSpamProtection(ctx, cfg, redisClient, keyBuilder, nil, sequencerID)
 		if err != nil {
 			log.Errorf("Failed to initialize spam protection: %v (continuing without spam protection)", err)
 			spamComponents = nil
+		} else {
+			log.Info("✅ Spam protection components initialized (local tracking only - P2P handled by spam-aggregator component)")
 		}
 	}
 

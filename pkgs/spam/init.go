@@ -11,7 +11,9 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
-// InitializeSpamProtection initializes all spam protection components
+// InitializeSpamProtection initializes spam protection components
+// If ps is nil, only local components (tracker, rateLimiter, flagging) are initialized
+// P2P components (aggregator, reporter) are only initialized if ps is provided
 func InitializeSpamProtection(ctx context.Context, cfg *config.Settings, redisClient *redis.Client, keyBuilder *redislib.KeyBuilder, ps *pubsub.PubSub, sequencerID string) (*SpamComponents, error) {
 	if !cfg.EnableSpamProtection {
 		log.Info("Spam protection disabled via ENABLE_SPAM_PROTECTION=false")
@@ -40,13 +42,15 @@ func InitializeSpamProtection(ctx context.Context, cfg *config.Settings, redisCl
 
 	// Initialize spam aggregator FIRST (always needed for local aggregation)
 	// The aggregator is needed for local data aggregation even if broadcast is disabled
-	// If broadcast is enabled, it also handles incoming reports from other validators
+	// If broadcast is enabled, it also handles incoming reports from other validators and broadcasts local reports
 	var aggregator *SpamAggregator
 	var sub *pubsub.Subscription
+	var spamTopic *pubsub.Topic
 	if cfg.EnableSpamReportBroadcast && ps != nil {
 		// Get spam report topic (constructed from validator presence prefix + "/spam-reports")
 		spamReportTopic := cfg.GetSpamReportTopic()
-		spamTopic, err := ps.Join(spamReportTopic)
+		var err error
+		spamTopic, err = ps.Join(spamReportTopic)
 		if err != nil {
 			return nil, fmt.Errorf("failed to join spam reports topic for aggregator: %w", err)
 		}
@@ -56,8 +60,10 @@ func InitializeSpamProtection(ctx context.Context, cfg *config.Settings, redisCl
 		}
 	}
 	// Window size is hardcoded to 10 for consensus consistency across all validators
-	// Create aggregator even if sub is nil (local aggregation only)
-	aggregator = NewSpamAggregator(ctx, redisClient, keyBuilder, whitelist, sub, flagging, DEFAULT_AGGREGATION_WINDOW_SIZE)
+	// Create aggregator even if sub/topic is nil (local aggregation only)
+	aggregator = NewSpamAggregator(ctx, redisClient, keyBuilder, whitelist, sub, spamTopic, flagging, DEFAULT_AGGREGATION_WINDOW_SIZE)
+	// Set sequencer ID for generating local reports
+	aggregator.SetSequencerID(sequencerID)
 	// Always start aggregator (periodicConsensusCheck handles pruning even without broadcast)
 	// Only subscription handler starts conditionally
 	aggregator.Start()

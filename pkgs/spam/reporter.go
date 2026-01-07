@@ -137,7 +137,7 @@ func (r *SpamReporter) CheckAndReport(ctx context.Context, peerID, snapshotterAd
 			return fmt.Errorf("failed to get submission count: %w", err)
 		}
 		// Include consecutive epochs information in evidence
-		consecutiveViolations, err := r.tracker.checkConsecutiveRateLimitViolations(ctx, peerID, epochID)
+		consecutiveViolations, err := r.tracker.CheckConsecutiveRateLimitViolations(ctx, peerID, epochID)
 		if err != nil {
 			log.Warnf("Failed to get consecutive violations count: %v", err)
 			consecutiveViolations = 1 // Fallback to 1 if check fails

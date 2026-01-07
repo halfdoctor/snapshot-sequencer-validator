@@ -78,6 +78,11 @@ services:
       - ENABLE_FINALIZER=false
       - ENABLE_BATCH_AGGREGATION=false
       - ENABLE_EVENT_MONITOR=false
+      # Spam protection configuration (local tracking only - P2P handled by spam-aggregator)
+      - ENABLE_SPAM_PROTECTION=${ENABLE_SPAM_PROTECTION:-true}
+      - FULL_NODE_PEER_IDS=${FULL_NODE_PEER_IDS:-}
+      - BULK_SERVICE_PEER_IDS=${BULK_SERVICE_PEER_IDS:-}
+      - SPAM_CACHE_TTL_HOURS=${SPAM_CACHE_TTL_HOURS:-24}
       # Dequeuer specific
       - DEQUEUER_WORKERS=${DEQUEUER_WORKERS:-5}
       - MAX_SUBMISSIONS_PER_EPOCH=${MAX_SUBMISSIONS_PER_EPOCH:-100}
@@ -238,6 +243,67 @@ services:
     restart: unless-stopped
     deploy:
       replicas: ${FINALIZER_REPLICAS:-2}
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # Spam Aggregator - Singleton for spam report P2P exchange and aggregation
+  spam-aggregator:
+    build:
+      context: .
+      dockerfile: Dockerfile.spam-aggregator
+    environment:
+      - SEQUENCER_ID=${SEQUENCER_ID:-validator1}
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_DB=${REDIS_DB:-0}
+      - REDIS_PASSWORD=${REDIS_PASSWORD:-}
+      - DEBUG_MODE=${DEBUG_MODE:-false}
+      # Spam protection configuration
+      - ENABLE_SPAM_PROTECTION=${ENABLE_SPAM_PROTECTION:-true}
+      - ENABLE_SPAM_REPORT_BROADCAST=${ENABLE_SPAM_REPORT_BROADCAST:-true}
+      - SPAM_REPORT_TOPIC=${SPAM_REPORT_TOPIC:-}
+      - FULL_NODE_PEER_IDS=${FULL_NODE_PEER_IDS:-}
+      - BULK_SERVICE_PEER_IDS=${BULK_SERVICE_PEER_IDS:-}
+      - SPAM_CACHE_TTL_HOURS=${SPAM_CACHE_TTL_HOURS:-24}
+      - GOSSIPSUB_VALIDATOR_PRESENCE_TOPIC=${GOSSIPSUB_VALIDATOR_PRESENCE_TOPIC:-/powerloom/dsv-devnet-alpha/validator/presence}
+      # P2P Configuration (separate port from p2p-gateway)
+      - P2P_PORT=${P2P_PORT_SPAM_AGGREGATOR:-9002}
+      - BOOTSTRAP_PEERS=${BOOTSTRAP_PEERS:-}
+      - BOOTSTRAP_MULTIADDR=${BOOTSTRAP_MULTIADDR:-}
+      - RENDEZVOUS_POINT=${RENDEZVOUS_POINT:-powerloom-snapshot-sequencer-network}
+      - PRIVATE_KEY=${PRIVATE_KEY}
+      - PUBLIC_IP=${PUBLIC_IP}
+      - CONN_MANAGER_LOW_WATER=${CONN_MANAGER_LOW_WATER:-50}
+      - CONN_MANAGER_HIGH_WATER=${CONN_MANAGER_HIGH_WATER:-200}
+      # Protocol/Market config
+      - PROTOCOL_STATE_CONTRACT=${PROTOCOL_STATE_CONTRACT}
+      - DATA_MARKET_ADDRESSES=${DATA_MARKET_ADDRESSES}
+      - POWERLOOM_RPC_NODES=${POWERLOOM_RPC_NODES}
+      - CONTRACT_ABI_PATH=${CONTRACT_ABI_PATH:-./abi/LegacyProtocolState.json}
+      # Event Monitor Configuration (for epoch boundary detection)
+      - ENABLE_EVENT_MONITOR=${ENABLE_EVENT_MONITOR:-true}
+      - EVENT_POLL_INTERVAL=${EVENT_POLL_INTERVAL:-12}
+      - EVENT_START_BLOCK=${EVENT_START_BLOCK:-0}
+      - EVENT_BLOCK_BATCH_SIZE=${EVENT_BLOCK_BATCH_SIZE:-1000}
+      - MAX_CONCURRENT_WINDOWS=${MAX_CONCURRENT_WINDOWS:-100}
+      - SUBMISSION_WINDOW_DURATION=${SUBMISSION_WINDOW_DURATION:-60}
+      - LEVEL1_FINALIZATION_DELAY=${LEVEL1_FINALIZATION_DELAY:-10s}
+      # VPA Configuration (optional, for event monitor)
+      - VPA_CONTRACT_ADDRESS=${VPA_CONTRACT_ADDRESS:-}
+      - VPA_VALIDATOR_ADDRESS=${VPA_VALIDATOR_ADDRESS:-}
+      - NEW_PROTOCOL_STATE_CONTRACT=${NEW_PROTOCOL_STATE_CONTRACT:-}
+      - NEW_DATA_MARKET_CONTRACT=${NEW_DATA_MARKET_CONTRACT:-}
+    depends_on:
+      redis:
+        condition: service_healthy
+    ports:
+      - "${P2P_PORT_SPAM_AGGREGATOR:-9002}:${P2P_PORT_SPAM_AGGREGATOR:-9002}"
+    networks:
+      - sequencer-net
+    restart: unless-stopped
     logging:
       driver: "json-file"
       options:

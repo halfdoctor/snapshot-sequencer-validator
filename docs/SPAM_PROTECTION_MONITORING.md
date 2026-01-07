@@ -10,49 +10,79 @@ If `/api/v1/spam/windows` returns empty, follow these steps:
 
 **CRITICAL FIRST STEP**: Check if components initialized correctly at startup.
 
+**Dequeuer Component** (local tracking only):
 ```bash
-# Check initialization logs (look for these at node startup)
-./dsv.sh dequeuer-logs | grep -i "initializing spam\|spam protection components initialized\|aggregator.*initialized"
+# Check initialization logs in dequeuer (local tracking components)
+./dsv.sh dequeuer-logs | grep -iE "(initializing spam|spam protection components initialized)"
 
 # Expected logs:
 # - "Initializing spam protection components" with fields:
 #   - enable_spam_protection: true
-#   - enable_spam_report_broadcast: true
-#   - pubsub_available: true (if P2P is enabled)
-# - "Initialized spam aggregator with window size: 10 (broadcast enabled, subscription handler started)"
-#   OR
-#   "Initialized spam aggregator with window size: 10 (local aggregation only, broadcast disabled or pubsub unavailable)"
-# - "✅ Spam protection components initialized" with component status:
+#   - enable_spam_report_broadcast: false (dequeuer doesn't do P2P)
+#   - pubsub_available: false (expected - dequeuer doesn't initialize P2P)
+# - "✅ Spam protection components initialized (local tracking only - P2P handled by spam-aggregator component)"
 #   - tracker_initialized: true
 #   - rate_limiter_initialized: true
 #   - flagging_initialized: true
-#   - reporter_initialized: true/false (depends on broadcast)
-#   - aggregator_initialized: true (MUST be true)
+#   - reporter_initialized: false (expected - no P2P in dequeuer)
+#   - aggregator_initialized: true (local aggregator instance, but no P2P)
 ```
 
-**If `aggregator_initialized: false` or aggregator logs are missing:**
+**Spam-Aggregator Component** (P2P broadcasting):
+```bash
+# Check initialization logs in spam-aggregator (P2P components)
+./dsv.sh spam-aggregator-logs | grep -iE "(spam aggregator component starting|initializing spam|spam protection components initialized|p2p host started|gossipsub|event monitor)"
+
+# Expected logs:
+# - "🛡️  SPAM AGGREGATOR COMPONENT STARTING"
+# - "✅ Connected to Redis"
+# - "P2P Host started with peer ID: {peerID}"
+# - "✅ Initialized gossipsub for spam report exchange"
+# - "Initializing spam protection components" with fields:
+#   - enable_spam_protection: true
+#   - enable_spam_report_broadcast: true
+#   - pubsub_available: true (MUST be true)
+# - "Initialized spam aggregator with window size: 10 (broadcast enabled, subscription handler started)"
+# - "✅ Spam protection components initialized" with component status:
+#   - aggregator_initialized: true (MUST be true)
+#   - reporter_initialized: true (MUST be true - spam-aggregator handles P2P)
+# - "✅ Event monitor started (will trigger window aggregation at epoch boundaries)"
+```
+
+**If spam-aggregator logs show errors:**
 - Check environment variables: `ENABLE_SPAM_PROTECTION=true` and `ENABLE_SPAM_REPORT_BROADCAST=true`
-- Verify Redis connection is working
-- Check if P2P/pubsub is initialized (required for broadcast, but aggregator works without it)
+- Verify `P2P_PORT_SPAM_AGGREGATOR` is set (default: 9002) and doesn't conflict with p2p-gateway port
+- Check Redis connection is working
+- Verify P2P configuration (BOOTSTRAP_PEERS, RENDEZVOUS_POINT, PRIVATE_KEY)
 
 ### Step 1: Check if EventMonitor is Processing Epochs
 
+**Spam-Aggregator Component** (has its own event monitor):
 ```bash
-# Check event monitor logs for epoch releases
-docker logs <event-monitor-container> | grep -i "epoch.*released\|epoch.*boundary\|aggregation window"
+# Check spam-aggregator logs for epoch releases and window creation
+./dsv.sh spam-aggregator-logs | grep -iE "(epoch.*released|epoch.*boundary|aggregation window|creating window|window.*aggregated)"
 
 # Look for these messages:
-# - "EpochReleased event received: epoch={epochID}"
-# - "Epoch {epochID} is an aggregation window boundary"
-# - "Creating spam aggregation window"
+# - "📅 Epoch {epochID} released for market {market} at block {block}"
+# - "Epoch {epochID} is an aggregation window boundary. Triggering local spam data aggregation."
+# - "Successfully created spam aggregation window for epoch {epochID}"
+# - "Broadcasting spam report for peer {peerID} epoch {epochID}"
+```
+
+**If using separate event-monitor component**:
+```bash
+# Check event monitor logs for epoch releases
+./dsv.sh event-logs | grep -iE "(epoch.*released|epoch.*boundary|aggregation window)"
 ```
 
 ### Step 2: Check if Tracking is Happening
 
 ```bash
 # Check dequeuer logs for tracking activity
-docker logs <dequeuer-container> | grep -i "tracked.*submission\|tracked.*validation\|epoch.*peers\|spam.*tracker\|peer.*empty"
+./dsv.sh dequeuer-logs | grep -iE "(tracked.*submission|tracked.*validation|epoch.*peers|spam.*tracker|peer.*empty)"
 
+# OR
+./dsv.sh dequeuer-logs | grep -iE "(tracked.*submission|tracked.*validation|epoch.*peers|spam.*tracker|peer.*empty)"
 # Enable debug logging if needed:
 # LOG_LEVEL=debug in your docker-compose env
 
@@ -97,21 +127,30 @@ curl "http://localhost:9091/api/v1/spam/epochs?limit=20" | jq '.'
 # If this returns epochs, check if any are multiples of 10
 ```
 
-### Step 6: Verify EventMonitor Configuration
+### Step 6: Verify Spam-Aggregator Window Creation
 
 ```bash
-# Check if DDoS protection components are passed to EventMonitor
-./dsv.sh event-logs | grep -i "spam.*component\|spam.*aggregator.*nil\|epoch.*boundary"
+# Check spam-aggregator logs for window creation and aggregation
+./dsv.sh spam-aggregator-logs | grep -iE "(window.*created|window.*aggregated|createwindow|aggregating.*local|broadcasting.*report)"
 
 # Look for:
 # - "Epoch {epochID} is an aggregation window boundary. Triggering local spam data aggregation."
-# - "Spam aggregator is nil at epoch boundary {epochID}" (BAD - aggregator not initialized)
-# - "Spam tracker is nil at epoch boundary {epochID}" (BAD - tracker not initialized)
-# - "Successfully triggered spam aggregation window creation for epoch {epochID}" (GOOD)
+# - "Successfully created spam aggregation window for epoch {epochID}" (GOOD)
 # - "Failed to create spam aggregation window at epoch boundary {epochID}: {error}" (BAD - check error)
+# - "Aggregated local data for window {windowID}: {peerCount} peers, {reportCount} reports"
+# - "Broadcasting spam report for peer {peerID} epoch {epochID}" (if reports generated)
+# - "Received spam report from validator {validatorID} for peer {peerID}" (if receiving reports)
+```
 
-# EventMonitor needs spamComponents.Aggregator to create windows
-# If aggregator is nil, check Step 0 initialization logs
+**Check P2P connectivity**:
+```bash
+# Check if spam-aggregator is connected to other validators
+./dsv.sh spam-aggregator-logs | grep -iE "(connected.*peer|found peer|p2p.*host|gossipsub)"
+
+# Look for:
+# - "Connected to peer via rendezvous: {peerID}"
+# - "P2P Host started with peer ID: {peerID}"
+# - "Joined spam reports topic: {topic}"
 ```
 
 ## Monitoring API Endpoints
@@ -135,10 +174,183 @@ curl "http://localhost:9091/api/v1/spam/windows" | jq '.'
 ### Check Window Details
 
 ```bash
-# Get details for a specific window
-curl "http://localhost:9091/api/v1/spam/windows/24176210" | jq '.'
+# Get details for a specific window (shows all peers and their aggregated reports)
+curl "http://localhost:9091/api/v1/spam/windows/24182100" | jq '.'
 
-# Replace 24176210 with actual window ID (multiple of 10)
+# Response includes:
+# - window_id: Window ID (end epoch)
+# - epoch_range: Epochs covered (e.g., "24182091-24182100")
+# - peers: Array of peer details including:
+#   - peer_id: Peer ID
+#   - validator_count: Number of validators that reported this peer (for consensus)
+#   - first_epoch: First epoch with violations
+#   - last_epoch: Last epoch with violations
+#   - report_count: Number of spam reports
+#   - reports: Array of individual spam reports
+```
+
+## Drilling Down: Detailed Investigation
+
+Once you have windows, here's how to investigate further:
+
+### Step 1: Get Window Details
+
+```bash
+# Get full details for a window (replace with your window ID)
+WINDOW_ID=24182100
+curl "http://localhost:9091/api/v1/spam/windows/${WINDOW_ID}" | jq '.'
+```
+
+This shows:
+- All peers in the window
+- Validator count per peer (consensus indicator)
+- Epoch range of violations
+- Individual spam reports
+
+### Step 2: Check Specific Peer Activity
+
+```bash
+# Get peer tracking for a specific epoch
+PEER_ID="12D3KooWKYSAndoFZEBENnFV9wi5CwPVWeT9ArUYnUZR5CA3Qc5L"
+EPOCH_ID=24182098
+curl "http://localhost:9091/api/v1/spam/peer/${PEER_ID}?epochID=${EPOCH_ID}" | jq '.'
+```
+
+### Step 3: Check Peer Activity Across Epochs
+
+**Endpoint**: `GET /api/v1/spam/peer/{peerID}/epochs`
+
+**Query Parameters**:
+- `startEpoch` (optional): Start epoch (default: current epoch - 10)
+- `endEpoch` (optional): End epoch (default: current epoch)
+- `protocol` (optional): Protocol state identifier
+- `market` (optional): Data market address
+
+**Example**:
+```bash
+# Get epoch-by-epoch tracking for a peer within a window
+PEER_ID="12D3KooWKYSAndoFZEBENnFV9wi5CwPVWeT9ArUYnUZR5CA3Qc5L"
+WINDOW_ID=24182100
+START_EPOCH=$((WINDOW_ID - 9))  # Window start
+END_EPOCH=$WINDOW_ID            # Window end
+
+curl "http://localhost:9091/api/v1/spam/peer/${PEER_ID}/epochs?startEpoch=${START_EPOCH}&endEpoch=${END_EPOCH}" | jq '.'
+```
+
+**Response**:
+```json
+{
+  "peer_id": "12D3KooW...",
+  "epochs": [
+    {
+      "epoch_id": 24182091,
+      "submission_count": 5,
+      "validation_failures": 0,
+      "snapshotter_addresses": ["0x1234...", "0x5678..."]
+    },
+    {
+      "epoch_id": 24182092,
+      "submission_count": 3,
+      "validation_failures": 2,
+      "snapshotter_addresses": ["0x1234..."]
+    }
+  ],
+  "count": 2,
+  "start_epoch": 24182091,
+  "end_epoch": 24182100,
+  "timestamp": "2026-01-07T10:00:00Z"
+}
+```
+
+**What it shows**:
+- Submission count per epoch
+- Validation failures per epoch
+- Snapshotter addresses used per epoch
+
+### Step 4: Check Redis Directly for Aggregated Data
+
+```bash
+PROTOCOL=0x3B5A0FB70ef68B5dd677C7d614dFB89961f97401
+MARKET=0xb5cE2F9B71e785e3eC0C45EDE06Ad95c3bb71a4d
+WINDOW_ID=24182100
+PEER_ID="12D3KooWKYSAndoFZEBENnFV9wi5CwPVWeT9ArUYnUZR5CA3Qc5L"
+
+# Get aggregated report for a peer in a window
+docker exec snapshot-sequencer-validator-redis-1 redis-cli GET "${PROTOCOL}:${MARKET}:spam:reports:peer:${PEER_ID}:window:${WINDOW_ID}" | jq '.'
+
+# Get all peers in a window
+docker exec snapshot-sequencer-validator-redis-1 redis-cli SMEMBERS "${PROTOCOL}:${MARKET}:spam:reports:window:${WINDOW_ID}:peers"
+```
+
+### Step 5: Check Submission Counts Per Epoch
+
+```bash
+PROTOCOL=0x3B5A0FB70ef68B5dd677C7d614dFB89961f97401
+MARKET=0xb5cE2F9B71e785e3eC0C45EDE06Ad95c3bb71a4d
+PEER_ID="12D3KooWKYSAndoFZEBENnFV9wi5CwPVWeT9ArUYnUZR5CA3Qc5L"
+EPOCH_ID=24182098
+
+# Get submission count for a peer in an epoch
+docker exec snapshot-sequencer-validator-redis-1 redis-cli GET "${PROTOCOL}:${MARKET}:spam:submissions:peer:${PEER_ID}:${EPOCH_ID}"
+
+# Get validation failure count
+docker exec snapshot-sequencer-validator-redis-1 redis-cli GET "${PROTOCOL}:${MARKET}:spam:validation_failures:peer:${PEER_ID}:${EPOCH_ID}"
+```
+
+### Step 6: Check Consensus Status
+
+```bash
+# Check if consensus was reached (validator_count >= 2)
+# This is shown in window details endpoint
+curl "http://localhost:9091/api/v1/spam/windows/24182100" | jq '.peers[] | select(.validator_count >= 2)'
+
+# Check if peer is flagged (consensus reached and flagged)
+curl "http://localhost:9091/api/v1/spam/flagged/peers" | jq '.'
+```
+
+**Important**: A peer will only be flagged if:
+1. **Spam reports are generated** (requires 3 consecutive epochs with violations for rate limits)
+2. **Consensus is reached** (>= 2 validators report the same peer in the same window)
+3. **Window boundary passed** (consensus check happens at epochID % 10 == 0)
+
+If only 1 validator has the new code, `validator_count` will be 1, so consensus won't be reached and the peer won't be flagged. Check logs for spam report generation:
+
+```bash
+# Check if spam reports are being generated
+./dsv.sh dequeuer-logs | grep -iE "(broadcasted spam report|shouldReport=true|spam check for peer)"
+
+# Look for:
+# - "Spam check for peer {peerID} epoch {epochID}: shouldReport=true, violationType=rate_limit"
+# - "📢 Broadcasted spam report for peer {peerID}"
+```
+
+### Step 7: Understanding Why a Peer Isn't Flagged
+
+**Scenario**: Peer exceeds rate limit (>2 submissions/epoch) but isn't flagged.
+
+**Check 1: Are spam reports being generated?**
+```bash
+PEER_ID="12D3KooWKYSAndoFZEBENnFV9wi5CwPVWeT9ArUYnUZR5CA3Qc5L"
+./dsv.sh dequeuer-logs | grep -iE "spam check for peer.*${PEER_ID}" | grep "shouldReport=true"
+```
+
+**Check 2: What's the validator count in the window?**
+```bash
+WINDOW_ID=24182120
+curl "http://localhost:9091/api/v1/spam/windows/${WINDOW_ID}" | jq ".peers[] | select(.peer_id == \"${PEER_ID}\") | {peer_id, validator_count, report_count}"
+```
+
+**Possible reasons peer isn't flagged:**
+- **No consensus**: `validator_count < 2` (need >= 2 validators to report)
+- **Reports not generated**: Need 3 consecutive epochs with violations before first report
+- **Window not checked yet**: Consensus check happens at window boundary (epochID % 10 == 0)
+- **Peer is whitelisted**: Check `FULL_NODE_PEER_IDS` and `BULK_SERVICE_PEER_IDS` in env
+
+### Step 8: Check Which Epochs Have Activity
+
+```bash
+# List all epochs with tracking data
+curl "http://localhost:9091/api/v1/spam/epochs?limit=50" | jq '.epochs[] | select(.epoch_id >= 24182091 and .epoch_id <= 24182100)'
 ```
 
 ### Check Epoch Tracking
@@ -152,15 +364,22 @@ curl "http://localhost:9091/api/v1/spam/epochs?limit=20" | jq '.'
 
 ### Check Peer Tracking
 
+**Single Epoch** (`GET /api/v1/spam/peer/{peerID}?epochID={epochID}`):
 ```bash
 # Get tracking for a specific peer in an epoch
 PEER_ID="12D3KooW..."
 EPOCH_ID=24176205
 curl "http://localhost:9091/api/v1/spam/peer/${PEER_ID}?epochID=${EPOCH_ID}" | jq '.'
+```
 
-# Get epoch-by-epoch tracking for a peer
+**Multiple Epochs** (`GET /api/v1/spam/peer/{peerID}/epochs`):
+```bash
+# Get epoch-by-epoch tracking for a peer across multiple epochs
+PEER_ID="12D3KooW..."
 curl "http://localhost:9091/api/v1/spam/peer/${PEER_ID}/epochs?startEpoch=24176200&endEpoch=24176210" | jq '.'
 ```
+
+See **Step 3** above for detailed endpoint documentation.
 
 ### Check Flagged Peers
 
@@ -185,21 +404,40 @@ curl "http://localhost:9091/api/v1/spam/stats" | jq '.'
 
 **Component Initialization (CRITICAL - Check at Startup)**:
 
-**Unified Sequencer (Full System)**:
+**Dequeuer Component (Local Tracking Only)**:
 ```bash
 ./dsv.sh dequeuer-logs | grep -i "initializing spam\|spam protection components initialized"
 ```
 Look for:
 - `"Initializing spam protection components"` with fields:
   - `enable_spam_protection: true`
+  - `enable_spam_report_broadcast: false` (expected - dequeuer doesn't do P2P)
+  - `pubsub_available: false` (expected - dequeuer doesn't initialize P2P)
+- `"✅ Spam protection components initialized (local tracking only - P2P handled by spam-aggregator component)"` with:
+  - `tracker_initialized: true`
+  - `rate_limiter_initialized: true`
+  - `flagging_initialized: true`
+  - `reporter_initialized: false` (expected - no P2P in dequeuer)
+  - `aggregator_initialized: true` (local instance, but no P2P)
+
+**Spam-Aggregator Component (P2P Broadcasting)**:
+```bash
+./dsv.sh spam-aggregator-logs | grep -i "spam aggregator component starting\|initializing spam\|p2p host\|gossipsub\|event monitor"
+```
+Look for:
+- `"🛡️  SPAM AGGREGATOR COMPONENT STARTING"`
+- `"✅ Connected to Redis"`
+- `"P2P Host started with peer ID: {peerID}"`
+- `"✅ Initialized gossipsub for spam report exchange"`
+- `"Initializing spam protection components"` with fields:
+  - `enable_spam_protection: true`
   - `enable_spam_report_broadcast: true`
-  - `pubsub_available: true` (if P2P enabled)
+  - `pubsub_available: true` (MUST be true)
 - `"Initialized spam aggregator with window size: 10 (broadcast enabled, subscription handler started)"` (GOOD)
-- `"Initialized spam aggregator with window size: 10 (local aggregation only, broadcast disabled or pubsub unavailable)"` (OK - aggregator still works)
 - `"✅ Spam protection components initialized"` with:
   - `aggregator_initialized: true` (MUST be true)
-  - `tracker_initialized: true`
-  - `reporter_initialized: true/false`
+  - `reporter_initialized: true` (MUST be true - spam-aggregator handles P2P)
+- `"✅ Event monitor started (will trigger window aggregation at epoch boundaries)"`
 
 **P2P Gateway (Early Rejection)**:
 ```bash
@@ -208,22 +446,21 @@ Look for:
 Look for:
 - `"Initialized spam protection: whitelist ({N} full nodes, {M} bulk service), flagging service"`
 
-**EventMonitor (Window Creation)**:
+**Spam-Aggregator EventMonitor (Window Creation)**:
 ```bash
-./dsv.sh event-logs | grep -i "aggregation window\|epoch.*boundary\|spam.*aggregator.*nil"
+./dsv.sh spam-aggregator-logs | grep -iE "(aggregation window|epoch.*boundary|creating window|window.*aggregated)"
 ```
 Look for:
+- `"📅 Epoch {epochID} released for market {market} at block {block}"`
 - `"Epoch {epochID} is an aggregation window boundary. Triggering local spam data aggregation."`
-- `"Creating spam aggregation window {windowID} for epochs {start}-{end}"`
-- `"Created spam aggregation window {windowID} with {N} peers"`
-- `"Successfully triggered spam aggregation window creation for epoch {epochID}"` (GOOD)
-- `"Spam aggregator is nil at epoch boundary {epochID}"` (BAD - check initialization)
-- `"Spam tracker is nil at epoch boundary {epochID}"` (BAD - check initialization)
+- `"Successfully created spam aggregation window for epoch {epochID}"` (GOOD)
+- `"Aggregated local data for window {windowID}: {peerCount} peers, {reportCount} reports"`
+- `"Failed to create spam aggregation window at epoch boundary {epochID}: {error}"` (BAD - check error)
 - `"Spam components not initialized - skipping window creation"` (BAD - check initialization)
 
 **Dequeuer (DDoS Protection Tracking)**:
 ```bash
-docker logs <dequeuer-container> | grep -i "tracked\|spam\|validation failure\|peer.*empty\|spam.*tracker.*nil"
+./dsv.sh dequeuer-logs | grep -iE "(tracked|spam|validation failure|peer.*empty|spam.*tracker.*nil)"
 ```
 Look for:
 - `"Tracked submission for peer {peerID} epoch {epochID} (count: {N})"` (debug level)
@@ -233,16 +470,26 @@ Look for:
 - `"DDoS protection disabled - skipping tracking"`
 
 
-**Spam Aggregator**:
+**Spam-Aggregator (P2P Broadcasting and Aggregation)**:
 ```bash
-docker logs <dequeuer-container> | grep -i "aggregated.*local\|window.*peer"
+./dsv.sh spam-aggregator-logs | grep -iE "(broadcasting|received|aggregated.*report|generated.*report|📢|📨)"
 ```
 Look for:
-- `"Aggregated local tracking data for peer {peerID} in window {windowID}"`
+- **Broadcasting reports** (INFO level):
+  - `"📢 Broadcasted spam report for peer {peerID} (violation: {type}, count: {N})"` (from reporter)
+  - `"Broadcasted local spam report for peer {peerID} epoch {epochID}"` (DEBUG level, from aggregator)
+- **Receiving reports** (INFO level):
+  - `"📨 Received spam report from validator {validatorID} for peer {peerID} epoch {epochID}"` (when report received from another validator)
+- **Processing reports** (INFO level):
+  - `"Aggregated spam report for peer {peerID} (window {windowID}, validators: {N})"` (after processing received report)
+- **Generating local reports** (DEBUG level):
+  - `"Generated local spam report for peer {peerID} epoch {epochID}"`
+- **Window aggregation**:
+  - `"Aggregated local data for window {windowID}: {peerCount} peers, {reportCount} reports"`
 
 **P2P Gateway (Enforcement)**:
 ```bash
-docker logs <p2p-gateway-container> | grep -i "flagged\|whitelist\|dropping"
+./dsv.sh p2p-logs | grep -iE "(flagged|whitelist|dropping)"
 ```
 Look for:
 - `"🚫 P2P Gateway: Dropping submission from flagged peer {peerID}"`
@@ -343,14 +590,14 @@ These are hardcoded for consensus consistency:
 
 **Debug Steps**:
 
-1. **Check EventMonitor is running**:
+1. **Check spam-aggregator is running** (CRITICAL):
    ```bash
-   docker ps | grep event-monitor
+   ./dsv.sh status | grep spam-aggregator
    ```
 
-2. **Check if epochs are being processed**:
+2. **Check if epochs are being processed by spam-aggregator**:
    ```bash
-   docker logs <event-monitor-container> --tail 50 | grep -i "epoch.*released"
+   ./dsv.sh spam-aggregator-logs | tail -50 | grep -iE "(epoch.*released|epoch.*boundary)"
    ```
 
 3. **Check if current epoch is a boundary**:
@@ -360,21 +607,21 @@ These are hardcoded for consensus consistency:
    echo "Is boundary: $(( $CURRENT_EPOCH % 10 == 0 ))"
    ```
 
-4. **Check if spam components are initialized**:
+4. **Check if spam components are initialized in dequeuer**:
    ```bash
-   docker logs <dequeuer-container> | grep -i "spam.*component\|spam.*initialized"
+   ./dsv.sh dequeuer-logs | grep -iE "(spam.*component|spam.*initialized)"
    ```
 
-5. **Check if tracking is happening**:
+5. **Check if tracking is happening in dequeuer**:
    ```bash
    # Enable debug logging first (LOG_LEVEL=debug in env)
    # Then check for tracking logs
-   docker logs <dequeuer-container> | grep -i "tracked.*submission\|tracked.*validation\|peer.*empty"
+   ./dsv.sh dequeuer-logs | grep -iE "(tracked.*submission|tracked.*validation|peer.*empty)"
    ```
 
 6. **Check Redis for epoch peer sets**:
    ```bash
-   docker exec <redis-container> redis-cli KEYS "*spam:epoch:*:peers" | head -10
+   docker exec snapshot-sequencer-validator-redis-1 redis-cli KEYS "*spam:epoch:*:peers" | head -10
    ```
 
 ### No Tracking Data
@@ -383,26 +630,32 @@ These are hardcoded for consensus consistency:
 
 **Debug Steps**:
 
-1. **Verify spam protection is enabled**:
+1. **Check dequeuer is running and processing submissions**:
    ```bash
-   docker logs <dequeuer-container> | grep -i "spam.*protection.*enabled\|ENABLE_SPAM_PROTECTION"
+   ./dsv.sh status | grep dequeuer
+   ./dsv.sh dequeuer-logs | tail -20 | grep -iE "(processing|tracked)"
    ```
 
-2. **Check if submissions are being processed**:
+2. **Verify spam protection is enabled**:
    ```bash
-   docker logs <dequeuer-container> | grep -i "processed.*submission\|worker.*processing"
+   ./dsv.sh dequeuer-logs | grep -iE "(spam.*protection.*enabled|ENABLE_SPAM_PROTECTION)"
    ```
 
-3. **Check if peers are whitelisted** (whitelisted peers aren't tracked):
+3. **Check if submissions are being processed**:
    ```bash
-   # Check your env vars in docker-compose
-   docker exec <dequeuer-container> env | grep FULL_NODE_PEER_IDS
-   docker exec <dequeuer-container> env | grep BULK_SERVICE_PEER_IDS
+   ./dsv.sh dequeuer-logs | grep -iE "(processed.*submission|worker.*processing)"
    ```
 
-4. **Check if peerID is being passed**:
+4. **Check if peers are whitelisted** (whitelisted peers aren't tracked):
    ```bash
-   docker logs <dequeuer-container> | grep -i "peer.*empty\|peer_id"
+   # Check your env vars
+   docker exec snapshot-sequencer-validator-dequeuer-1 env | grep FULL_NODE_PEER_IDS
+   docker exec snapshot-sequencer-validator-dequeuer-1 env | grep BULK_SERVICE_PEER_IDS
+   ```
+
+5. **Check if peerID is being passed**:
+   ```bash
+   ./dsv.sh dequeuer-logs | grep -iE "(peer.*empty|peer_id)"
    ```
 
 ### No Spam Reports Being Sent
@@ -411,18 +664,23 @@ These are hardcoded for consensus consistency:
 
 1. **Check thresholds are being exceeded**:
    ```bash
-   docker exec <redis-container> redis-cli KEYS "*spam:validation_failures:peer:*"
-   docker exec <redis-container> redis-cli KEYS "*spam:submissions:peer:*"
+   docker exec snapshot-sequencer-validator-redis-1 redis-cli KEYS "*spam:validation_failures:peer:*"
+   docker exec snapshot-sequencer-validator-redis-1 redis-cli KEYS "*spam:submissions:peer:*"
    ```
 
 2. **Check if report broadcast is enabled**:
    ```bash
-   docker exec <dequeuer-container> env | grep ENABLE_SPAM_REPORT_BROADCAST
+   docker exec snapshot-sequencer-validator-spam-aggregator-1 env | grep ENABLE_SPAM_REPORT_BROADCAST
    ```
 
-3. **Check reporter logs**:
+3. **Check spam-aggregator logs for report generation and broadcasting**:
    ```bash
-   docker logs <dequeuer-container> | grep -i "broadcasted.*spam\|spam.*report"
+   ./dsv.sh spam-aggregator-logs | grep -iE "(broadcasting.*report|generated.*report|spam.*report)"
+   ```
+
+4. **Check dequeuer logs for tracking** (dequeuer doesn't broadcast, only tracks):
+   ```bash
+   ./dsv.sh dequeuer-logs | grep -i "tracked.*submission\|tracked.*validation"
    ```
 
 ## Window to Epoch Mapping
@@ -446,6 +704,4 @@ echo "Epoch $EPOCH belongs to window $WINDOW_ID"
 ## Related Documentation
 
 - [Redis Keys Reference](./REDIS_KEYS.md) - Redis key structure documentation
-- [DDoS Protection Plan](../ai-coord-docs/phase3/DDoS_PROTECTION_PLAN.md) - Complete implementation plan and architecture
-- [Spam Report Flow](../ai-coord-docs/phase3/SPAM_REPORT_FLOW.md) - Detailed flow of spam reports and aggregation windows
 

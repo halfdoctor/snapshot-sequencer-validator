@@ -208,7 +208,7 @@ func (t *SpamTracker) ShouldReportSpam(ctx context.Context, peerID string, epoch
 	}
 	if submissionCount > MAX_SUBMISSIONS_PER_EPOCH_LITE {
 		// Current epoch has violation - check if previous N-1 epochs also had violations
-		consecutiveViolations, err := t.checkConsecutiveRateLimitViolations(ctx, peerID, epochID)
+		consecutiveViolations, err := t.CheckConsecutiveRateLimitViolations(ctx, peerID, epochID)
 		if err != nil {
 			return false, "", err
 		}
@@ -220,10 +220,10 @@ func (t *SpamTracker) ShouldReportSpam(ctx context.Context, peerID string, epoch
 	return false, "", nil
 }
 
-// checkConsecutiveRateLimitViolations checks how many consecutive epochs (including current) have rate limit violations
+// CheckConsecutiveRateLimitViolations checks how many consecutive epochs (including current) have rate limit violations
 // Returns the count of consecutive epochs with violations, starting from current epoch and going backwards
 // Stops checking when an epoch without violation is found or when we've checked CONSISTENT_VIOLATIONS_THRESHOLD epochs
-func (t *SpamTracker) checkConsecutiveRateLimitViolations(ctx context.Context, peerID string, currentEpochID uint64) (int, error) {
+func (t *SpamTracker) CheckConsecutiveRateLimitViolations(ctx context.Context, peerID string, currentEpochID uint64) (int, error) {
 	consecutiveCount := 0
 
 	// Check epochs backwards from current epoch
