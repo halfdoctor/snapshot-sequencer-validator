@@ -181,18 +181,26 @@ func (d *Dequeuer) ProcessSubmission(submission *SnapshotSubmission, submissionI
 	// Spam protection: Track submission count (if enabled)
 	// NOTE: We track FIRST, then check if spam should be reported
 	// Rate limiting is NOT enforced here - only flagged peers (after consensus) are rejected
-	if d.enableSpamProtection && d.spamTracker != nil && peerID != "" {
-		_, err := d.spamTracker.TrackSubmissionCount(ctx, peerID, snapshotterAddr.Hex(), submission.Request.EpochId)
-		if err != nil {
-			log.Warnf("Failed to track submission count: %v", err)
+	if d.enableSpamProtection {
+		if d.spamTracker == nil {
+			log.Debugf("Spam tracker is nil (spam protection enabled but tracker not initialized)")
+		} else if peerID == "" {
+			log.Debugf("Peer ID is empty - skipping spam tracking for epoch %d", submission.Request.EpochId)
 		} else {
-			// Check if spam should be reported (checks consecutive violations threshold)
-			if d.spamReporter != nil {
-				if err := d.spamReporter.CheckAndReport(ctx, peerID, snapshotterAddr.Hex(), submission.Request.EpochId); err != nil {
-					log.Warnf("Failed to check/report spam: %v", err)
+			_, err := d.spamTracker.TrackSubmissionCount(ctx, peerID, snapshotterAddr.Hex(), submission.Request.EpochId)
+			if err != nil {
+				log.Warnf("Failed to track submission count: %v", err)
+			} else {
+				// Check if spam should be reported (checks consecutive violations threshold)
+				if d.spamReporter != nil {
+					if err := d.spamReporter.CheckAndReport(ctx, peerID, snapshotterAddr.Hex(), submission.Request.EpochId); err != nil {
+						log.Warnf("Failed to check/report spam: %v", err)
+					}
 				}
 			}
 		}
+	} else {
+		log.Debugf("Spam protection disabled - skipping tracking for epoch %d", submission.Request.EpochId)
 	}
 
 	// Store in local state

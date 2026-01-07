@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math/big"
+	"reflect"
 	"strings"
 	"sync"
 	"time"
@@ -876,30 +877,56 @@ func (m *EventMonitor) handleEpochReleased(event *EpochReleasedEvent) {
 	// Windows are created at epochs 10, 20, 30, etc. (epochID % 10 == 0)
 	epochIDInt := event.EpochID.Uint64()
 	if epochIDInt > 0 && epochIDInt%10 == 0 {
+		log.Infof("Epoch %d is an aggregation window boundary. Triggering local spam data aggregation.", epochIDInt)
 		// This is a window boundary - create window and aggregate local tracking data
 		// Note: spamComponents may be nil if spam protection is disabled
-		// Use type assertion to access spam components (avoiding circular import)
 		if m.spamComponents != nil {
-			type SpamComponentsInterface interface {
-				GetAggregator() interface{}
-				GetTracker() interface{}
-			}
-			if sc, ok := m.spamComponents.(SpamComponentsInterface); ok {
-				aggregator := sc.GetAggregator()
-				tracker := sc.GetTracker()
-				if aggregator != nil && tracker != nil {
-					// Type assert to actual types (we know they're *SpamAggregator and *SpamTracker)
-					// This is safe because we control the SpamComponents struct
-					type AggregatorInterface interface {
-						CreateWindowAndAggregateLocalData(ctx context.Context, epochID uint64, tracker interface{}) error
-					}
-					if agg, ok := aggregator.(AggregatorInterface); ok {
-						if err := agg.CreateWindowAndAggregateLocalData(m.ctx, epochIDInt, tracker); err != nil {
-							log.Errorf("Failed to create spam aggregation window at epoch boundary %d: %v", epochIDInt, err)
+
+			scValue := reflect.ValueOf(m.spamComponents)
+			if scValue.Kind() == reflect.Ptr && !scValue.IsNil() {
+				// Get Aggregator field
+				aggregatorField := scValue.Elem().FieldByName("Aggregator")
+				trackerField := scValue.Elem().FieldByName("Tracker")
+
+				if aggregatorField.IsValid() && trackerField.IsValid() {
+					if !aggregatorField.IsNil() && !trackerField.IsNil() {
+						// Call CreateWindowAndAggregateLocalData using reflection
+						createWindowMethod := aggregatorField.MethodByName("CreateWindowAndAggregateLocalData")
+						if createWindowMethod.IsValid() {
+							ctxVal := reflect.ValueOf(m.ctx)
+							epochVal := reflect.ValueOf(epochIDInt)
+							trackerVal := trackerField
+
+							log.Debugf("Calling CreateWindowAndAggregateLocalData for epoch %d", epochIDInt)
+							results := createWindowMethod.Call([]reflect.Value{ctxVal, epochVal, trackerVal})
+							if len(results) > 0 && !results[0].IsNil() {
+								if err, ok := results[0].Interface().(error); ok && err != nil {
+									log.Errorf("Failed to create spam aggregation window at epoch boundary %d: %v", epochIDInt, err)
+								} else {
+									log.Infof("Successfully created spam aggregation window for epoch %d", epochIDInt)
+								}
+							} else {
+								log.Infof("Successfully created spam aggregation window for epoch %d (no error returned)", epochIDInt)
+							}
+						} else {
+							log.Warnf("CreateWindowAndAggregateLocalData method not found on aggregator (type: %s)", aggregatorField.Type())
+						}
+					} else {
+						if aggregatorField.IsNil() {
+							log.Warnf("Spam aggregator is nil at epoch boundary %d", epochIDInt)
+						}
+						if trackerField.IsNil() {
+							log.Warnf("Spam tracker is nil at epoch boundary %d", epochIDInt)
 						}
 					}
+				} else {
+					log.Warnf("Spam components fields not found (aggregator valid: %v, tracker valid: %v)", aggregatorField.IsValid(), trackerField.IsValid())
 				}
+			} else {
+				log.Warnf("Spam components value is not a valid pointer (kind: %s, isNil: %v)", scValue.Kind(), scValue.IsNil())
 			}
+		} else {
+			log.Warnf("Spam components not initialized - skipping window creation at epoch boundary %d", epochIDInt)
 		}
 	}
 

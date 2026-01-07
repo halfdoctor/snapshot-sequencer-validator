@@ -52,7 +52,8 @@ func (t *SpamTracker) TrackValidationFailure(ctx context.Context, peerID, snapsh
 
 	// Track by peer ID (primary)
 	peerKey := t.getValidationFailureKey(peerID, epochID)
-	if err := t.redisClient.Incr(ctx, peerKey).Err(); err != nil {
+	failureCount, err := t.redisClient.Incr(ctx, peerKey).Result()
+	if err != nil {
 		return fmt.Errorf("failed to increment peer validation failure count: %w", err)
 	}
 	if err := t.redisClient.Expire(ctx, peerKey, SPAM_TRACKING_TTL).Err(); err != nil {
@@ -68,6 +69,7 @@ func (t *SpamTracker) TrackValidationFailure(ctx context.Context, peerID, snapsh
 		if err := t.redisClient.Expire(ctx, epochPeersKey, SPAM_TRACKING_TTL).Err(); err != nil {
 			log.Warnf("Failed to set TTL on epoch peers set: %v", err)
 		}
+		log.Debugf("Tracked validation failure for peer %s epoch %d (count: %d)", peerID, epochID, failureCount)
 	}
 
 	// Track by snapshotter address (secondary, if available)
@@ -120,6 +122,7 @@ func (t *SpamTracker) TrackSubmissionCount(ctx context.Context, peerID, snapshot
 		if err := t.redisClient.Expire(ctx, epochPeersKey, SPAM_TRACKING_TTL).Err(); err != nil {
 			log.Warnf("Failed to set TTL on epoch peers set: %v", err)
 		}
+		log.Debugf("Tracked submission for peer %s epoch %d (count: %d)", peerID, epochID, count)
 	}
 
 	// Track by snapshotter address (secondary, for evidence)

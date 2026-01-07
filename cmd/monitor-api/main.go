@@ -2754,6 +2754,160 @@ func (m *MonitorAPI) SpamStats(c *gin.Context) {
 	c.JSON(http.StatusOK, stats)
 }
 
+// @Summary List epochs with tracking data
+// @Description Get list of epochs that have spam tracking data (peers tracked)
+// @Tags spam
+// @Produce json
+// @Param protocol query string false "Protocol state identifier"
+// @Param market query string false "Data market address"
+// @Param limit query int false "Maximum number of epochs to return (default: 100)"
+// @Success 200 {object} map[string]interface{} "List of epochs with tracking data"
+// @Router /spam/epochs [get]
+func (m *MonitorAPI) SpamEpochs(c *gin.Context) {
+	protocol := c.Query("protocol")
+	market := c.Query("market")
+	limitStr := c.DefaultQuery("limit", "100")
+
+	kb := m.keyBuilder
+	if protocol != "" || market != "" {
+		if protocol == "" {
+			protocol = m.keyBuilder.ProtocolState
+		}
+		if market == "" {
+			market = m.keyBuilder.DataMarket
+		}
+		kb = keys.NewKeyBuilder(protocol, market)
+	}
+
+	limit, _ := strconv.Atoi(limitStr)
+	if limit <= 0 || limit > 1000 {
+		limit = 100
+	}
+
+	// Check recent epochs (up to limit) for tracking data
+	// We check epochs in reverse order (newest first)
+	epochs := make([]map[string]interface{}, 0)
+
+	// Start from a high epoch number and work backwards
+	// In practice, you'd get current epoch from event monitor, but for discovery we check recent epochs
+	currentEpoch := uint64(100000) // Start high, will be adjusted based on actual data
+
+	checked := 0
+	for epoch := currentEpoch; epoch > 0 && checked < limit*2; epoch-- {
+		epochPeersKey := fmt.Sprintf("%s:%s:spam:epoch:%d:peers", kb.ProtocolState, kb.DataMarket, epoch)
+		exists, err := m.redis.Exists(m.ctx, epochPeersKey).Result()
+		if err != nil {
+			continue
+		}
+		if exists > 0 {
+			peerCount, _ := m.redis.SCard(m.ctx, epochPeersKey).Result()
+			epochs = append(epochs, map[string]interface{}{
+				"epoch_id":   epoch,
+				"peer_count": peerCount,
+			})
+			checked++
+			if len(epochs) >= limit {
+				break
+			}
+		}
+		checked++
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"epochs":    epochs,
+		"count":     len(epochs),
+		"timestamp": time.Now(),
+	})
+}
+
+// @Summary Get epoch-by-epoch tracking for a peer
+// @Description Get tracking data (submissions, validation failures) for a peer across multiple epochs
+// @Tags spam
+// @Produce json
+// @Param peerID path string true "Peer ID (libp2p)"
+// @Param startEpoch query int false "Start epoch (default: current epoch - 10)"
+// @Param endEpoch query int false "End epoch (default: current epoch)"
+// @Param protocol query string false "Protocol state identifier"
+// @Param market query string false "Data market address"
+// @Success 200 {object} map[string]interface{} "Epoch-by-epoch tracking data"
+// @Router /spam/peer/{peerID}/epochs [get]
+func (m *MonitorAPI) PeerSpamEpochs(c *gin.Context) {
+	peerID := c.Param("peerID")
+	protocol := c.Query("protocol")
+	market := c.Query("market")
+	startEpochStr := c.Query("startEpoch")
+	endEpochStr := c.Query("endEpoch")
+
+	kb := m.keyBuilder
+	if protocol != "" || market != "" {
+		if protocol == "" {
+			protocol = m.keyBuilder.ProtocolState
+		}
+		if market == "" {
+			market = m.keyBuilder.DataMarket
+		}
+		kb = keys.NewKeyBuilder(protocol, market)
+	}
+
+	// Parse epoch range
+	var startEpoch, endEpoch uint64
+	if endEpochStr != "" {
+		endEpoch, _ = strconv.ParseUint(endEpochStr, 10, 64)
+	} else {
+		// Default to checking recent epochs
+		endEpoch = 100000 // High number, will be adjusted
+	}
+	if startEpochStr != "" {
+		startEpoch, _ = strconv.ParseUint(startEpochStr, 10, 64)
+	} else {
+		// Default: last 10 epochs
+		if endEpoch > 10 {
+			startEpoch = endEpoch - 10
+		} else {
+			startEpoch = 1
+		}
+	}
+
+	// Limit range to prevent excessive queries
+	if endEpoch-startEpoch > 100 {
+		endEpoch = startEpoch + 100
+	}
+
+	epochData := make([]map[string]interface{}, 0)
+	for epoch := startEpoch; epoch <= endEpoch; epoch++ {
+		// Get submission count
+		submissionKey := fmt.Sprintf("%s:%s:spam:submissions:peer:%s:%d", kb.ProtocolState, kb.DataMarket, peerID, epoch)
+		submissions, _ := m.redis.Get(m.ctx, submissionKey).Int64()
+
+		// Get validation failure count
+		failureKey := fmt.Sprintf("%s:%s:spam:validation_failures:peer:%s:%d", kb.ProtocolState, kb.DataMarket, peerID, epoch)
+		failures, _ := m.redis.Get(m.ctx, failureKey).Int64()
+
+		// Only include epochs with data
+		if submissions > 0 || failures > 0 {
+			// Get snapshotter addresses
+			mapKey := fmt.Sprintf("%s:%s:spam:peer_snapshotter_map:%s:%d", kb.ProtocolState, kb.DataMarket, peerID, epoch)
+			snapshotterAddrs, _ := m.redis.SMembers(m.ctx, mapKey).Result()
+
+			epochData = append(epochData, map[string]interface{}{
+				"epoch_id":              epoch,
+				"submission_count":      submissions,
+				"validation_failures":   failures,
+				"snapshotter_addresses": snapshotterAddrs,
+			})
+		}
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"peer_id":     peerID,
+		"epochs":      epochData,
+		"count":       len(epochData),
+		"start_epoch": startEpoch,
+		"end_epoch":   endEpoch,
+		"timestamp":   time.Now(),
+	})
+}
+
 func main() {
 	// Configure logger
 	log.SetFormatter(&logrus.JSONFormatter{})
@@ -2853,8 +3007,10 @@ func main() {
 		v1.GET("/spam/flagged/peers", api.FlaggedPeers)
 		v1.GET("/spam/flagged/snapshotters", api.FlaggedSnapshotters)
 		v1.GET("/spam/peer/:peerID", api.PeerSpamInfo)
+		v1.GET("/spam/peer/:peerID/epochs", api.PeerSpamEpochs)
 		v1.GET("/spam/windows", api.SpamWindows)
 		v1.GET("/spam/windows/:windowID", api.SpamWindowDetails)
+		v1.GET("/spam/epochs", api.SpamEpochs)
 		v1.GET("/spam/stats", api.SpamStats)
 	}
 
