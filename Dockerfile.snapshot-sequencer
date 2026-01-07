@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1.4
 # Multi-stage Dockerfile for unified sequencer
 
 # Build stage
@@ -10,13 +11,18 @@ WORKDIR /app
 
 # Copy go mod files
 COPY go.mod go.sum ./
-RUN go mod download
+
+# Download dependencies with cache mount for faster rebuilds
+RUN --mount=type=cache,target=/go/pkg/mod \
+    go mod download
 
 # Copy source code
 COPY . .
 
-# Build unified binary (all components enabled/disabled via env vars)
-RUN go build -o bin/unified cmd/unified/main.go
+# Build unified binary with cache mounts for Go build cache
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    go build -o bin/unified cmd/unified/main.go
 
 # Runtime stage
 FROM alpine:latest

@@ -277,11 +277,16 @@ start_services() {
     # Start services with specified profiles
     print_color "$CYAN" "Starting services..."
     
+    # Enable BuildKit for faster, parallel builds with better caching
+    export DOCKER_BUILDKIT=1
+    export COMPOSE_DOCKER_CLI_BUILD=1
+    
     # Build flag - only add if force_rebuild is true
     local build_flag=""
     if [ "$force_rebuild" = true ]; then
         build_flag="--build"
         print_color "$YELLOW" "⚠️  Force rebuild enabled - images will be rebuilt"
+        print_color "$CYAN" "💡 BuildKit enabled for parallel builds and improved caching"
     fi
     
     if [ ${#profile_args[@]} -gt 0 ]; then
