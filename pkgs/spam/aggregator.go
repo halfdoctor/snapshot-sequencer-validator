@@ -62,8 +62,13 @@ func NewSpamAggregator(ctx context.Context, redisClient *redis.Client, keyBuilde
 }
 
 // Start begins listening for spam reports and aggregating them
+// If subscription is nil (broadcast disabled), only starts periodic consensus check (pruning)
 func (a *SpamAggregator) Start() {
-	go a.handleSpamReports()
+	// Only start subscription handler if broadcast is enabled (sub is not nil)
+	if a.sub != nil {
+		go a.handleSpamReports()
+	}
+	// Always start periodic consensus check (handles pruning even without broadcast)
 	go a.periodicConsensusCheck()
 }
 

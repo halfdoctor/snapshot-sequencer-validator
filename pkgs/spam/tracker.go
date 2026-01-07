@@ -45,6 +45,11 @@ func NewSpamTracker(redisClient *redis.Client, keyBuilder *redislib.KeyBuilder, 
 
 // TrackValidationFailure tracks a validation failure for a peer and snapshotter address
 func (t *SpamTracker) TrackValidationFailure(ctx context.Context, peerID, snapshotterAddr string, epochID uint64, err error) error {
+	// Skip epoch 0 - it's dummy/heartbeat only, never processed
+	if epochID == 0 {
+		return nil
+	}
+
 	// Skip tracking if peer is whitelisted
 	if t.whitelist != nil && t.whitelist.IsWhitelisted(peerID) {
 		return nil
@@ -98,6 +103,11 @@ func (t *SpamTracker) TrackValidationFailure(ctx context.Context, peerID, snapsh
 // TrackSubmissionCount tracks submission count for a peer and snapshotter address
 // Returns the current count after incrementing
 func (t *SpamTracker) TrackSubmissionCount(ctx context.Context, peerID, snapshotterAddr string, epochID uint64) (int, error) {
+	// Skip epoch 0 - it's dummy/heartbeat only, never processed
+	if epochID == 0 {
+		return 0, nil
+	}
+
 	// Skip tracking if peer is whitelisted
 	if t.whitelist != nil && t.whitelist.IsWhitelisted(peerID) {
 		return 0, nil
