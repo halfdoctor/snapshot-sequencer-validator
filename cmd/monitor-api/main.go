@@ -2784,33 +2784,119 @@ func (m *MonitorAPI) SpamEpochs(c *gin.Context) {
 		limit = 100
 	}
 
-	// Check recent epochs (up to limit) for tracking data
-	// We check epochs in reverse order (newest first)
+	// Query epochs from windows instead of epoch peer sets
+	// Epoch peer sets are ephemeral and deleted after window aggregation
+	// Windows contain the aggregated data and persist longer
 	epochs := make([]map[string]interface{}, 0)
+	epochSet := make(map[uint64]bool) // Track unique epochs
+	windowSize := 10                  // Hardcoded window size
 
-	// Start from a high epoch number and work backwards
-	// In practice, you'd get current epoch from event monitor, but for discovery we check recent epochs
-	currentEpoch := uint64(100000) // Start high, will be adjusted based on actual data
-
-	checked := 0
-	for epoch := currentEpoch; epoch > 0 && checked < limit*2; epoch-- {
-		epochPeersKey := fmt.Sprintf("%s:%s:spam:epoch:%d:peers", kb.ProtocolState, kb.DataMarket, epoch)
-		exists, err := m.redis.Exists(m.ctx, epochPeersKey).Result()
-		if err != nil {
-			continue
-		}
-		if exists > 0 {
-			peerCount, _ := m.redis.SCard(m.ctx, epochPeersKey).Result()
-			epochs = append(epochs, map[string]interface{}{
-				"epoch_id":   epoch,
-				"peer_count": peerCount,
-			})
-			checked++
-			if len(epochs) >= limit {
-				break
+	// Get all windows and extract epochs from aggregated reports
+	windowsSetKey := fmt.Sprintf("%s:%s:spam:reports:windows", kb.ProtocolState, kb.DataMarket)
+	windowIDs, err := m.redis.SMembers(m.ctx, windowsSetKey).Result()
+	if err == nil {
+		// Track peer count per epoch across all windows
+		epochPeerCounts := make(map[uint64]int64)
+		
+		for _, windowIDStr := range windowIDs {
+			windowID, err := strconv.Atoi(windowIDStr)
+			if err != nil {
+				continue
+			}
+			// Extract epochs from window (window contains epochs windowID-9 to windowID)
+			windowStartEpoch := uint64(windowID - windowSize + 1)
+			windowEndEpoch := uint64(windowID)
+			
+			// Get window peers set
+			windowPeersKey := fmt.Sprintf("%s:%s:spam:reports:window:%d:peers", kb.ProtocolState, kb.DataMarket, windowID)
+			peerIDs, _ := m.redis.SMembers(m.ctx, windowPeersKey).Result()
+			
+			// For each peer, extract epochs from their aggregated reports
+			for _, peerID := range peerIDs {
+				windowKey := fmt.Sprintf("%s:%s:spam:reports:peer:%s:window:%d", kb.ProtocolState, kb.DataMarket, peerID, windowID)
+				reportData, err := m.redis.Get(m.ctx, windowKey).Result()
+				if err == nil {
+					var aggregated map[string]interface{}
+					if json.Unmarshal([]byte(reportData), &aggregated) == nil {
+						if reports, ok := aggregated["reports"].([]interface{}); ok {
+							// Track which epochs this peer has reports for
+							peerEpochs := make(map[uint64]bool)
+							for _, report := range reports {
+								if reportMap, ok := report.(map[string]interface{}); ok {
+									if epochID, ok := reportMap["epoch_id"].(float64); ok {
+										epoch := uint64(epochID)
+										// Only count epochs within this window range
+										if epoch >= windowStartEpoch && epoch <= windowEndEpoch {
+											if !peerEpochs[epoch] {
+												peerEpochs[epoch] = true
+												epochPeerCounts[epoch]++
+												epochSet[epoch] = true
+											}
+										}
+									}
+								}
+							}
+						}
+					}
+				}
 			}
 		}
-		checked++
+		
+		// Convert epoch peer counts to epochs list
+		for epoch, peerCount := range epochPeerCounts {
+			if peerCount > 0 {
+				epochs = append(epochs, map[string]interface{}{
+					"epoch_id":   epoch,
+					"peer_count": peerCount,
+				})
+			}
+		}
+	}
+
+	// Also check for active epoch peer sets (for epochs not yet aggregated into windows)
+	// These exist for epochs that haven't reached window boundary yet
+	// Start from the latest window end epoch + window size to check recent epochs
+	currentEpoch := uint64(0)
+	if len(windowIDs) > 0 {
+		// Find the maximum window ID
+		for _, windowIDStr := range windowIDs {
+			if windowID, err := strconv.Atoi(windowIDStr); err == nil {
+				if uint64(windowID) > currentEpoch {
+					currentEpoch = uint64(windowID)
+				}
+			}
+		}
+		// Add window size to check epochs beyond the latest window
+		currentEpoch += uint64(windowSize)
+	} else {
+		// Fallback: start from a high epoch if no windows found
+		currentEpoch = uint64(100000)
+	}
+	for epoch := currentEpoch; epoch > currentEpoch-100 && len(epochs) < limit; epoch-- {
+		if epochSet[epoch] {
+			continue // Already added from windows
+		}
+		epochPeersKey := fmt.Sprintf("%s:%s:spam:epoch:%d:peers", kb.ProtocolState, kb.DataMarket, epoch)
+		exists, err := m.redis.Exists(m.ctx, epochPeersKey).Result()
+		if err == nil && exists > 0 {
+			peerCount, _ := m.redis.SCard(m.ctx, epochPeersKey).Result()
+			if peerCount > 0 {
+				epochs = append(epochs, map[string]interface{}{
+					"epoch_id":   epoch,
+					"peer_count": peerCount,
+				})
+			}
+		}
+	}
+
+	// Sort by epoch ID descending (newest first)
+	sort.Slice(epochs, func(i, j int) bool {
+		return epochs[i]["epoch_id"].(uint64) > epochs[j]["epoch_id"].(uint64)
+	})
+
+	// Limit results
+	if len(epochs) > limit {
+		epochs = epochs[:limit]
 	}
 
 	c.JSON(http.StatusOK, gin.H{
