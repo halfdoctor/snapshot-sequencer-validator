@@ -2553,12 +2553,12 @@ func (m *MonitorAPI) PeerSpamInfo(c *gin.Context) {
 }
 
 // @Summary List all aggregation windows with reports
-// @Description Get list of all windows that have spam reports (for discovery/indexing)
+// @Description Get list of all windows that have spam reports (for discovery/indexing). Windows are created at epoch boundaries (epochID % 10 == 0) and contain aggregated reports for a 10-epoch range. Windows persist for 2 hours (TTL).
 // @Tags spam
 // @Produce json
 // @Param protocol query string false "Protocol state identifier"
 // @Param market query string false "Data market address"
-// @Success 200 {object} map[string]interface{} "List of window IDs with basic info"
+// @Success 200 {object} map[string]interface{} "List of windows with window_id, epoch_range (e.g., '24189511-24189520'), first_epoch, last_epoch, and peer_count"
 // @Router /spam/windows [get]
 func (m *MonitorAPI) SpamWindows(c *gin.Context) {
 	protocol := c.Query("protocol")
@@ -2623,13 +2623,13 @@ func (m *MonitorAPI) SpamWindows(c *gin.Context) {
 }
 
 // @Summary Get details for a specific aggregation window
-// @Description Get all peers and their aggregated reports for a specific window
+// @Description Get all peers and their aggregated reports for a specific window. Window ID is the end epoch of the 10-epoch range (e.g., window 24189520 contains epochs 24189511-24189520). Includes validator counts (consensus requires >= 2 validators), all spam reports with epoch_id, violation_type, count, and evidence.
 // @Tags spam
 // @Produce json
-// @Param windowID path int true "Window ID (end epoch of 10-epoch range)"
+// @Param windowID path int true "Window ID (end epoch of 10-epoch range, e.g., 24189520 for epochs 24189511-24189520)"
 // @Param protocol query string false "Protocol state identifier"
 // @Param market query string false "Data market address"
-// @Success 200 {object} map[string]interface{} "Window details with all peers and reports"
+// @Success 200 {object} map[string]interface{} "Window details including window_id, epoch_range, peers array with peer_id, validator_count, report_count, first_epoch, last_epoch, and reports array"
 // @Router /spam/windows/{windowID} [get]
 func (m *MonitorAPI) SpamWindowDetails(c *gin.Context) {
 	windowIDStr := c.Param("windowID")
@@ -2755,13 +2755,13 @@ func (m *MonitorAPI) SpamStats(c *gin.Context) {
 }
 
 // @Summary List epochs with tracking data
-// @Description Get list of epochs that have spam tracking data (peers tracked)
+// @Description Get list of epochs that have spam tracking data. Queries epochs from aggregation windows (persistent) and active epoch peer sets (ephemeral, for recent epochs not yet aggregated). Epoch peer sets are deleted after window aggregation, so this endpoint primarily returns epochs from windows.
 // @Tags spam
 // @Produce json
 // @Param protocol query string false "Protocol state identifier"
 // @Param market query string false "Data market address"
-// @Param limit query int false "Maximum number of epochs to return (default: 100)"
-// @Success 200 {object} map[string]interface{} "List of epochs with tracking data"
+// @Param limit query int false "Maximum number of epochs to return (default: 100, max: 1000)"
+// @Success 200 {object} map[string]interface{} "List of epochs with tracking data, each containing epoch_id and peer_count"
 // @Router /spam/epochs [get]
 func (m *MonitorAPI) SpamEpochs(c *gin.Context) {
 	protocol := c.Query("protocol")
@@ -2797,7 +2797,7 @@ func (m *MonitorAPI) SpamEpochs(c *gin.Context) {
 	if err == nil {
 		// Track peer count per epoch across all windows
 		epochPeerCounts := make(map[uint64]int64)
-		
+
 		for _, windowIDStr := range windowIDs {
 			windowID, err := strconv.Atoi(windowIDStr)
 			if err != nil {
@@ -2806,11 +2806,11 @@ func (m *MonitorAPI) SpamEpochs(c *gin.Context) {
 			// Extract epochs from window (window contains epochs windowID-9 to windowID)
 			windowStartEpoch := uint64(windowID - windowSize + 1)
 			windowEndEpoch := uint64(windowID)
-			
+
 			// Get window peers set
 			windowPeersKey := fmt.Sprintf("%s:%s:spam:reports:window:%d:peers", kb.ProtocolState, kb.DataMarket, windowID)
 			peerIDs, _ := m.redis.SMembers(m.ctx, windowPeersKey).Result()
-			
+
 			// For each peer, extract epochs from their aggregated reports
 			for _, peerID := range peerIDs {
 				windowKey := fmt.Sprintf("%s:%s:spam:reports:peer:%s:window:%d", kb.ProtocolState, kb.DataMarket, peerID, windowID)
@@ -2841,7 +2841,7 @@ func (m *MonitorAPI) SpamEpochs(c *gin.Context) {
 				}
 			}
 		}
-		
+
 		// Convert epoch peer counts to epochs list
 		for epoch, peerCount := range epochPeerCounts {
 			if peerCount > 0 {

@@ -434,6 +434,331 @@ const docTemplate = `{
                 }
             }
         },
+        "/spam/epochs": {
+            "get": {
+                "description": "Get list of epochs that have spam tracking data. Queries epochs from aggregation windows (persistent) and active epoch peer sets (ephemeral, for recent epochs not yet aggregated). Epoch peer sets are deleted after window aggregation, so this endpoint primarily returns epochs from windows.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "spam"
+                ],
+                "summary": "List epochs with tracking data",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Protocol state identifier",
+                        "name": "protocol",
+                        "in": "query"
+                    },
+                    {
+                        "type": "string",
+                        "description": "Data market address",
+                        "name": "market",
+                        "in": "query"
+                    },
+                    {
+                        "type": "integer",
+                        "description": "Maximum number of epochs to return (default: 100, max: 1000)",
+                        "name": "limit",
+                        "in": "query"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "List of epochs with tracking data, each containing epoch_id and peer_count",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": true
+                        }
+                    }
+                }
+            }
+        },
+        "/spam/flagged/peers": {
+            "get": {
+                "description": "Get list of all flagged peer IDs (from Redis cache, synced from on-chain)",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "spam"
+                ],
+                "summary": "Get flagged peers",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Protocol state identifier",
+                        "name": "protocol",
+                        "in": "query"
+                    },
+                    {
+                        "type": "string",
+                        "description": "Data market address",
+                        "name": "market",
+                        "in": "query"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "List of flagged peers with metadata",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": true
+                        }
+                    }
+                }
+            }
+        },
+        "/spam/flagged/snapshotters": {
+            "get": {
+                "description": "Get list of all flagged snapshotter addresses (from Redis cache, synced from on-chain)",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "spam"
+                ],
+                "summary": "Get flagged snapshotters",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Protocol state identifier",
+                        "name": "protocol",
+                        "in": "query"
+                    },
+                    {
+                        "type": "string",
+                        "description": "Data market address",
+                        "name": "market",
+                        "in": "query"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "List of flagged snapshotters with metadata",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": true
+                        }
+                    }
+                }
+            }
+        },
+        "/spam/peer/{peerID}": {
+            "get": {
+                "description": "Get validation failures, submission counts, and aggregation info for a specific peer",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "spam"
+                ],
+                "summary": "Get spam tracking info for a peer",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Peer ID (libp2p)",
+                        "name": "peerID",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "Protocol state identifier",
+                        "name": "protocol",
+                        "in": "query"
+                    },
+                    {
+                        "type": "string",
+                        "description": "Data market address",
+                        "name": "market",
+                        "in": "query"
+                    },
+                    {
+                        "type": "integer",
+                        "description": "Specific epoch ID (optional, defaults to current epoch)",
+                        "name": "epochID",
+                        "in": "query"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "Spam tracking information for peer",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": true
+                        }
+                    }
+                }
+            }
+        },
+        "/spam/peer/{peerID}/epochs": {
+            "get": {
+                "description": "Get tracking data (submissions, validation failures) for a peer across multiple epochs",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "spam"
+                ],
+                "summary": "Get epoch-by-epoch tracking for a peer",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Peer ID (libp2p)",
+                        "name": "peerID",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "integer",
+                        "description": "Start epoch (default: current epoch - 10)",
+                        "name": "startEpoch",
+                        "in": "query"
+                    },
+                    {
+                        "type": "integer",
+                        "description": "End epoch (default: current epoch)",
+                        "name": "endEpoch",
+                        "in": "query"
+                    },
+                    {
+                        "type": "string",
+                        "description": "Protocol state identifier",
+                        "name": "protocol",
+                        "in": "query"
+                    },
+                    {
+                        "type": "string",
+                        "description": "Data market address",
+                        "name": "market",
+                        "in": "query"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "Epoch-by-epoch tracking data",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": true
+                        }
+                    }
+                }
+            }
+        },
+        "/spam/stats": {
+            "get": {
+                "description": "Get aggregated spam protection statistics including flagged counts, reports, and enforcement metrics",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "spam"
+                ],
+                "summary": "Get spam protection statistics",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Protocol state identifier",
+                        "name": "protocol",
+                        "in": "query"
+                    },
+                    {
+                        "type": "string",
+                        "description": "Data market address",
+                        "name": "market",
+                        "in": "query"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "Spam protection statistics",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": true
+                        }
+                    }
+                }
+            }
+        },
+        "/spam/windows": {
+            "get": {
+                "description": "Get list of all windows that have spam reports (for discovery/indexing). Windows are created at epoch boundaries (epochID % 10 == 0) and contain aggregated reports for a 10-epoch range. Windows persist for 2 hours (TTL).",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "spam"
+                ],
+                "summary": "List all aggregation windows with reports",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Protocol state identifier",
+                        "name": "protocol",
+                        "in": "query"
+                    },
+                    {
+                        "type": "string",
+                        "description": "Data market address",
+                        "name": "market",
+                        "in": "query"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "List of windows with window_id, epoch_range (e.g., '24189511-24189520'), first_epoch, last_epoch, and peer_count",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": true
+                        }
+                    }
+                }
+            }
+        },
+        "/spam/windows/{windowID}": {
+            "get": {
+                "description": "Get all peers and their aggregated reports for a specific window. Window ID is the end epoch of the 10-epoch range (e.g., window 24189520 contains epochs 24189511-24189520). Includes validator counts (consensus requires \u003e= 2 validators), all spam reports with epoch_id, violation_type, count, and evidence.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "spam"
+                ],
+                "summary": "Get details for a specific aggregation window",
+                "parameters": [
+                    {
+                        "type": "integer",
+                        "description": "Window ID (end epoch of 10-epoch range, e.g., 24189520 for epochs 24189511-24189520)",
+                        "name": "windowID",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "Protocol state identifier",
+                        "name": "protocol",
+                        "in": "query"
+                    },
+                    {
+                        "type": "string",
+                        "description": "Data market address",
+                        "name": "market",
+                        "in": "query"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "Window details including window_id, epoch_range, peers array with peer_id, validator_count, report_count, first_epoch, last_epoch, and reports array",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": true
+                        }
+                    }
+                }
+            }
+        },
         "/stats/daily": {
             "get": {
                 "description": "Get pre-aggregated 24-hour statistics",
@@ -720,159 +1045,6 @@ const docTemplate = `{
                         "description": "VPA timeline with priority and/or submission entries",
                         "schema": {
                             "$ref": "#/definitions/main.VPATimelineResponse"
-                        }
-                    }
-                }
-            }
-        },
-        "/spam/flagged/peers": {
-            "get": {
-                "description": "Get list of all flagged peer IDs (from Redis cache, synced from onchain)",
-                "produces": [
-                    "application/json"
-                ],
-                "tags": [
-                    "spam"
-                ],
-                "summary": "Get flagged peers",
-                "parameters": [
-                    {
-                        "type": "string",
-                        "description": "Protocol state identifier",
-                        "name": "protocol",
-                        "in": "query"
-                    },
-                    {
-                        "type": "string",
-                        "description": "Data market address",
-                        "name": "market",
-                        "in": "query"
-                    }
-                ],
-                "responses": {
-                    "200": {
-                        "description": "List of flagged peers with metadata",
-                        "schema": {
-                            "type": "object",
-                            "additionalProperties": true
-                        }
-                    }
-                }
-            }
-        },
-        "/spam/flagged/snapshotters": {
-            "get": {
-                "description": "Get list of all flagged snapshotter addresses (from Redis cache, synced from onchain)",
-                "produces": [
-                    "application/json"
-                ],
-                "tags": [
-                    "spam"
-                ],
-                "summary": "Get flagged snapshotters",
-                "parameters": [
-                    {
-                        "type": "string",
-                        "description": "Protocol state identifier",
-                        "name": "protocol",
-                        "in": "query"
-                    },
-                    {
-                        "type": "string",
-                        "description": "Data market address",
-                        "name": "market",
-                        "in": "query"
-                    }
-                ],
-                "responses": {
-                    "200": {
-                        "description": "List of flagged snapshotters with metadata",
-                        "schema": {
-                            "type": "object",
-                            "additionalProperties": true
-                        }
-                    }
-                }
-            }
-        },
-        "/spam/peer/{peerID}": {
-            "get": {
-                "description": "Get validation failures, submission counts, and aggregation info for a specific peer",
-                "produces": [
-                    "application/json"
-                ],
-                "tags": [
-                    "spam"
-                ],
-                "summary": "Get spam tracking info for a peer",
-                "parameters": [
-                    {
-                        "type": "string",
-                        "description": "Peer ID (libp2p)",
-                        "name": "peerID",
-                        "in": "path",
-                        "required": true
-                    },
-                    {
-                        "type": "string",
-                        "description": "Protocol state identifier",
-                        "name": "protocol",
-                        "in": "query"
-                    },
-                    {
-                        "type": "string",
-                        "description": "Data market address",
-                        "name": "market",
-                        "in": "query"
-                    },
-                    {
-                        "type": "integer",
-                        "description": "Specific epoch ID (optional, defaults to current epoch)",
-                        "name": "epochID",
-                        "in": "query"
-                    }
-                ],
-                "responses": {
-                    "200": {
-                        "description": "Spam tracking information for peer",
-                        "schema": {
-                            "type": "object",
-                            "additionalProperties": true
-                        }
-                    }
-                }
-            }
-        },
-        "/spam/stats": {
-            "get": {
-                "description": "Get aggregated spam protection statistics including flagged counts, reports, and enforcement metrics",
-                "produces": [
-                    "application/json"
-                ],
-                "tags": [
-                    "spam"
-                ],
-                "summary": "Get spam protection statistics",
-                "parameters": [
-                    {
-                        "type": "string",
-                        "description": "Protocol state identifier",
-                        "name": "protocol",
-                        "in": "query"
-                    },
-                    {
-                        "type": "string",
-                        "description": "Data market address",
-                        "name": "market",
-                        "in": "query"
-                    }
-                ],
-                "responses": {
-                    "200": {
-                        "description": "Spam protection statistics",
-                        "schema": {
-                            "type": "object",
-                            "additionalProperties": true
                         }
                     }
                 }

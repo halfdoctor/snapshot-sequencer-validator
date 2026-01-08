@@ -483,6 +483,240 @@ paths:
       summary: Queue status
       tags:
       - queues
+  /spam/epochs:
+    get:
+      description: Get list of epochs that have spam tracking data. Queries epochs
+        from aggregation windows (persistent) and active epoch peer sets (ephemeral,
+        for recent epochs not yet aggregated). Epoch peer sets are deleted after window
+        aggregation, so this endpoint primarily returns epochs from windows.
+      parameters:
+      - description: Protocol state identifier
+        in: query
+        name: protocol
+        type: string
+      - description: Data market address
+        in: query
+        name: market
+        type: string
+      - description: 'Maximum number of epochs to return (default: 100, max: 1000)'
+        in: query
+        name: limit
+        type: integer
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: List of epochs with tracking data, each containing epoch_id
+            and peer_count
+          schema:
+            additionalProperties: true
+            type: object
+      summary: List epochs with tracking data
+      tags:
+      - spam
+  /spam/flagged/peers:
+    get:
+      description: Get list of all flagged peer IDs (from Redis cache, synced from
+        on-chain)
+      parameters:
+      - description: Protocol state identifier
+        in: query
+        name: protocol
+        type: string
+      - description: Data market address
+        in: query
+        name: market
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: List of flagged peers with metadata
+          schema:
+            additionalProperties: true
+            type: object
+      summary: Get flagged peers
+      tags:
+      - spam
+  /spam/flagged/snapshotters:
+    get:
+      description: Get list of all flagged snapshotter addresses (from Redis cache,
+        synced from on-chain)
+      parameters:
+      - description: Protocol state identifier
+        in: query
+        name: protocol
+        type: string
+      - description: Data market address
+        in: query
+        name: market
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: List of flagged snapshotters with metadata
+          schema:
+            additionalProperties: true
+            type: object
+      summary: Get flagged snapshotters
+      tags:
+      - spam
+  /spam/peer/{peerID}:
+    get:
+      description: Get validation failures, submission counts, and aggregation info
+        for a specific peer
+      parameters:
+      - description: Peer ID (libp2p)
+        in: path
+        name: peerID
+        required: true
+        type: string
+      - description: Protocol state identifier
+        in: query
+        name: protocol
+        type: string
+      - description: Data market address
+        in: query
+        name: market
+        type: string
+      - description: Specific epoch ID (optional, defaults to current epoch)
+        in: query
+        name: epochID
+        type: integer
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: Spam tracking information for peer
+          schema:
+            additionalProperties: true
+            type: object
+      summary: Get spam tracking info for a peer
+      tags:
+      - spam
+  /spam/peer/{peerID}/epochs:
+    get:
+      description: Get tracking data (submissions, validation failures) for a peer
+        across multiple epochs
+      parameters:
+      - description: Peer ID (libp2p)
+        in: path
+        name: peerID
+        required: true
+        type: string
+      - description: 'Start epoch (default: current epoch - 10)'
+        in: query
+        name: startEpoch
+        type: integer
+      - description: 'End epoch (default: current epoch)'
+        in: query
+        name: endEpoch
+        type: integer
+      - description: Protocol state identifier
+        in: query
+        name: protocol
+        type: string
+      - description: Data market address
+        in: query
+        name: market
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: Epoch-by-epoch tracking data
+          schema:
+            additionalProperties: true
+            type: object
+      summary: Get epoch-by-epoch tracking for a peer
+      tags:
+      - spam
+  /spam/stats:
+    get:
+      description: Get aggregated spam protection statistics including flagged counts,
+        reports, and enforcement metrics
+      parameters:
+      - description: Protocol state identifier
+        in: query
+        name: protocol
+        type: string
+      - description: Data market address
+        in: query
+        name: market
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: Spam protection statistics
+          schema:
+            additionalProperties: true
+            type: object
+      summary: Get spam protection statistics
+      tags:
+      - spam
+  /spam/windows:
+    get:
+      description: Get list of all windows that have spam reports (for discovery/indexing).
+        Windows are created at epoch boundaries (epochID % 10 == 0) and contain aggregated
+        reports for a 10-epoch range. Windows persist for 2 hours (TTL).
+      parameters:
+      - description: Protocol state identifier
+        in: query
+        name: protocol
+        type: string
+      - description: Data market address
+        in: query
+        name: market
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: List of windows with window_id, epoch_range (e.g., '24189511-24189520'),
+            first_epoch, last_epoch, and peer_count
+          schema:
+            additionalProperties: true
+            type: object
+      summary: List all aggregation windows with reports
+      tags:
+      - spam
+  /spam/windows/{windowID}:
+    get:
+      description: Get all peers and their aggregated reports for a specific window.
+        Window ID is the end epoch of the 10-epoch range (e.g., window 24189520 contains
+        epochs 24189511-24189520). Includes validator counts (consensus requires >=
+        2 validators), all spam reports with epoch_id, violation_type, count, and
+        evidence.
+      parameters:
+      - description: Window ID (end epoch of 10-epoch range, e.g., 24189520 for epochs
+          24189511-24189520)
+        in: path
+        name: windowID
+        required: true
+        type: integer
+      - description: Protocol state identifier
+        in: query
+        name: protocol
+        type: string
+      - description: Data market address
+        in: query
+        name: market
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: Window details including window_id, epoch_range, peers array
+            with peer_id, validator_count, report_count, first_epoch, last_epoch,
+            and reports array
+          schema:
+            additionalProperties: true
+            type: object
+      summary: Get details for a specific aggregation window
+      tags:
+      - spam
   /stats/daily:
     get:
       description: Get pre-aggregated 24-hour statistics
