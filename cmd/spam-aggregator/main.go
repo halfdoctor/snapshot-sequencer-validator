@@ -7,11 +7,8 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
-	"time"
 
-	rpchelper "github.com/powerloom/go-rpc-helper"
 	"github.com/powerloom/snapshot-sequencer-validator/config"
-	"github.com/powerloom/snapshot-sequencer-validator/pkgs/eventmonitor"
 	rediskeys "github.com/powerloom/snapshot-sequencer-validator/pkgs/redis"
 	"github.com/powerloom/snapshot-sequencer-validator/pkgs/spam"
 	"github.com/redis/go-redis/v9"
@@ -93,73 +90,6 @@ func main() {
 	}
 
 	log.Info("✅ Spam protection components initialized")
-
-	// Initialize event monitor to detect epoch releases and trigger window aggregation
-	if cfg.EnableEventMonitor {
-		// Initialize RPC Helper with Powerloom chain config
-		rpcConfig := cfg.ToRPCConfig()
-		if rpcConfig == nil || len(rpcConfig.Nodes) == 0 {
-			log.Fatal("POWERLOOM_RPC_NODES must be configured for event monitoring")
-		}
-
-		// Set default timeouts if not configured
-		if rpcConfig.RequestTimeout == 0 {
-			rpcConfig.RequestTimeout = 30 * time.Second
-		}
-		if rpcConfig.MaxRetries == 0 {
-			rpcConfig.MaxRetries = 3
-		}
-
-		rpcHelper := rpchelper.NewRPCHelper(rpcConfig)
-		if err := rpcHelper.Initialize(ctx); err != nil {
-			log.WithError(err).Fatal("Failed to initialize RPC helper")
-		}
-
-		// Create event monitor config
-		monitorCfg := &eventmonitor.Config{
-			RPCHelper:                rpcHelper,
-			ContractAddress:          cfg.ProtocolStateContract,
-			ContractABIPath:          cfg.ContractABIPath,
-			RedisClient:              redisClient,
-			WindowDuration:           cfg.Level1FinalizationDelay,
-			StartBlock:               cfg.EventStartBlock,
-			PollInterval:             cfg.EventPollInterval,
-			DataMarkets:              cfg.DataMarketAddresses,
-			MaxWindows:               cfg.MaxConcurrentWindows,
-			FinalizationBatchSize:    cfg.FinalizationBatchSize,
-			VPAContractAddress:       cfg.VPAContractAddress,
-			VPAValidatorAddress:      cfg.VPAValidatorAddress,
-			VPARPCURL:                strings.Join(cfg.RPCNodes, ","),
-			ProtocolState:            cfg.ProtocolStateContract,
-			NewProtocolStateContract: cfg.NewProtocolStateContract,
-			WindowConfigCacheTTL:     5 * time.Minute,
-			EstimatedMaxPriority:     10,
-			NewDataMarketContracts: func() []string {
-				if cfg.NewDataMarket != "" {
-					return []string{cfg.NewDataMarket}
-				}
-				return []string{}
-			}(),
-			SpamComponents: spamComponents,
-		}
-
-		eventMonitor, err := eventmonitor.NewEventMonitor(monitorCfg)
-		if err != nil {
-			log.WithError(err).Fatal("Failed to create event monitor")
-		}
-
-		// Start event monitor
-		go func() {
-			if err := eventMonitor.Start(); err != nil {
-				log.WithError(err).Error("Event monitor failed")
-			}
-		}()
-
-		log.Info("✅ Event monitor started (will trigger window aggregation at epoch boundaries)")
-	} else {
-		log.Warn("Event monitor disabled - window aggregation will not be triggered automatically")
-		log.Warn("Consider enabling ENABLE_EVENT_MONITOR for automatic aggregation")
-	}
 
 	// Wait for shutdown signal
 	sigChan := make(chan os.Signal, 1)
