@@ -70,10 +70,26 @@ If `/api/v1/spam/windows` returns empty, follow these steps:
 # - "Queued local spam report for broadcasting for peer {peerID} epoch {epochID}"
 ```
 
-**If using separate event-monitor component**:
+**Event-Monitor Component** (triggers window aggregation at epoch boundaries):
 ```bash
-# Check event monitor logs for epoch releases
-./dsv.sh event-logs | grep -iE "(epoch.*released|epoch.*boundary|aggregation window)"
+# Check initialization logs in event-monitor
+./dsv.sh event-logs | grep -iE "(spam protection components initialized|event monitor started|initializing spam)"
+
+# Check if epoch boundaries are being detected
+./dsv.sh event-logs | grep -iE "(EpochReleased|epoch.*released|aggregation window boundary|epoch.*boundary|window boundary)"
+
+# Expected logs when epoch boundary detected:
+# - "📅 Epoch {epochID} released for market {address} at block {block}"
+# - "Epoch {epochID} is an aggregation window boundary. Triggering local spam data aggregation."
+# - "Calling CreateWindowAndAggregateLocalData for epoch {epochID}"
+# - "Successfully created spam aggregation window for epoch {epochID}"
+# - "Waiting 10 seconds for validator reports before checking consensus for window {epochID}"
+# - "Checking consensus for window {epochID} after 10-second delay"
+
+# If you see warnings instead:
+# - "Spam components not initialized - skipping window creation" → Check spam component initialization
+# - "Spam aggregator is nil at epoch boundary" → Aggregator not initialized
+# - "Spam tracker is nil at epoch boundary" → Tracker not initialized
 ```
 
 ### Step 2: Check if Tracking is Happening
@@ -128,19 +144,33 @@ curl "http://localhost:9091/api/v1/spam/epochs?limit=20" | jq '.'
 # If this returns epochs, check if any are multiples of 10
 ```
 
-### Step 6: Verify Spam-Aggregator Window Creation
+### Step 6: Verify Event-Monitor Window Creation
+
+**Event-monitor triggers window aggregation at epoch boundaries** (`epochID % 10 == 0`):
 
 ```bash
-# Check spam-aggregator logs for window creation and aggregation
-./dsv.sh spam-aggregator-logs | grep -iE "(window.*created|window.*aggregated|createwindow|aggregating.*local|broadcasting.*report)"
+# Check event-monitor logs for epoch boundary detection and window creation
+./dsv.sh event-logs | grep -iE "(EpochReleased|aggregation window boundary|Calling CreateWindowAndAggregateLocalData|Successfully created spam aggregation window)"
 
-# Look for:
+# Expected logs:
+# - "📅 Epoch {epochID} released for market {address} at block {block}"
 # - "Epoch {epochID} is an aggregation window boundary. Triggering local spam data aggregation."
+# - "Calling CreateWindowAndAggregateLocalData for epoch {epochID}"
 # - "Successfully created spam aggregation window for epoch {epochID}" (GOOD)
 # - "Failed to create spam aggregation window at epoch boundary {epochID}: {error}" (BAD - check error)
+
+# Check spam-aggregator logs for actual window creation
+./dsv.sh spam-aggregator-logs | grep -iE "(Creating spam aggregation window|window.*aggregated)"
+
+# Expected logs:
+# - "Creating spam aggregation window {windowID} for epochs {start}-{end}"
 # - "Aggregated local data for window {windowID}: {peerCount} peers, {reportCount} reports"
-# - "Broadcasting spam report for peer {peerID} epoch {epochID}" (if reports generated)
-# - "Received spam report from validator {validatorID} for peer {peerID}" (if receiving reports)
+```
+
+**Check consensus checking (after 10-second delay)**:
+```bash
+./dsv.sh event-logs | grep -iE "(Waiting.*seconds|checking consensus|CheckWindowForConsensus)"
+./dsv.sh spam-aggregator-logs | grep -iE "(Checking consensus|consensus.*reached|flagged.*peer)"
 ```
 
 **Check Redis queue activity**:
@@ -179,18 +209,41 @@ curl "http://localhost:9091/api/v1/spam/windows" | jq '.'
 
 ```bash
 # Get details for a specific window (shows all peers and their aggregated reports)
-curl "http://localhost:9091/api/v1/spam/windows/24182100" | jq '.'
+WINDOW_ID=24189520  # Replace with your window ID
+curl "http://localhost:9091/api/v1/spam/windows/${WINDOW_ID}" | jq '.'
 
 # Response includes:
 # - window_id: Window ID (end epoch)
-# - epoch_range: Epochs covered (e.g., "24182091-24182100")
+# - epoch_range: Epochs covered (e.g., "24189511-24189520")
 # - peers: Array of peer details including:
 #   - peer_id: Peer ID
-#   - validator_count: Number of validators that reported this peer (for consensus)
+#   - validator_count: Number of validators that reported this peer (for consensus, requires >= 2)
 #   - first_epoch: First epoch with violations
 #   - last_epoch: Last epoch with violations
 #   - report_count: Number of spam reports
-#   - reports: Array of individual spam reports
+#   - reports: Array of individual spam reports with epoch_id, violation_type, count, evidence
+
+# Summary view - see all peers, validator counts, and report counts
+curl "http://localhost:9091/api/v1/spam/windows/${WINDOW_ID}" | jq '{
+  window_id: .window_id,
+  epoch_range: .epoch_range,
+  peer_count: .peer_count,
+  peers: [.peers[] | {
+    peer_id,
+    validator_count,
+    report_count,
+    first_epoch,
+    last_epoch,
+    violation_types: [.reports[].violation_type] | unique
+  }]
+}'
+
+# Check reports for a specific epoch within the window
+EPOCH_ID=24189520
+curl "http://localhost:9091/api/v1/spam/windows/${WINDOW_ID}" | jq ".peers[].reports[] | select(.epoch_id == ${EPOCH_ID})"
+
+# Check consensus status (peers with >= 2 validators reporting)
+curl "http://localhost:9091/api/v1/spam/windows/${WINDOW_ID}" | jq '.peers[] | select(.validator_count >= 2) | {peer_id, validator_count, report_count}'
 ```
 
 ## Drilling Down: Detailed Investigation
@@ -638,6 +691,8 @@ These are hardcoded for consensus consistency:
 
 **Symptoms**: `/api/v1/spam/epochs` returns empty, no epoch peer sets in Redis
 
+**Note**: The `/api/v1/spam/epochs` endpoint queries epochs from windows (not epoch peer sets, which are deleted after aggregation). If windows exist but epochs endpoint is empty, check that windows contain epoch data.
+
 **Debug Steps**:
 
 1. **Check dequeuer is running and processing submissions**:
@@ -653,7 +708,7 @@ These are hardcoded for consensus consistency:
 
 3. **Check if submissions are being processed**:
    ```bash
-   ./dsv.sh dequeuer-logs | grep -iE "(processed.*submission|worker.*processing)"
+   ./dsv.sh dequeuer-logs | grep -iE "(processed.*submission|worker.*processing|tracked.*submission)"
    ```
 
 4. **Check if peers are whitelisted** (whitelisted peers aren't tracked):
@@ -666,6 +721,11 @@ These are hardcoded for consensus consistency:
 5. **Check if peerID is being passed**:
    ```bash
    ./dsv.sh dequeuer-logs | grep -iE "(peer.*empty|peer_id)"
+   ```
+
+6. **Check if windows exist** (epochs endpoint queries from windows):
+   ```bash
+   curl "http://localhost:9091/api/v1/spam/windows" | jq '.windows[] | {window_id, epoch_range, peer_count}'
    ```
 
 ### No Spam Reports Being Sent
