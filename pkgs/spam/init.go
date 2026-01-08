@@ -2,9 +2,7 @@ package spam
 
 import (
 	"context"
-	"fmt"
 
-	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	"github.com/powerloom/snapshot-sequencer-validator/config"
 	redislib "github.com/powerloom/snapshot-sequencer-validator/pkgs/redis"
 	"github.com/redis/go-redis/v9"
@@ -12,9 +10,8 @@ import (
 )
 
 // InitializeSpamProtection initializes spam protection components
-// If ps is nil, only local components (tracker, rateLimiter, flagging) are initialized
-// P2P components (aggregator, reporter) are only initialized if ps is provided
-func InitializeSpamProtection(ctx context.Context, cfg *config.Settings, redisClient *redis.Client, keyBuilder *redislib.KeyBuilder, ps *pubsub.PubSub, sequencerID string) (*SpamComponents, error) {
+// All P2P operations are handled via Redis queues with p2p-gateway
+func InitializeSpamProtection(ctx context.Context, cfg *config.Settings, redisClient *redis.Client, keyBuilder *redislib.KeyBuilder, ps interface{}, sequencerID string) (*SpamComponents, error) {
 	if !cfg.EnableSpamProtection {
 		log.Info("Spam protection disabled via ENABLE_SPAM_PROTECTION=false")
 		return nil, nil
@@ -23,8 +20,7 @@ func InitializeSpamProtection(ctx context.Context, cfg *config.Settings, redisCl
 	log.WithFields(log.Fields{
 		"enable_spam_protection":       cfg.EnableSpamProtection,
 		"enable_spam_report_broadcast": cfg.EnableSpamReportBroadcast,
-		"pubsub_available":             ps != nil,
-	}).Info("Initializing spam protection components")
+	}).Info("Initializing spam protection components (Redis queue-based P2P)")
 
 	// Initialize whitelist
 	whitelist := NewPeerWhitelist(cfg.FullNodePeerIDs, cfg.BulkServicePeerIDs)
@@ -40,51 +36,21 @@ func InitializeSpamProtection(ctx context.Context, cfg *config.Settings, redisCl
 	// Initialize flagging service
 	flagging := NewFlaggingService(redisClient, keyBuilder, whitelist)
 
-	// Initialize spam aggregator FIRST (always needed for local aggregation)
-	// The aggregator is needed for local data aggregation even if broadcast is disabled
-	// If broadcast is enabled, it also handles incoming reports from other validators and broadcasts local reports
-	var aggregator *SpamAggregator
-	var sub *pubsub.Subscription
-	var spamTopic *pubsub.Topic
-	if cfg.EnableSpamReportBroadcast && ps != nil {
-		// Get spam report topic (constructed from validator presence prefix + "/spam-reports")
-		spamReportTopic := cfg.GetSpamReportTopic()
-		var err error
-		spamTopic, err = ps.Join(spamReportTopic)
-		if err != nil {
-			return nil, fmt.Errorf("failed to join spam reports topic for aggregator: %w", err)
-		}
-		sub, err = spamTopic.Subscribe()
-		if err != nil {
-			return nil, fmt.Errorf("failed to subscribe to spam reports topic: %w", err)
-		}
-	}
+	// Initialize spam aggregator (always needed for local aggregation and Redis queue processing)
 	// Window size is hardcoded to 10 for consensus consistency across all validators
-	// Create aggregator even if sub/topic is nil (local aggregation only)
-	aggregator = NewSpamAggregator(ctx, redisClient, keyBuilder, whitelist, sub, spamTopic, flagging, DEFAULT_AGGREGATION_WINDOW_SIZE)
+	aggregator := NewSpamAggregator(ctx, redisClient, keyBuilder, whitelist, flagging, DEFAULT_AGGREGATION_WINDOW_SIZE)
 	// Set sequencer ID for generating local reports
 	aggregator.SetSequencerID(sequencerID)
-	// Always start aggregator (periodicConsensusCheck handles pruning even without broadcast)
-	// Only subscription handler starts conditionally
+	// Start aggregator (handles Redis queue reading and periodic pruning)
 	aggregator.Start()
-	if sub != nil {
-		log.Infof("Initialized spam aggregator with window size: %d (broadcast enabled, subscription handler started)", DEFAULT_AGGREGATION_WINDOW_SIZE)
-	} else {
-		log.Infof("Initialized spam aggregator with window size: %d (local aggregation only, broadcast disabled or pubsub unavailable)", DEFAULT_AGGREGATION_WINDOW_SIZE)
-	}
+	log.Infof("Initialized spam aggregator with window size: %d (Redis queue-based P2P)", DEFAULT_AGGREGATION_WINDOW_SIZE)
 
 	// Initialize spam reporter (if broadcast enabled)
 	// Pass aggregator so it can inject reports directly (Gossipsub doesn't deliver self-messages)
 	var reporter *SpamReporter
-	if cfg.EnableSpamReportBroadcast && ps != nil {
-		// Get spam report topic (constructed from validator presence prefix + "/spam-reports")
-		spamReportTopic := cfg.GetSpamReportTopic()
-		spamTopic, err := ps.Join(spamReportTopic)
-		if err != nil {
-			return nil, fmt.Errorf("failed to join spam reports topic: %w", err)
-		}
-		reporter = NewSpamReporterWithAggregator(spamTopic, tracker, whitelist, sequencerID, aggregator)
-		log.Infof("Initialized spam reporter for topic: %s", spamReportTopic)
+	if cfg.EnableSpamReportBroadcast {
+		reporter = NewSpamReporterWithAggregator(redisClient, keyBuilder, tracker, whitelist, sequencerID, aggregator)
+		log.Infof("Initialized spam reporter (Redis queue-based broadcasting)")
 	}
 
 	// TODO: Initialize state sync service (if enabled)

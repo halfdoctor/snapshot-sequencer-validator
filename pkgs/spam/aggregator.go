@@ -5,9 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
-	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	redislib "github.com/powerloom/snapshot-sequencer-validator/pkgs/redis"
 	"github.com/redis/go-redis/v9"
 	log "github.com/sirupsen/logrus"
@@ -21,17 +21,108 @@ const (
 	AGGREGATION_TTL = 2 * time.Hour
 )
 
+// Lua script for atomic update of aggregated report
+const updateAggregatedReportScript = `
+-- KEYS[1]: windowKey (e.g., "{protocol}:{market}:spam:reports:peer:{peerID}:window:{windowID}")
+-- ARGV[1]: report JSON (string)
+-- ARGV[2]: reporter ID (string)
+-- ARGV[3]: snapshotter address (string, can be empty)
+-- ARGV[4]: epoch ID (number)
+-- ARGV[5]: timestamp (number)
+-- ARGV[6]: TTL seconds (number, e.g., 7200 for 2 hours)
+
+local windowKey = KEYS[1]
+local reportJson = ARGV[1]
+local reporterId = ARGV[2]
+local snapshotterAddr = ARGV[3]
+local epochId = tonumber(ARGV[4])
+local timestamp = tonumber(ARGV[5])
+local ttl = tonumber(ARGV[6])
+
+-- Get existing aggregated report or create new one
+local existing = redis.call('GET', windowKey)
+local aggregated
+
+if existing then
+    aggregated = cjson.decode(existing)
+else
+    aggregated = {
+        reports = {},
+        validator_ids = {},
+        validator_count = 0,
+        snapshotter_addrs = {},
+        first_epoch = 0,
+        last_epoch = 0,
+        first_seen = 0,
+        last_updated = 0
+    }
+end
+
+-- Parse new report
+local newReport = cjson.decode(reportJson)
+
+-- Append report
+table.insert(aggregated.reports, newReport)
+
+-- Add validator ID if not present
+local validatorExists = false
+for i, vid in ipairs(aggregated.validator_ids) do
+    if vid == reporterId then
+        validatorExists = true
+        break
+    end
+end
+if not validatorExists then
+    table.insert(aggregated.validator_ids, reporterId)
+    aggregated.validator_count = #aggregated.validator_ids
+end
+
+-- Add snapshotter address if not present
+if snapshotterAddr ~= '' then
+    local addrExists = false
+    for i, addr in ipairs(aggregated.snapshotter_addrs) do
+        if addr == snapshotterAddr then
+            addrExists = true
+            break
+        end
+    end
+    if not addrExists then
+        table.insert(aggregated.snapshotter_addrs, snapshotterAddr)
+    end
+end
+
+-- Update epoch range
+if aggregated.first_epoch == 0 or epochId < aggregated.first_epoch then
+    aggregated.first_epoch = epochId
+end
+if epochId > aggregated.last_epoch then
+    aggregated.last_epoch = epochId
+end
+
+-- Update timestamps
+if aggregated.first_seen == 0 then
+    aggregated.first_seen = timestamp
+end
+aggregated.last_updated = timestamp
+
+-- Store back with TTL
+local updatedJson = cjson.encode(aggregated)
+redis.call('SET', windowKey, updatedJson, 'EX', ttl)
+
+-- Return validator count
+return aggregated.validator_count
+`
+
 // SpamAggregator receives and aggregates spam reports from other validators
 type SpamAggregator struct {
-	ctx         context.Context
-	redisClient *redis.Client
-	keyBuilder  *redislib.KeyBuilder
-	whitelist   *PeerWhitelist
-	windowSize  int
-	sub         *pubsub.Subscription // Subscription for receiving reports
-	topic       *pubsub.Topic        // Topic for broadcasting reports
-	flagging    *FlaggingService
-	sequencerID string // Validator/sequencer ID for generating local reports
+	ctx                   context.Context
+	redisClient           *redis.Client
+	keyBuilder            *redislib.KeyBuilder
+	whitelist             *PeerWhitelist
+	windowSize            int
+	flagging              *FlaggingService
+	sequencerID           string // Validator/sequencer ID for generating local reports
+	updateReportScriptSha string // SHA1 hash of Lua script for atomic updates
 }
 
 // AggregatedReport represents aggregated spam reports for a peer in a window
@@ -48,21 +139,27 @@ type AggregatedReport struct {
 }
 
 // NewSpamAggregator creates a new SpamAggregator instance
-func NewSpamAggregator(ctx context.Context, redisClient *redis.Client, keyBuilder *redislib.KeyBuilder, whitelist *PeerWhitelist, sub *pubsub.Subscription, topic *pubsub.Topic, flagging *FlaggingService, windowSize int) *SpamAggregator {
+func NewSpamAggregator(ctx context.Context, redisClient *redis.Client, keyBuilder *redislib.KeyBuilder, whitelist *PeerWhitelist, flagging *FlaggingService, windowSize int) *SpamAggregator {
 	if windowSize <= 0 {
 		windowSize = DEFAULT_AGGREGATION_WINDOW_SIZE
 	}
-	return &SpamAggregator{
+	agg := &SpamAggregator{
 		ctx:         ctx,
 		redisClient: redisClient,
 		keyBuilder:  keyBuilder,
 		whitelist:   whitelist,
 		windowSize:  windowSize,
-		sub:         sub,
-		topic:       topic,
 		flagging:    flagging,
 		sequencerID: "", // Will be set via SetSequencerID if needed
 	}
+
+	// Load Lua scripts on initialization
+	if err := agg.loadLuaScripts(ctx); err != nil {
+		log.Errorf("Failed to load Lua scripts: %v", err)
+		// Continue anyway - will use fallback method
+	}
+
+	return agg
 }
 
 // SetSequencerID sets the sequencer ID for generating local reports
@@ -70,40 +167,55 @@ func (a *SpamAggregator) SetSequencerID(sequencerID string) {
 	a.sequencerID = sequencerID
 }
 
-// Start begins listening for spam reports and aggregating them
-// If subscription is nil (broadcast disabled), only starts periodic consensus check (pruning)
-func (a *SpamAggregator) Start() {
-	// Only start subscription handler if broadcast is enabled (sub is not nil)
-	if a.sub != nil {
-		go a.handleSpamReports()
+// loadLuaScripts loads Lua scripts into Redis and stores their SHA hashes
+func (a *SpamAggregator) loadLuaScripts(ctx context.Context) error {
+	sha, err := a.redisClient.ScriptLoad(ctx, updateAggregatedReportScript).Result()
+	if err != nil {
+		return fmt.Errorf("failed to load update aggregated report script: %w", err)
 	}
-	// Always start periodic consensus check (handles pruning even without broadcast)
+	a.updateReportScriptSha = sha
+	log.Infof("Loaded update aggregated report Lua script SHA: %s", sha)
+	return nil
+}
+
+// Start begins listening for spam reports and aggregating them
+func (a *SpamAggregator) Start() {
+	// Start Redis queue reader for incoming reports
+	go a.handleIncomingSpamReports()
+	// Always start periodic consensus check (handles pruning)
 	go a.periodicConsensusCheck()
 }
 
-// handleSpamReports processes incoming spam reports from other validators
-func (a *SpamAggregator) handleSpamReports() {
+// handleIncomingSpamReports reads spam reports from Redis queue
+func (a *SpamAggregator) handleIncomingSpamReports() {
+	queueKey := a.keyBuilder.IncomingSpamReports()
 	for {
 		select {
 		case <-a.ctx.Done():
 			return
 		default:
-			msg, err := a.sub.Next(a.ctx)
+			result, err := a.redisClient.BRPop(a.ctx, time.Second, queueKey).Result()
 			if err != nil {
+				if err == redis.Nil {
+					// Timeout - continue
+					continue
+				}
 				if a.ctx.Err() != nil {
 					return
 				}
-				log.Errorf("Error reading spam report message: %v", err)
+				log.Errorf("Error reading from spam reports queue: %v", err)
 				continue
 			}
 
-			// Process spam report
-			go a.processSpamReportDirect(msg.Data)
+			if len(result) >= 2 {
+				// Process result[1] as spam report JSON
+				go a.processSpamReportDirect([]byte(result[1]))
+			}
 		}
 	}
 }
 
-// processSpamReportDirect processes a single spam report (can be called directly or from subscription)
+// processSpamReportDirect processes a single spam report (can be called directly or from Redis queue)
 func (a *SpamAggregator) processSpamReportDirect(data []byte) {
 	var report SpamReport
 	if err := json.Unmarshal(data, &report); err != nil {
@@ -128,10 +240,90 @@ func (a *SpamAggregator) processSpamReportDirect(data []byte) {
 	}
 
 	// Calculate aggregation window ID (end epoch of the window)
-	// Window ID = round up to next multiple of windowSize
-	// Note: Epoch 0 is dummy/heartbeat only, so windows start from epoch 1
-	// Epochs 1-10 → Window 10, Epochs 11-20 → Window 20, etc.
-	// Simple formula: round up epochID to next multiple of windowSize
+	windowID := ((int(report.EpochID) + a.windowSize - 1) / a.windowSize) * a.windowSize
+	windowKey := a.getAggregationWindowKey(report.PeerID, windowID)
+
+	// Use Lua script for atomic update
+	reportJson, err := json.Marshal(report)
+	if err != nil {
+		log.Errorf("Failed to marshal spam report: %v", err)
+		return
+	}
+
+	ttlSeconds := int(AGGREGATION_TTL.Seconds())
+	result, err := a.redisClient.EvalSha(a.ctx, a.updateReportScriptSha,
+		[]string{windowKey},
+		reportJson, report.ReporterID, report.SnapshotterAddr,
+		report.EpochID, report.Timestamp, ttlSeconds).Result()
+
+	if err != nil {
+		// Handle NOSCRIPT error (script not in Redis cache)
+		if strings.Contains(err.Error(), "NOSCRIPT") {
+			log.Warnf("NOSCRIPT error, reloading Lua script")
+			if reloadErr := a.loadLuaScripts(a.ctx); reloadErr != nil {
+				log.Errorf("Failed to reload Lua script: %v", reloadErr)
+				// Fallback to non-atomic method
+				a.processSpamReportDirectFallback(data)
+				return
+			}
+			// Retry with reloaded script
+			result, err = a.redisClient.EvalSha(a.ctx, a.updateReportScriptSha,
+				[]string{windowKey},
+				reportJson, report.ReporterID, report.SnapshotterAddr,
+				report.EpochID, report.Timestamp, ttlSeconds).Result()
+		}
+
+		if err != nil {
+			log.Errorf("Failed to update aggregated report atomically: %v", err)
+			// Fallback to non-atomic method
+			a.processSpamReportDirectFallback(data)
+			return
+		}
+	}
+
+	validatorCount, _ := result.(int64)
+
+	// Add peer to window peers set
+	windowPeersKey := a.getWindowPeersKey(windowID)
+	if err := a.redisClient.SAdd(a.ctx, windowPeersKey, report.PeerID).Err(); err != nil {
+		log.Errorf("Failed to add peer to window peers set: %v", err)
+	} else {
+		// Set TTL on the set
+		if err := a.redisClient.Expire(a.ctx, windowPeersKey, AGGREGATION_TTL).Err(); err != nil {
+			log.Warnf("Failed to set TTL on window peers set: %v", err)
+		}
+	}
+
+	// Add window ID to master windows set
+	windowsSetKey := a.getWindowsSetKey()
+	windowIDStr := fmt.Sprintf("%d", windowID)
+	if err := a.redisClient.SAdd(a.ctx, windowsSetKey, windowIDStr).Err(); err != nil {
+		log.Errorf("Failed to add window to master set: %v", err)
+	}
+
+	log.WithFields(log.Fields{
+		"peer_id":         report.PeerID,
+		"epoch_id":        report.EpochID,
+		"window_id":       windowID,
+		"validator_count": validatorCount,
+		"reporter_id":     report.ReporterID,
+	}).Infof("Atomically aggregated spam report for peer %s (window %d, validators: %d)", report.PeerID, windowID, validatorCount)
+}
+
+// processSpamReportDirectFallback is the fallback non-atomic implementation
+func (a *SpamAggregator) processSpamReportDirectFallback(data []byte) {
+	var report SpamReport
+	if err := json.Unmarshal(data, &report); err != nil {
+		log.Errorf("Failed to unmarshal spam report: %v", err)
+		return
+	}
+
+	// Skip if peer is whitelisted
+	if a.whitelist != nil && a.whitelist.IsWhitelisted(report.PeerID) {
+		log.Debugf("Skipping spam report for whitelisted peer: %s", report.PeerID)
+		return
+	}
+
 	windowID := ((int(report.EpochID) + a.windowSize - 1) / a.windowSize) * a.windowSize
 	windowKey := a.getAggregationWindowKey(report.PeerID, windowID)
 
@@ -192,24 +384,21 @@ func (a *SpamAggregator) processSpamReportDirect(data []byte) {
 		return
 	}
 
-	// Add peer ID to window peers set
+	// Add peer to window peers set
 	windowPeersKey := a.getWindowPeersKey(windowID)
 	if err := a.redisClient.SAdd(a.ctx, windowPeersKey, report.PeerID).Err(); err != nil {
 		log.Errorf("Failed to add peer to window peers set: %v", err)
-		// Continue - non-critical, but log error
 	} else {
-		// Set TTL on the set (same as aggregation TTL)
 		if err := a.redisClient.Expire(a.ctx, windowPeersKey, AGGREGATION_TTL).Err(); err != nil {
 			log.Warnf("Failed to set TTL on window peers set: %v", err)
 		}
 	}
 
-	// Add window ID to master windows set (for discovery/indexing)
+	// Add window ID to master windows set
 	windowsSetKey := a.getWindowsSetKey()
 	windowIDStr := fmt.Sprintf("%d", windowID)
 	if err := a.redisClient.SAdd(a.ctx, windowsSetKey, windowIDStr).Err(); err != nil {
 		log.Errorf("Failed to add window to master set: %v", err)
-		// Continue - non-critical, but log error
 	}
 
 	log.WithFields(log.Fields{
@@ -218,7 +407,7 @@ func (a *SpamAggregator) processSpamReportDirect(data []byte) {
 		"window_id":       windowID,
 		"validator_count": aggregated.ValidatorCount,
 		"reporter_id":     report.ReporterID,
-	}).Infof("Aggregated spam report for peer %s (window %d, validators: %d)", report.PeerID, windowID, aggregated.ValidatorCount)
+	}).Infof("Aggregated spam report for peer %s (window %d, validators: %d) [fallback]", report.PeerID, windowID, aggregated.ValidatorCount)
 }
 
 // CheckWindowForConsensus checks a specific window for consensus and flags if reached
@@ -654,21 +843,20 @@ func (a *SpamAggregator) CreateWindowAndAggregateLocalData(ctx context.Context, 
 						"count":          count,
 					}).Debugf("Generated local spam report for peer %s epoch %d", peerID, epoch)
 
-					// Broadcast report via P2P if topic is available
-					if a.topic != nil {
-						reportData, err := json.Marshal(report)
-						if err != nil {
-							log.Warnf("Failed to marshal spam report for broadcasting: %v", err)
+					// Queue report for broadcasting via p2p-gateway
+					reportData, err := json.Marshal(report)
+					if err != nil {
+						log.Warnf("Failed to marshal spam report for broadcasting: %v", err)
+					} else {
+						broadcastQueue := a.keyBuilder.OutgoingSpamReports()
+						if err := a.redisClient.LPush(a.ctx, broadcastQueue, reportData).Err(); err != nil {
+							log.Warnf("Failed to queue spam report for broadcasting for peer %s epoch %d: %v", peerID, epoch, err)
 						} else {
-							if err := a.topic.Publish(a.ctx, reportData); err != nil {
-								log.Warnf("Failed to broadcast spam report for peer %s epoch %d: %v", peerID, epoch, err)
-							} else {
-								log.WithFields(log.Fields{
-									"peer_id":        peerID,
-									"epoch_id":       epoch,
-									"violation_type": violationType,
-								}).Debugf("Broadcasted local spam report for peer %s epoch %d", peerID, epoch)
-							}
+							log.WithFields(log.Fields{
+								"peer_id":        peerID,
+								"epoch_id":       epoch,
+								"violation_type": violationType,
+							}).Debugf("Queued local spam report for broadcasting for peer %s epoch %d", peerID, epoch)
 						}
 					}
 				}

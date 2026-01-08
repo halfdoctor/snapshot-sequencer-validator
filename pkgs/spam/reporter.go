@@ -6,7 +6,8 @@ import (
 	"fmt"
 	"time"
 
-	pubsub "github.com/libp2p/go-libp2p-pubsub"
+	redislib "github.com/powerloom/snapshot-sequencer-validator/pkgs/redis"
+	"github.com/redis/go-redis/v9"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -23,33 +24,36 @@ type SpamReport struct {
 	Timestamp       int64    `json:"timestamp"`
 }
 
-// SpamReporter broadcasts spam reports to the validator mesh
+// SpamReporter broadcasts spam reports to the validator mesh via Redis queue
 type SpamReporter struct {
-	topic      *pubsub.Topic
-	tracker    *SpamTracker
-	whitelist  *PeerWhitelist
-	reporterID string
-	aggregator *SpamAggregator
+	redisClient *redis.Client
+	keyBuilder  *redislib.KeyBuilder
+	tracker     *SpamTracker
+	whitelist   *PeerWhitelist
+	reporterID  string
+	aggregator  *SpamAggregator
 }
 
 // NewSpamReporter creates a new SpamReporter instance
-func NewSpamReporter(topic *pubsub.Topic, tracker *SpamTracker, whitelist *PeerWhitelist, reporterID string) *SpamReporter {
+func NewSpamReporter(redisClient *redis.Client, keyBuilder *redislib.KeyBuilder, tracker *SpamTracker, whitelist *PeerWhitelist, reporterID string) *SpamReporter {
 	return &SpamReporter{
-		topic:      topic,
-		tracker:    tracker,
-		whitelist:  whitelist,
-		reporterID: reporterID,
+		redisClient: redisClient,
+		keyBuilder:  keyBuilder,
+		tracker:     tracker,
+		whitelist:   whitelist,
+		reporterID:  reporterID,
 	}
 }
 
 // NewSpamReporterWithAggregator creates a new SpamReporter with aggregator for direct injection
-func NewSpamReporterWithAggregator(topic *pubsub.Topic, tracker *SpamTracker, whitelist *PeerWhitelist, reporterID string, aggregator *SpamAggregator) *SpamReporter {
+func NewSpamReporterWithAggregator(redisClient *redis.Client, keyBuilder *redislib.KeyBuilder, tracker *SpamTracker, whitelist *PeerWhitelist, reporterID string, aggregator *SpamAggregator) *SpamReporter {
 	return &SpamReporter{
-		topic:      topic,
-		tracker:    tracker,
-		whitelist:  whitelist,
-		reporterID: reporterID,
-		aggregator: aggregator,
+		redisClient: redisClient,
+		keyBuilder:  keyBuilder,
+		tracker:     tracker,
+		whitelist:   whitelist,
+		reporterID:  reporterID,
+		aggregator:  aggregator,
 	}
 }
 
@@ -83,9 +87,10 @@ func (r *SpamReporter) ReportSpam(ctx context.Context, peerID, snapshotterAddr s
 		go r.aggregator.processSpamReportDirect(data)
 	}
 
-	// Broadcast to validator mesh
-	if err := r.topic.Publish(ctx, data); err != nil {
-		return fmt.Errorf("failed to publish spam report: %w", err)
+	// Queue report for broadcasting via p2p-gateway
+	broadcastQueue := r.keyBuilder.OutgoingSpamReports()
+	if err := r.redisClient.LPush(ctx, broadcastQueue, data).Err(); err != nil {
+		return fmt.Errorf("failed to queue spam report for broadcasting: %w", err)
 	}
 
 	log.WithFields(log.Fields{

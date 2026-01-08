@@ -62,6 +62,16 @@ func (kb *KeyBuilder) OutgoingBroadcastBatch() string {
 	return fmt.Sprintf("%s:%s:outgoing:broadcast:batch", kb.ProtocolState, kb.DataMarket)
 }
 
+// OutgoingSpamReports returns the key for spam reports to broadcast
+func (kb *KeyBuilder) OutgoingSpamReports() string {
+	return fmt.Sprintf("%s:%s:outgoing:spam-reports", kb.ProtocolState, kb.DataMarket)
+}
+
+// IncomingSpamReports returns the key for received spam reports queue
+func (kb *KeyBuilder) IncomingSpamReports() string {
+	return fmt.Sprintf("%s:%s:incoming:spam-reports", kb.ProtocolState, kb.DataMarket)
+}
+
 // Dequeuer Keys
 
 // ProcessingSubmission returns the key for submission being processed

@@ -904,9 +904,13 @@ func (m *EventMonitor) handleEpochReleased(event *EpochReleasedEvent) {
 									log.Errorf("Failed to create spam aggregation window at epoch boundary %d: %v", epochIDInt, err)
 								} else {
 									log.Infof("Successfully created spam aggregation window for epoch %d", epochIDInt)
+									// Wait 10 seconds for all validators' reports to arrive before checking consensus
+									go m.checkConsensusAfterDelay(epochIDInt)
 								}
 							} else {
 								log.Infof("Successfully created spam aggregation window for epoch %d (no error returned)", epochIDInt)
+								// Wait 10 seconds for all validators' reports to arrive before checking consensus
+								go m.checkConsensusAfterDelay(epochIDInt)
 							}
 						} else {
 							log.Warnf("CreateWindowAndAggregateLocalData method not found on aggregator (type: %s)", aggregatorField.Type())
@@ -969,6 +973,37 @@ func (m *EventMonitor) handleEpochReleased(event *EpochReleasedEvent) {
 			log.Infof("📋 Level 1 finalization will trigger when snapshot reveal window closes (in %v)", windowDuration)
 		} else {
 			log.Infof("📋 Level 1 finalization will trigger when P1 window closes (in %v)", windowDuration)
+		}
+	}
+}
+
+// checkConsensusAfterDelay waits 10 seconds then checks consensus for the completed window
+// This allows all validators' reports to arrive before checking consensus
+func (m *EventMonitor) checkConsensusAfterDelay(epochID uint64) {
+	log.Infof("Waiting 10 seconds for validator reports before checking consensus for window %d", epochID)
+	time.Sleep(10 * time.Second)
+
+	// Now call CheckWindowForConsensus
+	if m.spamComponents != nil {
+		scValue := reflect.ValueOf(m.spamComponents)
+		if scValue.Kind() == reflect.Ptr && !scValue.IsNil() {
+			aggregatorField := scValue.Elem().FieldByName("Aggregator")
+			if aggregatorField.IsValid() && !aggregatorField.IsNil() {
+				checkConsensusMethod := aggregatorField.MethodByName("CheckWindowForConsensus")
+				if checkConsensusMethod.IsValid() {
+					ctxVal := reflect.ValueOf(m.ctx)
+					epochVal := reflect.ValueOf(epochID)
+					log.Infof("Checking consensus for window %d after 10-second delay", epochID)
+					results := checkConsensusMethod.Call([]reflect.Value{ctxVal, epochVal})
+					if len(results) > 0 && !results[0].IsNil() {
+						if err, ok := results[0].Interface().(error); ok && err != nil {
+							log.Errorf("Failed to check consensus for window %d: %v", epochID, err)
+						} else {
+							log.Infof("Successfully checked consensus for window %d", epochID)
+						}
+					}
+				}
+			}
 		}
 	}
 }

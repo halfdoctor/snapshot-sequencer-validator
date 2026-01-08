@@ -269,15 +269,6 @@ services:
       - BULK_SERVICE_PEER_IDS=${BULK_SERVICE_PEER_IDS:-}
       - SPAM_CACHE_TTL_HOURS=${SPAM_CACHE_TTL_HOURS:-24}
       - GOSSIPSUB_VALIDATOR_PRESENCE_TOPIC=${GOSSIPSUB_VALIDATOR_PRESENCE_TOPIC:-/powerloom/dsv-devnet-alpha/validator/presence}
-      # P2P Configuration (separate port from p2p-gateway)
-      - P2P_PORT=${P2P_PORT_SPAM_AGGREGATOR:-9002}
-      - BOOTSTRAP_PEERS=${BOOTSTRAP_PEERS:-}
-      - BOOTSTRAP_MULTIADDR=${BOOTSTRAP_MULTIADDR:-}
-      - RENDEZVOUS_POINT=${RENDEZVOUS_POINT:-powerloom-snapshot-sequencer-network}
-      - PRIVATE_KEY=${PRIVATE_KEY}
-      - PUBLIC_IP=${PUBLIC_IP}
-      - CONN_MANAGER_LOW_WATER=${CONN_MANAGER_LOW_WATER:-50}
-      - CONN_MANAGER_HIGH_WATER=${CONN_MANAGER_HIGH_WATER:-200}
       # Protocol/Market config
       - PROTOCOL_STATE_CONTRACT=${PROTOCOL_STATE_CONTRACT}
       - DATA_MARKET_ADDRESSES=${DATA_MARKET_ADDRESSES}
@@ -299,8 +290,6 @@ services:
     depends_on:
       redis:
         condition: service_healthy
-    ports:
-      - "${P2P_PORT_SPAM_AGGREGATOR:-9002}:${P2P_PORT_SPAM_AGGREGATOR:-9002}"
     networks:
       - sequencer-net
     restart: unless-stopped

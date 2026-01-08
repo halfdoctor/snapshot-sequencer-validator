@@ -28,32 +28,31 @@ If `/api/v1/spam/windows` returns empty, follow these steps:
 #   - aggregator_initialized: true (local aggregator instance, but no P2P)
 ```
 
-**Spam-Aggregator Component** (P2P broadcasting):
+**Spam-Aggregator Component** (Redis queue-based P2P):
 ```bash
-# Check initialization logs in spam-aggregator (P2P components)
-./dsv.sh spam-aggregator-logs | grep -iE "(spam aggregator component starting|initializing spam|spam protection components initialized|p2p host started|gossipsub|event monitor)"
+# Check initialization logs in spam-aggregator (Redis queue-based)
+./dsv.sh spam-aggregator-logs | grep -iE "(spam aggregator component starting|initializing spam|spam protection components initialized|redis queue|event monitor)"
 
 # Expected logs:
 # - "🛡️  SPAM AGGREGATOR COMPONENT STARTING"
 # - "✅ Connected to Redis"
-# - "P2P Host started with peer ID: {peerID}"
-# - "✅ Initialized gossipsub for spam report exchange"
-# - "Initializing spam protection components" with fields:
+# - "✅ P2P operations handled via p2p-gateway (Redis queue-based)"
+# - "Initializing spam protection components (Redis queue-based P2P)" with fields:
 #   - enable_spam_protection: true
 #   - enable_spam_report_broadcast: true
-#   - pubsub_available: true (MUST be true)
-# - "Initialized spam aggregator with window size: 10 (broadcast enabled, subscription handler started)"
+# - "Initialized spam aggregator with window size: 10 (Redis queue-based P2P)"
+# - "Initialized spam reporter (Redis queue-based broadcasting)"
 # - "✅ Spam protection components initialized" with component status:
 #   - aggregator_initialized: true (MUST be true)
-#   - reporter_initialized: true (MUST be true - spam-aggregator handles P2P)
+#   - reporter_initialized: true (MUST be true - uses Redis queues)
 # - "✅ Event monitor started (will trigger window aggregation at epoch boundaries)"
 ```
 
 **If spam-aggregator logs show errors:**
 - Check environment variables: `ENABLE_SPAM_PROTECTION=true` and `ENABLE_SPAM_REPORT_BROADCAST=true`
-- Verify `P2P_PORT_SPAM_AGGREGATOR` is set (default: 9002) and doesn't conflict with p2p-gateway port
-- Check Redis connection is working
-- Verify P2P configuration (BOOTSTRAP_PEERS, RENDEZVOUS_POINT, PRIVATE_KEY)
+- Check Redis connection is working (spam-aggregator uses Redis queues, not direct P2P)
+- Verify p2p-gateway is running (handles all P2P operations for spam reports)
+- Check Redis queue keys: `{protocol}:{market}:outgoing:spam-reports` and `{protocol}:{market}:incoming:spam-reports`
 
 ### Step 1: Check if EventMonitor is Processing Epochs
 
@@ -66,7 +65,9 @@ If `/api/v1/spam/windows` returns empty, follow these steps:
 # - "📅 Epoch {epochID} released for market {market} at block {block}"
 # - "Epoch {epochID} is an aggregation window boundary. Triggering local spam data aggregation."
 # - "Successfully created spam aggregation window for epoch {epochID}"
-# - "Broadcasting spam report for peer {peerID} epoch {epochID}"
+# - "Waiting 10 seconds for validator reports before checking consensus for window {epochID}"
+# - "Checking consensus for window {epochID} after 10-second delay"
+# - "Queued local spam report for broadcasting for peer {peerID} epoch {epochID}"
 ```
 
 **If using separate event-monitor component**:
@@ -142,15 +143,18 @@ curl "http://localhost:9091/api/v1/spam/epochs?limit=20" | jq '.'
 # - "Received spam report from validator {validatorID} for peer {peerID}" (if receiving reports)
 ```
 
-**Check P2P connectivity**:
+**Check Redis queue activity**:
 ```bash
-# Check if spam-aggregator is connected to other validators
-./dsv.sh spam-aggregator-logs | grep -iE "(connected.*peer|found peer|p2p.*host|gossipsub)"
+# Check if spam reports are being queued and processed
+./dsv.sh spam-aggregator-logs | grep -iE "(queued.*spam report|received spam report|incoming.*spam|atomically aggregated)"
 
 # Look for:
-# - "Connected to peer via rendezvous: {peerID}"
-# - "P2P Host started with peer ID: {peerID}"
-# - "Joined spam reports topic: {topic}"
+# - "Queued local spam report for broadcasting for peer {peerID} epoch {epochID}"
+# - "📨 Received spam report from validator {validatorID} for peer {peerID} epoch {epochID}"
+# - "Atomically aggregated spam report for peer {peerID} (window {windowID}, validators: {count})"
+
+# Check p2p-gateway logs for spam report P2P operations
+./dsv.sh p2p-logs | grep -iE "(spam report|broadcasted spam|queued incoming spam)"
 ```
 
 ## Monitoring API Endpoints
@@ -311,7 +315,7 @@ curl "http://localhost:9091/api/v1/spam/flagged/peers" | jq '.'
 **Important**: A peer will only be flagged if:
 1. **Spam reports are generated** (requires 3 consecutive epochs with violations for rate limits)
 2. **Consensus is reached** (>= 2 validators report the same peer in the same window)
-3. **Window boundary passed** (consensus check happens at epochID % 10 == 0)
+3. **Window boundary passed** (consensus check happens at epochID % 10 == 0, after a 10-second delay to allow all validator reports to arrive)
 
 If only 1 validator has the new code, `validator_count` will be 1, so consensus won't be reached and the peer won't be flagged. Check logs for spam report generation:
 
@@ -420,23 +424,22 @@ Look for:
   - `reporter_initialized: false` (expected - no P2P in dequeuer)
   - `aggregator_initialized: true` (local instance, but no P2P)
 
-**Spam-Aggregator Component (P2P Broadcasting)**:
+**Spam-Aggregator Component (Redis Queue-Based P2P)**:
 ```bash
-./dsv.sh spam-aggregator-logs | grep -i "spam aggregator component starting\|initializing spam\|p2p host\|gossipsub\|event monitor"
+./dsv.sh spam-aggregator-logs | grep -i "spam aggregator component starting\|initializing spam\|redis queue\|event monitor"
 ```
 Look for:
 - `"🛡️  SPAM AGGREGATOR COMPONENT STARTING"`
 - `"✅ Connected to Redis"`
-- `"P2P Host started with peer ID: {peerID}"`
-- `"✅ Initialized gossipsub for spam report exchange"`
-- `"Initializing spam protection components"` with fields:
+- `"✅ P2P operations handled via p2p-gateway (Redis queue-based)"`
+- `"Initializing spam protection components (Redis queue-based P2P)"` with fields:
   - `enable_spam_protection: true`
   - `enable_spam_report_broadcast: true`
-  - `pubsub_available: true` (MUST be true)
-- `"Initialized spam aggregator with window size: 10 (broadcast enabled, subscription handler started)"` (GOOD)
+- `"Initialized spam aggregator with window size: 10 (Redis queue-based P2P)"` (GOOD)
+- `"Initialized spam reporter (Redis queue-based broadcasting)"`
 - `"✅ Spam protection components initialized"` with:
   - `aggregator_initialized: true` (MUST be true)
-  - `reporter_initialized: true` (MUST be true - spam-aggregator handles P2P)
+  - `reporter_initialized: true` (MUST be true - uses Redis queues)
 - `"✅ Event monitor started (will trigger window aggregation at epoch boundaries)"`
 
 **P2P Gateway (Early Rejection)**:
@@ -470,22 +473,25 @@ Look for:
 - `"DDoS protection disabled - skipping tracking"`
 
 
-**Spam-Aggregator (P2P Broadcasting and Aggregation)**:
+**Spam-Aggregator (Redis Queue-Based Broadcasting and Aggregation)**:
 ```bash
-./dsv.sh spam-aggregator-logs | grep -iE "(broadcasting|received|aggregated.*report|generated.*report|📢|📨)"
+./dsv.sh spam-aggregator-logs | grep -iE "(queued|received|aggregated.*report|generated.*report|📨|waiting.*seconds|checking consensus)"
 ```
 Look for:
-- **Broadcasting reports** (INFO level):
-  - `"📢 Broadcasted spam report for peer {peerID} (violation: {type}, count: {N})"` (from reporter)
-  - `"Broadcasted local spam report for peer {peerID} epoch {epochID}"` (DEBUG level, from aggregator)
-- **Receiving reports** (INFO level):
-  - `"📨 Received spam report from validator {validatorID} for peer {peerID} epoch {epochID}"` (when report received from another validator)
+- **Queuing reports for broadcasting** (DEBUG level):
+  - `"Queued local spam report for broadcasting for peer {peerID} epoch {epochID}"` (from aggregator)
+  - `"📢 Broadcasted spam report for peer {peerID} (violation: {type}, count: {N})"` (from reporter, queues to Redis)
+- **Receiving reports from Redis queue** (INFO level):
+  - `"📨 Received spam report from validator {validatorID} for peer {peerID} epoch {epochID}"` (when report received from another validator via Redis queue)
 - **Processing reports** (INFO level):
-  - `"Aggregated spam report for peer {peerID} (window {windowID}, validators: {N})"` (after processing received report)
+  - `"Atomically aggregated spam report for peer {peerID} (window {windowID}, validators: {N})"` (after processing received report)
 - **Generating local reports** (DEBUG level):
   - `"Generated local spam report for peer {peerID} epoch {epochID}"`
 - **Window aggregation**:
   - `"Aggregated local data for window {windowID}: {peerCount} peers, {reportCount} reports"`
+- **Consensus checking with delay**:
+  - `"Waiting 10 seconds for validator reports before checking consensus for window {windowID}"`
+  - `"Checking consensus for window {windowID} after 10-second delay"`
 
 **P2P Gateway (Enforcement)**:
 ```bash
@@ -581,6 +587,10 @@ These are hardcoded for consensus consistency:
 - `SPAM_AGGREGATION_WINDOW_SIZE = 10` (epochs per aggregation window)
 
 **Window Creation**: Windows are created at epochs where `epochID % 10 == 0` (epochs 10, 20, 30, etc.)
+
+**Consensus Checking with Delay**: After window creation at epoch boundary, the system waits 10 seconds before checking consensus. This delay ensures all validators' spam reports have time to arrive via P2P and be aggregated before consensus decisions are made. Look for log messages:
+- `"Waiting 10 seconds for validator reports before checking consensus for window {windowID}"`
+- `"Checking consensus for window {windowID} after 10-second delay"`
 
 ## Troubleshooting
 

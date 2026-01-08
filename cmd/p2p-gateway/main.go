@@ -17,8 +17,8 @@ import (
 	"github.com/powerloom/snapshot-sequencer-validator/pkgs/events"
 	"github.com/powerloom/snapshot-sequencer-validator/pkgs/metrics"
 	"github.com/powerloom/snapshot-sequencer-validator/pkgs/p2p"
-	"github.com/powerloom/snapshot-sequencer-validator/pkgs/spam"
 	rediskeys "github.com/powerloom/snapshot-sequencer-validator/pkgs/redis"
+	"github.com/powerloom/snapshot-sequencer-validator/pkgs/spam"
 	"github.com/powerloom/snapshot-sequencer-validator/pkgs/utils"
 	"github.com/redis/go-redis/v9"
 	"github.com/sirupsen/logrus"
@@ -209,11 +209,13 @@ type P2PGateway struct {
 	submissionSub *pubsub.Subscription
 	batchSub      *pubsub.Subscription
 	presenceSub   *pubsub.Subscription
+	spamReportSub *pubsub.Subscription
 
 	// Topic handlers
 	submissionTopic *pubsub.Topic
 	batchTopic      *pubsub.Topic
 	presenceTopic   *pubsub.Topic
+	spamReportTopic *pubsub.Topic
 
 	// Event and metrics
 	eventEmitter    *events.Emitter
@@ -225,8 +227,8 @@ type P2PGateway struct {
 	submissionWorkers int                         // Number of worker goroutines
 
 	// Spam protection components
-	whitelist           *spam.PeerWhitelist
-	flagging            *spam.FlaggingService
+	whitelist            *spam.PeerWhitelist
+	flagging             *spam.FlaggingService
 	enableSpamProtection bool
 }
 
@@ -341,19 +343,19 @@ func NewP2PGateway(cfg *config.Settings) (*P2PGateway, error) {
 	}
 
 	gateway := &P2PGateway{
-		ctx:                 ctx,
-		cancel:              cancel,
-		p2pHost:             p2pHost,
-		redisClient:         redisClient,
-		keyBuilder:          keyBuilder,
-		config:              cfg,
-		eventEmitter:        eventEmitter,
-		eventPublisher:      eventPublisher,
-		metricsRegistry:     metricsRegistry,
-		submissionMsgChan:   submissionMsgChan,
-		submissionWorkers:   submissionWorkers,
-		whitelist:           whitelist,
-		flagging:            flagging,
+		ctx:                  ctx,
+		cancel:               cancel,
+		p2pHost:              p2pHost,
+		redisClient:          redisClient,
+		keyBuilder:           keyBuilder,
+		config:               cfg,
+		eventEmitter:         eventEmitter,
+		eventPublisher:       eventPublisher,
+		metricsRegistry:      metricsRegistry,
+		submissionMsgChan:    submissionMsgChan,
+		submissionWorkers:    submissionWorkers,
+		whitelist:            whitelist,
+		flagging:             flagging,
 		enableSpamProtection: enableSpamProtection,
 	}
 
@@ -433,6 +435,26 @@ func (g *P2PGateway) setupTopics() error {
 		return fmt.Errorf("failed to subscribe to presence topic: %w", err)
 	}
 	log.Infof("📡 Subscribed to topic: %s", g.config.GossipsubValidatorPresenceTopic)
+
+	// Spam report topic (validator-only)
+	if g.config.EnableSpamProtection && g.config.EnableSpamReportBroadcast {
+		spamReportTopicName := g.config.GetSpamReportTopic()
+		spamTopic, err := g.p2pHost.Pubsub.Join(spamReportTopicName)
+		if err != nil {
+			return fmt.Errorf("failed to join spam report topic: %w", err)
+		}
+		g.spamReportTopic = spamTopic
+
+		g.spamReportSub, err = spamTopic.Subscribe()
+		if err != nil {
+			return fmt.Errorf("failed to subscribe to spam report topic: %w", err)
+		}
+		log.Infof("📡 Subscribed to spam report topic: %s", spamReportTopicName)
+
+		// Start handlers for spam reports
+		go g.handleIncomingSpamReports()
+		go g.handleOutgoingSpamReports()
+	}
 
 	log.Info("P2P Gateway: Subscribed to all topics")
 	return nil
@@ -915,12 +937,12 @@ func (g *P2PGateway) queueSubmission(msg *pubsub.Message, topicName string) {
 			counter.Inc()
 		}
 
-			// Emit queue depth change event
-			queuePayload, _ := json.Marshal(map[string]interface{}{
-				"queue_name":     "submission",
-				"current_depth":  int(queueDepthBefore) + 1,
-				"previous_depth": int(queueDepthBefore),
-			})
+		// Emit queue depth change event
+		queuePayload, _ := json.Marshal(map[string]interface{}{
+			"queue_name":     "submission",
+			"current_depth":  int(queueDepthBefore) + 1,
+			"previous_depth": int(queueDepthBefore),
+		})
 		if err := g.eventEmitter.Emit(&events.Event{
 			Type:      events.EventQueueDepthChanged,
 			Severity:  events.SeverityDebug,
@@ -1222,6 +1244,80 @@ func (g *P2PGateway) handleOutgoingMessages() {
 			} else {
 				epochID := msg["epochId"]
 				log.WithField("epoch", utils.FormatEpochID(epochID)).Info("P2P Gateway: Broadcast batch to network")
+			}
+		}
+	}
+}
+
+// handleOutgoingSpamReports reads spam reports from Redis queue and broadcasts them
+func (g *P2PGateway) handleOutgoingSpamReports() {
+	if !g.config.EnableSpamProtection || !g.config.EnableSpamReportBroadcast {
+		return
+	}
+
+	broadcastQueueKey := g.keyBuilder.OutgoingSpamReports()
+	for {
+		select {
+		case <-g.ctx.Done():
+			return
+		default:
+			result, err := g.redisClient.BRPop(g.ctx, time.Second, broadcastQueueKey).Result()
+			if err != nil {
+				if err == redis.Nil {
+					// Timeout - continue
+					continue
+				}
+				if g.ctx.Err() != nil {
+					return
+				}
+				log.WithError(err).Debug("Error reading from spam reports queue")
+				continue
+			}
+
+			if len(result) >= 2 {
+				// Broadcast spam report via Gossipsub
+				reportData := []byte(result[1])
+				if err := g.spamReportTopic.Publish(g.ctx, reportData); err != nil {
+					log.WithError(err).Error("Failed to broadcast spam report")
+				} else {
+					log.Debug("Broadcasted spam report via Gossipsub")
+				}
+			}
+		}
+	}
+}
+
+// handleIncomingSpamReports receives spam reports from Gossipsub and queues them for spam-aggregator
+func (g *P2PGateway) handleIncomingSpamReports() {
+	if !g.config.EnableSpamProtection || !g.config.EnableSpamReportBroadcast {
+		return
+	}
+
+	for {
+		select {
+		case <-g.ctx.Done():
+			return
+		default:
+			msg, err := g.spamReportSub.Next(g.ctx)
+			if err != nil {
+				if g.ctx.Err() != nil {
+					return
+				}
+				log.WithError(err).Error("Error reading spam report message")
+				continue
+			}
+
+			// Ignore self-messages (same peer ID)
+			if msg.ReceivedFrom == g.p2pHost.Host.ID() {
+				continue
+			}
+
+			// Write to Redis queue for spam-aggregator to process
+			incomingQueueKey := g.keyBuilder.IncomingSpamReports()
+			if err := g.redisClient.LPush(g.ctx, incomingQueueKey, msg.Data).Err(); err != nil {
+				log.WithError(err).Error("Failed to queue incoming spam report")
+			} else {
+				log.Debug("Queued incoming spam report for spam-aggregator")
 			}
 		}
 	}
