@@ -41,7 +41,8 @@ If `/api/v1/spam/windows` returns empty, follow these steps:
 #   - enable_spam_protection: true
 #   - enable_spam_report_broadcast: true
 # - "Initialized spam aggregator with window size: 10 (Redis queue-based P2P)"
-# - "Initialized spam reporter (Redis queue-based broadcasting)"
+# - "Initialized spam reporter (Redis queue-based broadcasting with epoch batching)"
+# - "Initialized spam report window manager (collection window: {duration})"
 # - "✅ Spam protection components initialized" with component status:
 #   - aggregator_initialized: true (MUST be true)
 #   - reporter_initialized: true (MUST be true - uses Redis queues)
@@ -179,7 +180,9 @@ curl "http://localhost:9091/api/v1/spam/epochs?limit=20" | jq '.'
 ./dsv.sh spam-aggregator-logs | grep -iE "(queued.*spam report|received spam report|incoming.*spam|atomically aggregated)"
 
 # Look for:
-# - "Queued local spam report for broadcasting for peer {peerID} epoch {epochID}"
+# - "Stored spam report for peer {peerID} epoch {epochID} (will be sent after collection window)"
+# - "Started spam report collection window for epoch {epochID}"
+# - "Sent {count} batched spam reports for epoch {epochID}"
 # - "📨 Received spam report from validator {validatorID} for peer {peerID} epoch {epochID}"
 # - "Atomically aggregated spam report for peer {peerID} (window {windowID}, validators: {count})"
 
@@ -489,7 +492,8 @@ Look for:
   - `enable_spam_protection: true`
   - `enable_spam_report_broadcast: true`
 - `"Initialized spam aggregator with window size: 10 (Redis queue-based P2P)"` (GOOD)
-- `"Initialized spam reporter (Redis queue-based broadcasting)"`
+- `"Initialized spam reporter (Redis queue-based broadcasting with epoch batching)"`
+- `"Initialized spam report window manager (collection window: {duration})"`
 - `"✅ Spam protection components initialized"` with:
   - `aggregator_initialized: true` (MUST be true)
   - `reporter_initialized: true` (MUST be true - uses Redis queues)
@@ -531,9 +535,10 @@ Look for:
 ./dsv.sh spam-aggregator-logs | grep -iE "(queued|received|aggregated.*report|generated.*report|📨|waiting.*seconds|checking consensus)"
 ```
 Look for:
-- **Queuing reports for broadcasting** (DEBUG level):
-  - `"Queued local spam report for broadcasting for peer {peerID} epoch {epochID}"` (from aggregator)
-  - `"📢 Broadcasted spam report for peer {peerID} (violation: {type}, count: {N})"` (from reporter, queues to Redis)
+- **Storing reports for batching** (DEBUG level):
+  - `"Stored spam report for peer {peerID} epoch {epochID} (will be sent after collection window)"` (from reporter)
+  - `"Started spam report collection window for epoch {epochID}"` (from window manager)
+  - `"Sent {count} batched spam reports for epoch {epochID}"` (from window manager after collection window)
 - **Receiving reports from Redis queue** (INFO level):
   - `"📨 Received spam report from validator {validatorID} for peer {peerID} epoch {epochID}"` (when report received from another validator via Redis queue)
 - **Processing reports** (INFO level):

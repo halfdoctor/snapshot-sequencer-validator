@@ -26,38 +26,41 @@ type SpamReport struct {
 
 // SpamReporter broadcasts spam reports to the validator mesh via Redis queue
 type SpamReporter struct {
-	redisClient *redis.Client
-	keyBuilder  *redislib.KeyBuilder
-	tracker     *SpamTracker
-	whitelist   *PeerWhitelist
-	reporterID  string
-	aggregator  *SpamAggregator
+	redisClient   *redis.Client
+	keyBuilder    *redislib.KeyBuilder
+	tracker       *SpamTracker
+	whitelist     *PeerWhitelist
+	reporterID    string
+	aggregator    *SpamAggregator
+	windowManager *SpamReportWindowManager
 }
 
 // NewSpamReporter creates a new SpamReporter instance
-func NewSpamReporter(redisClient *redis.Client, keyBuilder *redislib.KeyBuilder, tracker *SpamTracker, whitelist *PeerWhitelist, reporterID string) *SpamReporter {
+func NewSpamReporter(redisClient *redis.Client, keyBuilder *redislib.KeyBuilder, tracker *SpamTracker, whitelist *PeerWhitelist, reporterID string, windowManager *SpamReportWindowManager) *SpamReporter {
 	return &SpamReporter{
-		redisClient: redisClient,
-		keyBuilder:  keyBuilder,
-		tracker:     tracker,
-		whitelist:   whitelist,
-		reporterID:  reporterID,
+		redisClient:   redisClient,
+		keyBuilder:    keyBuilder,
+		tracker:       tracker,
+		whitelist:     whitelist,
+		reporterID:    reporterID,
+		windowManager: windowManager,
 	}
 }
 
 // NewSpamReporterWithAggregator creates a new SpamReporter with aggregator for direct injection
-func NewSpamReporterWithAggregator(redisClient *redis.Client, keyBuilder *redislib.KeyBuilder, tracker *SpamTracker, whitelist *PeerWhitelist, reporterID string, aggregator *SpamAggregator) *SpamReporter {
+func NewSpamReporterWithAggregator(redisClient *redis.Client, keyBuilder *redislib.KeyBuilder, tracker *SpamTracker, whitelist *PeerWhitelist, reporterID string, aggregator *SpamAggregator, windowManager *SpamReportWindowManager) *SpamReporter {
 	return &SpamReporter{
-		redisClient: redisClient,
-		keyBuilder:  keyBuilder,
-		tracker:     tracker,
-		whitelist:   whitelist,
-		reporterID:  reporterID,
-		aggregator:  aggregator,
+		redisClient:   redisClient,
+		keyBuilder:    keyBuilder,
+		tracker:       tracker,
+		whitelist:     whitelist,
+		reporterID:    reporterID,
+		aggregator:    aggregator,
+		windowManager: windowManager,
 	}
 }
 
-// ReportSpam creates and broadcasts a spam report if thresholds are exceeded
+// ReportSpam stores a spam report in Redis for batching (will be sent after collection window)
 func (r *SpamReporter) ReportSpam(ctx context.Context, peerID, snapshotterAddr string, epochID uint64, violationType string, count int, evidence []string) error {
 	// Skip reporting if peer is whitelisted
 	if r.whitelist != nil && r.whitelist.IsWhitelisted(peerID) {
@@ -76,21 +79,9 @@ func (r *SpamReporter) ReportSpam(ctx context.Context, peerID, snapshotterAddr s
 		Timestamp:       time.Now().Unix(),
 	}
 
-	// Marshal report
-	data, err := json.Marshal(report)
-	if err != nil {
-		return fmt.Errorf("failed to marshal spam report: %w", err)
-	}
-
-	// Inject directly into aggregator (Gossipsub doesn't deliver self-messages)
-	if r.aggregator != nil {
-		go r.aggregator.processSpamReportDirect(data)
-	}
-
-	// Queue report for broadcasting via p2p-gateway
-	broadcastQueue := r.keyBuilder.OutgoingSpamReports()
-	if err := r.redisClient.LPush(ctx, broadcastQueue, data).Err(); err != nil {
-		return fmt.Errorf("failed to queue spam report for broadcasting: %w", err)
+	// Store report in Redis for batching (will be sent after collection window)
+	if err := r.storePendingReport(ctx, epochID, report); err != nil {
+		return fmt.Errorf("failed to store pending spam report: %w", err)
 	}
 
 	log.WithFields(log.Fields{
@@ -100,7 +91,41 @@ func (r *SpamReporter) ReportSpam(ctx context.Context, peerID, snapshotterAddr s
 		"epoch_id":         epochID,
 		"count":            count,
 		"reporter_id":      r.reporterID,
-	}).Infof("📢 Broadcasted spam report for peer %s (violation: %s, count: %d)", peerID, violationType, count)
+	}).Debugf("Stored spam report for peer %s epoch %d (will be sent after collection window)", peerID, epochID)
+
+	return nil
+}
+
+// storePendingReport stores a report in Redis LIST for deterministic collection
+func (r *SpamReporter) storePendingReport(ctx context.Context, epochID uint64, report *SpamReport) error {
+	// Marshal report
+	data, err := json.Marshal(report)
+	if err != nil {
+		return fmt.Errorf("failed to marshal spam report: %w", err)
+	}
+
+	// Get data market from key builder (needed for Redis key)
+	// Note: The key builder may have a default data market, but reports are per-epoch
+	// We need to get the data market from the key builder's current state
+	dataMarket := r.keyBuilder.DataMarket
+	if dataMarket == "" {
+		// If data market is not set in key builder, we can't store the report
+		// This should not happen in normal operation, but log a warning
+		log.Warnf("Data market not set in key builder, cannot store spam report for epoch %d", epochID)
+		return fmt.Errorf("data market not set in key builder")
+	}
+
+	// Store in Redis LIST (deterministic collection, like submissions)
+	// Use the same key format as window manager
+	pendingKey := fmt.Sprintf("%s:%s:spam:reports:pending:epoch:%d", r.keyBuilder.ProtocolState, dataMarket, epochID)
+	if err := r.redisClient.LPush(ctx, pendingKey, data).Err(); err != nil {
+		return fmt.Errorf("failed to store pending report in Redis: %w", err)
+	}
+
+	// Set TTL on the key (2 hours, matches aggregation window TTL)
+	if err := r.redisClient.Expire(ctx, pendingKey, 2*time.Hour).Err(); err != nil {
+		log.Debugf("Failed to set TTL on pending reports key: %v", err)
+	}
 
 	return nil
 }
@@ -153,6 +178,11 @@ func (r *SpamReporter) CheckAndReport(ctx context.Context, peerID, snapshotterAd
 		}
 	}
 
-	// Report spam
+	// Report spam (will be stored in Redis and sent after collection window)
 	return r.ReportSpam(ctx, peerID, snapshotterAddr, epochID, violationType, count, evidence)
+}
+
+// GetWindowManager returns the window manager (for use by event monitor)
+func (r *SpamReporter) GetWindowManager() *SpamReportWindowManager {
+	return r.windowManager
 }

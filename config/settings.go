@@ -62,6 +62,11 @@ type Settings struct {
 	MaxConcurrentWindows    int
 	WindowCleanupInterval   time.Duration
 
+	// Spam Report Collection Window Configuration
+	// Duration to wait after epoch release before sending batched spam reports
+	// Default: Level1FinalizationDelay + 10 seconds
+	SpamReportCollectionWindow time.Duration
+
 	// Event Monitoring
 	EventPollInterval   time.Duration
 	EventStartBlock     uint64
@@ -223,6 +228,9 @@ func LoadConfig() error {
 		Level1FinalizationDelay: time.Duration(getEnvAsInt("LEVEL1_FINALIZATION_DELAY_SECONDS", 10)) * time.Second,
 		MaxConcurrentWindows:    getEnvAsInt("MAX_CONCURRENT_WINDOWS", 100),
 		WindowCleanupInterval:   5 * time.Minute,
+
+		// Spam Report Collection Window: level1_delay + 10 seconds
+		SpamReportCollectionWindow: time.Duration(getEnvAsInt("LEVEL1_FINALIZATION_DELAY_SECONDS", 10))*time.Second + 10*time.Second,
 
 		// Event Monitoring
 		EventPollInterval:   time.Duration(getEnvAsInt("EVENT_POLL_INTERVAL", 12)) * time.Second,

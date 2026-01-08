@@ -2,6 +2,7 @@ package spam
 
 import (
 	"context"
+	"time"
 
 	"github.com/powerloom/snapshot-sequencer-validator/config"
 	redislib "github.com/powerloom/snapshot-sequencer-validator/pkgs/redis"
@@ -45,12 +46,25 @@ func InitializeSpamProtection(ctx context.Context, cfg *config.Settings, redisCl
 	aggregator.Start()
 	log.Infof("Initialized spam aggregator with window size: %d (Redis queue-based P2P)", DEFAULT_AGGREGATION_WINDOW_SIZE)
 
+	// Initialize spam report window manager (for batching reports per epoch)
+	var windowManager *SpamReportWindowManager
+	if cfg.EnableSpamReportBroadcast {
+		collectionWindowDuration := cfg.SpamReportCollectionWindow
+		if collectionWindowDuration == 0 {
+			// Default: level1_delay + 10 seconds
+			collectionWindowDuration = cfg.Level1FinalizationDelay + 10*time.Second
+		}
+		windowManager = NewSpamReportWindowManager(ctx, redisClient, keyBuilder, collectionWindowDuration, aggregator)
+		log.Infof("Initialized spam report window manager (collection window: %v)", collectionWindowDuration)
+	}
+
 	// Initialize spam reporter (if broadcast enabled)
 	// Pass aggregator so it can inject reports directly (Gossipsub doesn't deliver self-messages)
+	// Pass window manager for batching reports per epoch
 	var reporter *SpamReporter
 	if cfg.EnableSpamReportBroadcast {
-		reporter = NewSpamReporterWithAggregator(redisClient, keyBuilder, tracker, whitelist, sequencerID, aggregator)
-		log.Infof("Initialized spam reporter (Redis queue-based broadcasting)")
+		reporter = NewSpamReporterWithAggregator(redisClient, keyBuilder, tracker, whitelist, sequencerID, aggregator, windowManager)
+		log.Infof("Initialized spam reporter (Redis queue-based broadcasting with epoch batching)")
 	}
 
 	// TODO: Initialize state sync service (if enabled)

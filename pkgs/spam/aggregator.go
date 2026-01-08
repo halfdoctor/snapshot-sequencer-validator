@@ -841,24 +841,10 @@ func (a *SpamAggregator) CreateWindowAndAggregateLocalData(ctx context.Context, 
 						"epoch_id":       epoch,
 						"violation_type": violationType,
 						"count":          count,
-					}).Debugf("Generated local spam report for peer %s epoch %d", peerID, epoch)
+					}).Debugf("Generated local spam report for peer %s epoch %d (will be sent via collection window)", peerID, epoch)
 
-					// Queue report for broadcasting via p2p-gateway
-					reportData, err := json.Marshal(report)
-					if err != nil {
-						log.Warnf("Failed to marshal spam report for broadcasting: %v", err)
-					} else {
-						broadcastQueue := a.keyBuilder.OutgoingSpamReports()
-						if err := a.redisClient.LPush(a.ctx, broadcastQueue, reportData).Err(); err != nil {
-							log.Warnf("Failed to queue spam report for broadcasting for peer %s epoch %d: %v", peerID, epoch, err)
-						} else {
-							log.WithFields(log.Fields{
-								"peer_id":        peerID,
-								"epoch_id":       epoch,
-								"violation_type": violationType,
-							}).Debugf("Queued local spam report for broadcasting for peer %s epoch %d", peerID, epoch)
-						}
-					}
+					// Note: Reports are stored in Redis by SpamReporter and sent after collection window
+					// No immediate broadcasting here - batching happens per epoch via SpamReportWindowManager
 				}
 			}
 		}

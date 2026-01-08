@@ -934,6 +934,47 @@ func (m *EventMonitor) handleEpochReleased(event *EpochReleasedEvent) {
 		}
 	}
 
+	// Start spam report collection window (if spam protection enabled)
+	// This window batches all spam reports for the epoch and sends them after collection window
+	// Collection window: LEVEL1_FINALIZATION_DELAY_SECONDS + 10 seconds
+	if m.spamComponents != nil {
+		scValue := reflect.ValueOf(m.spamComponents)
+		if scValue.Kind() == reflect.Ptr && !scValue.IsNil() {
+			reporterField := scValue.Elem().FieldByName("Reporter")
+			if reporterField.IsValid() && !reporterField.IsNil() {
+				// Get window manager from reporter using reflection
+				getWindowManagerMethod := reporterField.MethodByName("GetWindowManager")
+				if getWindowManagerMethod.IsValid() {
+					results := getWindowManagerMethod.Call([]reflect.Value{})
+					if len(results) > 0 && !results[0].IsNil() {
+						windowManager := results[0]
+						// Call StartReportCollectionWindow using reflection
+						startWindowMethod := windowManager.MethodByName("StartReportCollectionWindow")
+						if startWindowMethod.IsValid() {
+							// Convert timestamp from Unix seconds to time.Time
+							releaseTime := time.Unix(int64(event.Timestamp), 0)
+							epochIDInt := event.EpochID.Uint64()
+							ctxVal := reflect.ValueOf(m.ctx)
+							dataMarketVal := reflect.ValueOf(dataMarketAddr)
+							epochVal := reflect.ValueOf(epochIDInt)
+							releaseTimeVal := reflect.ValueOf(releaseTime)
+							callResults := startWindowMethod.Call([]reflect.Value{ctxVal, dataMarketVal, epochVal, releaseTimeVal})
+							if len(callResults) > 0 && !callResults[0].IsNil() {
+								if err, ok := callResults[0].Interface().(error); ok && err != nil {
+									log.Debugf("Failed to start spam report collection window for epoch %d: %v", epochIDInt, err)
+								} else {
+									log.Debugf("Started spam report collection window for epoch %d", epochIDInt)
+								}
+							} else {
+								log.Debugf("Started spam report collection window for epoch %d", epochIDInt)
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
 	// Start submission window - this window is for collecting snapshot CIDs from snapshotter nodes
 	// Window closes when Level 1 finalization should begin
 	// Duration varies by contract type:
