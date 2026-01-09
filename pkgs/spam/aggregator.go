@@ -121,8 +121,9 @@ type SpamAggregator struct {
 	whitelist             *PeerWhitelist
 	windowSize            int
 	flagging              *FlaggingService
-	sequencerID           string // Validator/sequencer ID for generating local reports
-	updateReportScriptSha string // SHA1 hash of Lua script for atomic updates
+	sequencerID           string        // Validator/sequencer ID for generating local reports
+	updateReportScriptSha string        // SHA1 hash of Lua script for atomic updates
+	reporter              *SpamReporter // Reporter for storing generated reports (optional)
 }
 
 // AggregatedReport represents aggregated spam reports for a peer in a window
@@ -167,6 +168,11 @@ func (a *SpamAggregator) SetSequencerID(sequencerID string) {
 	a.sequencerID = sequencerID
 }
 
+// SetReporter sets the reporter for storing generated reports
+func (a *SpamAggregator) SetReporter(reporter *SpamReporter) {
+	a.reporter = reporter
+}
+
 // loadLuaScripts loads Lua scripts into Redis and stores their SHA hashes
 func (a *SpamAggregator) loadLuaScripts(ctx context.Context) error {
 	sha, err := a.redisClient.ScriptLoad(ctx, updateAggregatedReportScript).Result()
@@ -208,6 +214,18 @@ func (a *SpamAggregator) handleIncomingSpamReports() {
 			}
 
 			if len(result) >= 2 {
+				// Parse report for logging before processing
+				var report SpamReport
+				if err := json.Unmarshal([]byte(result[1]), &report); err == nil {
+					log.WithFields(log.Fields{
+						"peer_id":        report.PeerID,
+						"epoch_id":       report.EpochID,
+						"violation_type": report.ViolationType,
+						"count":          report.Count,
+						"reporter_id":    report.ReporterID,
+					}).Infof("📥 Received spam report from queue: peer=%s epoch=%d violation=%s count=%d reporter=%s", report.PeerID, report.EpochID, report.ViolationType, report.Count, report.ReporterID)
+				}
+
 				// Process result[1] as spam report JSON
 				go a.processSpamReportDirect([]byte(result[1]))
 			}
@@ -216,6 +234,9 @@ func (a *SpamAggregator) handleIncomingSpamReports() {
 }
 
 // processSpamReportDirect processes a single spam report (can be called directly or from Redis queue)
+// This processes reports IMMEDIATELY when received - there is no collection window delay for incoming reports.
+// The collection window (LEVEL1_FINALIZATION_DELAY_SECONDS + 10 seconds) only applies to when WE send OUR reports.
+// Incoming reports from other validators are processed immediately into aggregation windows.
 func (a *SpamAggregator) processSpamReportDirect(data []byte) {
 	var report SpamReport
 	if err := json.Unmarshal(data, &report); err != nil {

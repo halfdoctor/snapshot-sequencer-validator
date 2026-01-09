@@ -20,8 +20,10 @@ type SpamReportWindowManager struct {
 	redisClient              *redis.Client
 	keyBuilder               *redislib.KeyBuilder
 	collectionWindowDuration time.Duration // level1_delay + 10s
+	consensusDelayDuration   time.Duration // Additional delay after sending reports for other validators' reports to arrive
 	aggregator               *SpamAggregator
 	ctx                      context.Context
+	onConsensusCheck         func(epochID uint64) // Callback to trigger consensus check (optional)
 }
 
 // ReportWindow represents an active report collection window for an epoch
@@ -34,15 +36,21 @@ type ReportWindow struct {
 }
 
 // NewSpamReportWindowManager creates a new SpamReportWindowManager
-func NewSpamReportWindowManager(ctx context.Context, redisClient *redis.Client, keyBuilder *redislib.KeyBuilder, collectionWindowDuration time.Duration, aggregator *SpamAggregator) *SpamReportWindowManager {
+func NewSpamReportWindowManager(ctx context.Context, redisClient *redis.Client, keyBuilder *redislib.KeyBuilder, collectionWindowDuration time.Duration, consensusDelayDuration time.Duration, aggregator *SpamAggregator) *SpamReportWindowManager {
 	return &SpamReportWindowManager{
 		activeWindows:            make(map[string]*ReportWindow),
 		redisClient:              redisClient,
 		keyBuilder:               keyBuilder,
 		collectionWindowDuration: collectionWindowDuration,
+		consensusDelayDuration:   consensusDelayDuration,
 		aggregator:               aggregator,
 		ctx:                      ctx,
 	}
+}
+
+// SetConsensusCheckCallback sets the callback function to trigger consensus checking
+func (m *SpamReportWindowManager) SetConsensusCheckCallback(callback func(epochID uint64)) {
+	m.onConsensusCheck = callback
 }
 
 // StartReportCollectionWindow starts a collection window timer for an epoch
@@ -145,6 +153,25 @@ func (m *SpamReportWindowManager) closeReportWindow(dataMarket string, epochID u
 
 	// Clean up Redis key
 	m.cleanupPendingReportsKey(dataMarket, epochID)
+
+	// Schedule consensus check after additional delay to allow other validators' reports to arrive
+	// This delay is AFTER the collection window, giving time for reports from other validators
+	// who also waited for their collection window to complete
+	if m.onConsensusCheck != nil && m.consensusDelayDuration > 0 {
+		// Check if this is a window boundary epoch (epochID % 10 == 0)
+		// Consensus checking only happens at window boundaries
+		if epochID%10 == 0 {
+			log.WithFields(log.Fields{
+				"epoch_id":        epochID,
+				"consensus_delay": m.consensusDelayDuration,
+			}).Infof("⏳ Scheduling consensus check for window %d after %v delay (waiting for other validators' reports)", epochID, m.consensusDelayDuration)
+			go func(epID uint64) {
+				time.Sleep(m.consensusDelayDuration)
+				log.Infof("🔍 Checking consensus for window %d after %v delay", epID, m.consensusDelayDuration)
+				m.onConsensusCheck(epID)
+			}(epochID)
+		}
+	}
 }
 
 // collectPendingReports collects all pending reports for an epoch from Redis
@@ -176,6 +203,9 @@ func (m *SpamReportWindowManager) collectPendingReports(dataMarket string, epoch
 }
 
 // batchSendReports sends all reports together via Redis queue and direct aggregator injection
+// Note: Reports are "batched" in time (sent together after collection window), but each report
+// is still sent as a separate message. This is intentional - each report is for a different
+// peer/epoch/violation and needs to be processed individually by the aggregator.
 func (m *SpamReportWindowManager) batchSendReports(reports []*SpamReport) error {
 	broadcastQueue := m.keyBuilder.OutgoingSpamReports()
 	sentCount := 0
@@ -189,15 +219,33 @@ func (m *SpamReportWindowManager) batchSendReports(reports []*SpamReport) error 
 		}
 
 		// Inject directly into aggregator (Gossipsub doesn't deliver self-messages)
+		// This ensures our own reports are aggregated locally even though we broadcast them
 		if m.aggregator != nil {
 			go m.aggregator.processSpamReportDirect(data)
 		}
 
+		// Also queue to IncomingSpamReports so spam-aggregator service can process it
+		// (spam-aggregator service has its own aggregator instance)
+		incomingQueue := m.keyBuilder.IncomingSpamReports()
+		if err := m.redisClient.LPush(m.ctx, incomingQueue, data).Err(); err != nil {
+			log.Warnf("Failed to queue spam report to incoming queue for spam-aggregator: %v", err)
+		}
+
 		// Queue report for broadcasting via p2p-gateway
+		// Each report is sent as a separate message (not combined into one batched message)
+		// because the aggregator processes them individually
 		if err := m.redisClient.LPush(m.ctx, broadcastQueue, data).Err(); err != nil {
 			log.Warnf("Failed to queue spam report for broadcasting: %v", err)
 			continue
 		}
+
+		log.WithFields(log.Fields{
+			"peer_id":        report.PeerID,
+			"epoch_id":       report.EpochID,
+			"violation_type": report.ViolationType,
+			"count":          report.Count,
+			"reporter_id":    report.ReporterID,
+		}).Debugf("Queued spam report for broadcasting: peer=%s epoch=%d violation=%s count=%d", report.PeerID, report.EpochID, report.ViolationType, report.Count)
 
 		sentCount++
 	}
@@ -205,7 +253,7 @@ func (m *SpamReportWindowManager) batchSendReports(reports []*SpamReport) error 
 	log.WithFields(log.Fields{
 		"total_reports": len(reports),
 		"sent_count":    sentCount,
-	}).Debugf("Batched and sent %d/%d spam reports", sentCount, len(reports))
+	}).Infof("✅ Sent %d batched spam reports for epoch (each report sent as separate message)", sentCount)
 
 	return nil
 }

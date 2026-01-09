@@ -1275,6 +1275,24 @@ func (g *P2PGateway) handleOutgoingSpamReports() {
 			}
 
 			if len(result) >= 2 {
+				// Parse report for logging
+				var report struct {
+					PeerID        string `json:"peer_id"`
+					EpochID       uint64 `json:"epoch_id"`
+					ViolationType string `json:"violation_type"`
+					Count         int    `json:"count"`
+					ReporterID    string `json:"reporter_id"`
+				}
+				if err := json.Unmarshal([]byte(result[1]), &report); err == nil {
+					log.WithFields(logrus.Fields{
+						"peer_id":        report.PeerID,
+						"epoch_id":       report.EpochID,
+						"violation_type": report.ViolationType,
+						"count":          report.Count,
+						"reporter_id":    report.ReporterID,
+					}).Infof("📤 Broadcasting spam report: peer=%s epoch=%d violation=%s count=%d reporter=%s", report.PeerID, report.EpochID, report.ViolationType, report.Count, report.ReporterID)
+				}
+
 				// Broadcast spam report via Gossipsub
 				reportData := []byte(result[1])
 				if err := g.spamReportTopic.Publish(g.ctx, reportData); err != nil {

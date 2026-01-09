@@ -31,7 +31,7 @@ If `/api/v1/spam/windows` returns empty, follow these steps:
 **Spam-Aggregator Component** (Redis queue-based P2P):
 ```bash
 # Check initialization logs in spam-aggregator (Redis queue-based)
-./dsv.sh spam-aggregator-logs | grep -iE "(spam aggregator component starting|initializing spam|spam protection components initialized|redis queue|event monitor)"
+./dsv.sh spam-aggregator-logs | grep -iE "(spam aggregator component starting|initializing spam|spam protection components initialized|redis queue)"
 
 # Expected logs:
 # - "🛡️  SPAM AGGREGATOR COMPONENT STARTING"
@@ -42,11 +42,10 @@ If `/api/v1/spam/windows` returns empty, follow these steps:
 #   - enable_spam_report_broadcast: true
 # - "Initialized spam aggregator with window size: 10 (Redis queue-based P2P)"
 # - "Initialized spam reporter (Redis queue-based broadcasting with epoch batching)"
-# - "Initialized spam report window manager (collection window: {duration})"
+# - "Initialized spam report window manager (collection window: {duration}, consensus delay: {duration})"
 # - "✅ Spam protection components initialized" with component status:
 #   - aggregator_initialized: true (MUST be true)
 #   - reporter_initialized: true (MUST be true - uses Redis queues)
-# - "✅ Event monitor started (will trigger window aggregation at epoch boundaries)"
 ```
 
 **If spam-aggregator logs show errors:**
@@ -56,20 +55,6 @@ If `/api/v1/spam/windows` returns empty, follow these steps:
 - Check Redis queue keys: `{protocol}:{market}:outgoing:spam-reports` and `{protocol}:{market}:incoming:spam-reports`
 
 ### Step 1: Check if EventMonitor is Processing Epochs
-
-**Spam-Aggregator Component** (has its own event monitor):
-```bash
-# Check spam-aggregator logs for epoch releases and window creation
-./dsv.sh spam-aggregator-logs | grep -iE "(epoch.*released|epoch.*boundary|aggregation window|creating window|window.*aggregated)"
-
-# Look for these messages:
-# - "📅 Epoch {epochID} released for market {market} at block {block}"
-# - "Epoch {epochID} is an aggregation window boundary. Triggering local spam data aggregation."
-# - "Successfully created spam aggregation window for epoch {epochID}"
-# - "Waiting 10 seconds for validator reports before checking consensus for window {epochID}"
-# - "Checking consensus for window {epochID} after 10-second delay"
-# - "Queued local spam report for broadcasting for peer {peerID} epoch {epochID}"
-```
 
 **Event-Monitor Component** (triggers window aggregation at epoch boundaries):
 ```bash
@@ -84,8 +69,12 @@ If `/api/v1/spam/windows` returns empty, follow these steps:
 # - "Epoch {epochID} is an aggregation window boundary. Triggering local spam data aggregation."
 # - "Calling CreateWindowAndAggregateLocalData for epoch {epochID}"
 # - "Successfully created spam aggregation window for epoch {epochID}"
-# - "Waiting 10 seconds for validator reports before checking consensus for window {epochID}"
-# - "Checking consensus for window {epochID} after 10-second delay"
+# - "Started spam report collection window for epoch {epochID}"
+# - "⏱️ Spam report collection window closed for epoch {epochID}, collecting and sending reports"
+# - "✅ Sent {count} batched spam reports for epoch {epochID}"
+# - "⏳ Scheduling consensus check for window {epochID} after {duration} delay (waiting for other validators' reports)"
+# - "🔍 Checking consensus for window {epochID} after {duration} delay"
+# - "Checking consensus for window {epochID} after {duration}-second delay"
 
 # If you see warnings instead:
 # - "Spam components not initialized - skipping window creation" → Check spam component initialization
@@ -160,12 +149,14 @@ curl "http://localhost:9091/api/v1/spam/epochs?limit=20" | jq '.'
 # - "Successfully created spam aggregation window for epoch {epochID}" (GOOD)
 # - "Failed to create spam aggregation window at epoch boundary {epochID}: {error}" (BAD - check error)
 
-# Check spam-aggregator logs for actual window creation
-./dsv.sh spam-aggregator-logs | grep -iE "(Creating spam aggregation window|window.*aggregated)"
+# NOTE: Window creation logs appear in event-monitor logs, not spam-aggregator logs
+# Event-monitor calls CreateWindowAndAggregateLocalData on its own spam components instance
+# Check event-monitor logs for window creation details:
+./dsv.sh event-logs | grep -iE "(Creating spam aggregation window|Created spam aggregation window)"
 
-# Expected logs:
+# Expected logs in event-monitor:
 # - "Creating spam aggregation window {windowID} for epochs {start}-{end}"
-# - "Aggregated local data for window {windowID}: {peerCount} peers, {reportCount} reports"
+# - "Created spam aggregation window {windowID} with {peers_count} peers"
 ```
 
 **Check consensus checking (after 10-second delay)**:
@@ -174,20 +165,82 @@ curl "http://localhost:9091/api/v1/spam/epochs?limit=20" | jq '.'
 ./dsv.sh spam-aggregator-logs | grep -iE "(Checking consensus|consensus.*reached|flagged.*peer)"
 ```
 
-**Check Redis queue activity**:
+**Verify Local Aggregation and Broadcasting**:
+
+Since event-monitor handles window creation, verify aggregation and broadcasting separately:
+
+**1. Check if local reports are being generated** (in event-monitor/dequeuer):
 ```bash
-# Check if spam reports are being queued and processed
-./dsv.sh spam-aggregator-logs | grep -iE "(queued.*spam report|received spam report|incoming.*spam|atomically aggregated)"
+# Check for local report generation (DEBUG level)
+./dsv.sh event-logs | grep -iE "(Generated local spam report|shouldReport=true)"
+./dsv.sh dequeuer-logs | grep -iE "(Generated local spam report|shouldReport=true|spam check.*shouldReport=true)"
 
 # Look for:
-# - "Stored spam report for peer {peerID} epoch {epochID} (will be sent after collection window)"
-# - "Started spam report collection window for epoch {epochID}"
-# - "Sent {count} batched spam reports for epoch {epochID}"
-# - "📨 Received spam report from validator {validatorID} for peer {peerID} epoch {epochID}"
-# - "Atomically aggregated spam report for peer {peerID} (window {windowID}, validators: {count})"
+# - "Generated local spam report for peer {peerID} epoch {epochID}"
+# - "Spam check for peer {peerID} epoch {epochID}: shouldReport=true"
+```
 
+**2. Check if reports are being queued for broadcasting** (in event-monitor/dequeuer):
+```bash
+# Check for report storage and collection window activity
+./dsv.sh event-logs | grep -iE "(Stored spam report|Started spam report collection|Sent.*batched spam reports|collection window closed|Scheduling consensus check)"
+./dsv.sh dequeuer-logs | grep -iE "(Stored spam report|Started spam report collection|Sent.*batched spam reports)"
+
+# Look for:
+# - "Stored spam report for peer {peerID} epoch {epochID} (will be sent after collection window)" (DEBUG level)
+# - "⏰ Started spam report collection window for epoch {epochID} (will send reports after {delay})" (INFO level)
+# - "⏱️ Spam report collection window closed for epoch {epochID}, collecting and sending reports" (INFO level)
+# - "✅ Sent {count} batched spam reports for epoch {epochID}" (INFO level)
+# - "⏳ Scheduling consensus check for window {epochID} after {duration} delay" (INFO level, window boundaries only)
+```
+
+**3. Check Redis queues directly**:
+```bash
+# Replace {protocol} and {market} with your values
+PROTOCOL="0x3B5A0FB70ef68B5dd677C7d614dFB89961f97401"
+MARKET="0xb5cE2F9B71e785e3eC0C45EDE06Ad95c3bb71a4d"
+
+# Check outgoing queue (reports waiting to be broadcast)
+docker exec <redis-container> redis-cli LLEN "${PROTOCOL}:${MARKET}:outgoing:spam-reports"
+
+# Check incoming queue (reports received from other validators)
+docker exec <redis-container> redis-cli LLEN "${PROTOCOL}:${MARKET}:incoming:spam-reports"
+
+# If queues have items, spam-aggregator should be processing them
+```
+
+**4. Check spam-aggregator processing incoming reports**:
+```bash
+# Check if spam-aggregator is receiving and processing reports from Redis queue
+./dsv.sh spam-aggregator-logs | grep -iE "(📨 Received spam report|Atomically aggregated|Error reading from spam reports queue)"
+
+# Look for:
+# - "📨 Received spam report from validator {validatorID} for peer {peerID} epoch {epochID}" (INFO level)
+# - "Atomically aggregated spam report for peer {peerID} (window {windowID}, validators: {count})" (DEBUG level)
+# - "Error reading from spam reports queue" (ERROR level - indicates queue reading issues)
+
+# If no logs appear, spam-aggregator may not be receiving reports (check Redis queue above)
+```
+
+**5. Check p2p-gateway broadcasting**:
+```bash
 # Check p2p-gateway logs for spam report P2P operations
-./dsv.sh p2p-logs | grep -iE "(spam report|broadcasted spam|queued incoming spam)"
+./dsv.sh p2p-logs | grep -iE "(spam report|broadcasted spam|queued incoming spam|Broadcasted spam report)"
+
+# Look for:
+# - "Broadcasted spam report via Gossipsub" (DEBUG level)
+# - "Queued incoming spam report for spam-aggregator" (DEBUG level)
+# - "Failed to broadcast spam report" (ERROR level)
+```
+
+**6. Check if windows exist in Redis** (verifies aggregation happened):
+```bash
+# Check if windows were created
+curl "http://localhost:9091/api/v1/spam/windows" | jq '.windows[] | {window_id, epoch_range, peer_count}'
+
+# If windows exist but spam-aggregator shows no activity:
+# - Local aggregation happened (event-monitor created windows)
+# - But no reports were generated/broadcast (check steps 1-2 above)
 ```
 
 ## Monitoring API Endpoints
@@ -482,7 +535,7 @@ Look for:
 
 **Spam-Aggregator Component (Redis Queue-Based P2P)**:
 ```bash
-./dsv.sh spam-aggregator-logs | grep -i "spam aggregator component starting\|initializing spam\|redis queue\|event monitor"
+./dsv.sh spam-aggregator-logs | grep -i "spam aggregator component starting\|initializing spam\|redis queue"
 ```
 Look for:
 - `"🛡️  SPAM AGGREGATOR COMPONENT STARTING"`
@@ -493,11 +546,10 @@ Look for:
   - `enable_spam_report_broadcast: true`
 - `"Initialized spam aggregator with window size: 10 (Redis queue-based P2P)"` (GOOD)
 - `"Initialized spam reporter (Redis queue-based broadcasting with epoch batching)"`
-- `"Initialized spam report window manager (collection window: {duration})"`
+- `"Initialized spam report window manager (collection window: {duration}, consensus delay: {duration})"`
 - `"✅ Spam protection components initialized"` with:
   - `aggregator_initialized: true` (MUST be true)
   - `reporter_initialized: true` (MUST be true - uses Redis queues)
-- `"✅ Event monitor started (will trigger window aggregation at epoch boundaries)"`
 
 **P2P Gateway (Early Rejection)**:
 ```bash
@@ -506,17 +558,24 @@ Look for:
 Look for:
 - `"Initialized spam protection: whitelist ({N} full nodes, {M} bulk service), flagging service"`
 
-**Spam-Aggregator EventMonitor (Window Creation)**:
+**Event-Monitor Component (Window Creation)**:
 ```bash
-./dsv.sh spam-aggregator-logs | grep -iE "(aggregation window|epoch.*boundary|creating window|window.*aggregated)"
+./dsv.sh event-logs | grep -iE "(aggregation window|epoch.*boundary|creating window|window.*aggregated|EpochReleased)"
 ```
 Look for:
 - `"📅 Epoch {epochID} released for market {market} at block {block}"`
 - `"Epoch {epochID} is an aggregation window boundary. Triggering local spam data aggregation."`
+- `"Calling CreateWindowAndAggregateLocalData for epoch {epochID}"`
 - `"Successfully created spam aggregation window for epoch {epochID}"` (GOOD)
-- `"Aggregated local data for window {windowID}: {peerCount} peers, {reportCount} reports"`
 - `"Failed to create spam aggregation window at epoch boundary {epochID}: {error}"` (BAD - check error)
 - `"Spam components not initialized - skipping window creation"` (BAD - check initialization)
+
+**Spam-Aggregator Component (Window Aggregation)**:
+```bash
+./dsv.sh spam-aggregator-logs | grep -iE "(aggregated.*window|window.*aggregated|creating window)"
+```
+Look for:
+- `"Aggregated local data for window {windowID}: {peerCount} peers, {reportCount} reports"`
 
 **Dequeuer (DDoS Protection Tracking)**:
 ```bash

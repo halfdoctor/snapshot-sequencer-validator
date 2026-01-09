@@ -54,8 +54,13 @@ func InitializeSpamProtection(ctx context.Context, cfg *config.Settings, redisCl
 			// Default: level1_delay + 10 seconds
 			collectionWindowDuration = cfg.Level1FinalizationDelay + 10*time.Second
 		}
-		windowManager = NewSpamReportWindowManager(ctx, redisClient, keyBuilder, collectionWindowDuration, aggregator)
-		log.Infof("Initialized spam report window manager (collection window: %v)", collectionWindowDuration)
+		consensusDelayDuration := cfg.SpamReportConsensusDelay
+		if consensusDelayDuration == 0 {
+			// Default: 10 seconds
+			consensusDelayDuration = 10 * time.Second
+		}
+		windowManager = NewSpamReportWindowManager(ctx, redisClient, keyBuilder, collectionWindowDuration, consensusDelayDuration, aggregator)
+		log.Infof("Initialized spam report window manager (collection window: %v, consensus delay: %v)", collectionWindowDuration, consensusDelayDuration)
 	}
 
 	// Initialize spam reporter (if broadcast enabled)
@@ -65,6 +70,8 @@ func InitializeSpamProtection(ctx context.Context, cfg *config.Settings, redisCl
 	if cfg.EnableSpamReportBroadcast {
 		reporter = NewSpamReporterWithAggregator(redisClient, keyBuilder, tracker, whitelist, sequencerID, aggregator, windowManager)
 		log.Infof("Initialized spam reporter (Redis queue-based broadcasting with epoch batching)")
+		// Set reporter in aggregator so it can store generated reports
+		aggregator.SetReporter(reporter)
 	}
 
 	// TODO: Initialize state sync service (if enabled)

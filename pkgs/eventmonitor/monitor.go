@@ -904,13 +904,15 @@ func (m *EventMonitor) handleEpochReleased(event *EpochReleasedEvent) {
 									log.Errorf("Failed to create spam aggregation window at epoch boundary %d: %v", epochIDInt, err)
 								} else {
 									log.Infof("Successfully created spam aggregation window for epoch %d", epochIDInt)
-									// Wait 10 seconds for all validators' reports to arrive before checking consensus
-									go m.checkConsensusAfterDelay(epochIDInt)
+									// Note: Consensus checking is now scheduled by SpamReportWindowManager
+									// after collection window closes and reports are sent, with additional delay
+									// for other validators' reports to arrive
 								}
 							} else {
 								log.Infof("Successfully created spam aggregation window for epoch %d (no error returned)", epochIDInt)
-								// Wait 10 seconds for all validators' reports to arrive before checking consensus
-								go m.checkConsensusAfterDelay(epochIDInt)
+								// Note: Consensus checking is now scheduled by SpamReportWindowManager
+								// after collection window closes and reports are sent, with additional delay
+								// for other validators' reports to arrive
 							}
 						} else {
 							log.Warnf("CreateWindowAndAggregateLocalData method not found on aggregator (type: %s)", aggregatorField.Type())
@@ -948,12 +950,28 @@ func (m *EventMonitor) handleEpochReleased(event *EpochReleasedEvent) {
 					results := getWindowManagerMethod.Call([]reflect.Value{})
 					if len(results) > 0 && !results[0].IsNil() {
 						windowManager := results[0]
+
+						// Set consensus check callback if this is a window boundary epoch
+						epochIDInt := event.EpochID.Uint64()
+						if epochIDInt%10 == 0 {
+							setCallbackMethod := windowManager.MethodByName("SetConsensusCheckCallback")
+							if setCallbackMethod.IsValid() {
+								// Create callback function that calls checkConsensusAfterDelay
+								callbackFunc := reflect.MakeFunc(reflect.TypeOf(func(uint64) {}), func(args []reflect.Value) []reflect.Value {
+									epID := uint64(args[0].Uint())
+									go m.checkConsensusAfterDelay(epID)
+									return nil
+								})
+								setCallbackMethod.Call([]reflect.Value{callbackFunc})
+								log.Debugf("Set consensus check callback for window boundary epoch %d", epochIDInt)
+							}
+						}
+
 						// Call StartReportCollectionWindow using reflection
 						startWindowMethod := windowManager.MethodByName("StartReportCollectionWindow")
 						if startWindowMethod.IsValid() {
 							// Convert timestamp from Unix seconds to time.Time
 							releaseTime := time.Unix(int64(event.Timestamp), 0)
-							epochIDInt := event.EpochID.Uint64()
 							ctxVal := reflect.ValueOf(m.ctx)
 							dataMarketVal := reflect.ValueOf(dataMarketAddr)
 							epochVal := reflect.ValueOf(epochIDInt)

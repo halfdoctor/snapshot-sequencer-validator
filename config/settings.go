@@ -67,6 +67,11 @@ type Settings struct {
 	// Default: Level1FinalizationDelay + 10 seconds
 	SpamReportCollectionWindow time.Duration
 
+	// Spam Report Consensus Delay Configuration
+	// Additional delay after sending local reports to wait for other validators' reports before checking consensus
+	// Default: 10 seconds (gives other validators time to send their reports after their collection window)
+	SpamReportConsensusDelay time.Duration
+
 	// Event Monitoring
 	EventPollInterval   time.Duration
 	EventStartBlock     uint64
@@ -231,6 +236,9 @@ func LoadConfig() error {
 
 		// Spam Report Collection Window: level1_delay + 10 seconds
 		SpamReportCollectionWindow: time.Duration(getEnvAsInt("LEVEL1_FINALIZATION_DELAY_SECONDS", 10))*time.Second + 10*time.Second,
+		// Spam Report Consensus Delay: Additional delay after sending reports for other validators' reports to arrive
+		// Default: 10 seconds
+		SpamReportConsensusDelay: time.Duration(getEnvAsInt("SPAM_REPORT_CONSENSUS_DELAY_SECONDS", 10)) * time.Second,
 
 		// Event Monitoring
 		EventPollInterval:   time.Duration(getEnvAsInt("EVENT_POLL_INTERVAL", 12)) * time.Second,
