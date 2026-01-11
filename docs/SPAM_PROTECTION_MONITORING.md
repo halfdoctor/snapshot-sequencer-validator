@@ -103,11 +103,13 @@ If `/api/v1/spam/windows` returns empty, follow these steps:
 ### Step 3: Check Current Epoch and Window Boundaries
 
 ```bash
-# Get current epoch
-curl "http://localhost:9091/api/v1/epochs/active" | jq '.current_epoch'
+# Get current epoch (endpoint returns array, get first epoch's ID)
+CURRENT_EPOCH=$(curl -s "http://localhost:9091/api/v1/epochs/active" | jq -r '.[0].epoch_id')
+echo "Current epoch: $CURRENT_EPOCH"
 
 # Check if current epoch is a boundary (should be multiple of 10)
 # Windows are created when epochID % 10 == 0 (epochs 10, 20, 30, etc.)
+echo "Is boundary: $(( $CURRENT_EPOCH % 10 == 0 ))"
 ```
 
 ### Step 4: Check Redis for Epoch Tracking Data
@@ -128,9 +130,12 @@ docker exec <redis-container> redis-cli SMEMBERS "${PROTOCOL}:${MARKET}:spam:rep
 
 ```bash
 # List epochs with tracking data
+# NOTE: This endpoint returns empty unless an epoch boundary has been hit (windows created)
 curl "http://localhost:9091/api/v1/spam/epochs?limit=20" | jq '.'
 
-# If this returns empty, tracking isn't happening
+# If this returns empty, either:
+# - No epoch boundaries have been hit yet (epochID % 10 != 0)
+# - Tracking isn't happening
 # If this returns epochs, check if any are multiples of 10
 ```
 
@@ -159,8 +164,9 @@ curl "http://localhost:9091/api/v1/spam/epochs?limit=20" | jq '.'
 # - "Created spam aggregation window {windowID} with {peers_count} peers"
 ```
 
-**Check consensus checking (after 10-second delay)**:
+**Check consensus checking (after 10-second delay) - ONLY at epoch boundaries**:
 ```bash
+# These logs only appear at epoch boundaries (epochID % 10 == 0)
 ./dsv.sh event-logs | grep -iE "(Waiting.*seconds|checking consensus|CheckWindowForConsensus)"
 ./dsv.sh spam-aggregator-logs | grep -iE "(Checking consensus|consensus.*reached|flagged.*peer)"
 ```
@@ -171,13 +177,14 @@ Since event-monitor handles window creation, verify aggregation and broadcasting
 
 **1. Check if local reports are being generated** (in event-monitor/dequeuer):
 ```bash
-# Check for local report generation (DEBUG level)
+# Check for local report generation (DEBUG level) - only appears when violations occur
 ./dsv.sh event-logs | grep -iE "(Generated local spam report|shouldReport=true)"
 ./dsv.sh dequeuer-logs | grep -iE "(Generated local spam report|shouldReport=true|spam check.*shouldReport=true)"
 
 # Look for:
 # - "Generated local spam report for peer {peerID} epoch {epochID}"
 # - "Spam check for peer {peerID} epoch {epochID}: shouldReport=true"
+# NOTE: These logs only appear when spam violations are detected, not at every epoch
 ```
 
 **2. Check if reports are being queued for broadcasting** (in event-monitor/dequeuer):
@@ -470,9 +477,10 @@ curl "http://localhost:9091/api/v1/spam/epochs?limit=50" | jq '.epochs[] | selec
 
 ```bash
 # List epochs with tracking data
+# NOTE: This endpoint returns empty unless an epoch boundary has been hit (windows created)
 curl "http://localhost:9091/api/v1/spam/epochs?limit=20" | jq '.'
 
-# Shows which epochs have peer activity
+# Shows which epochs have peer activity (only epochs that are part of created windows)
 ```
 
 ### Check Peer Tracking
@@ -729,7 +737,7 @@ These are hardcoded for consensus consistency:
 
 3. **Check if current epoch is a boundary**:
    ```bash
-   CURRENT_EPOCH=$(curl -s "http://localhost:9091/api/v1/epochs/active" | jq -r '.current_epoch')
+   CURRENT_EPOCH=$(curl -s "http://localhost:9091/api/v1/epochs/active" | jq -r '.[0].epoch_id')
    echo "Current epoch: $CURRENT_EPOCH"
    echo "Is boundary: $(( $CURRENT_EPOCH % 10 == 0 ))"
    ```
@@ -755,7 +763,7 @@ These are hardcoded for consensus consistency:
 
 **Symptoms**: `/api/v1/spam/epochs` returns empty, no epoch peer sets in Redis
 
-**Note**: The `/api/v1/spam/epochs` endpoint queries epochs from windows (not epoch peer sets, which are deleted after aggregation). If windows exist but epochs endpoint is empty, check that windows contain epoch data.
+**Note**: The `/api/v1/spam/epochs` endpoint queries epochs from windows (not epoch peer sets, which are deleted after aggregation). **This endpoint returns empty unless an epoch boundary has been hit** (epochID % 10 == 0). If windows exist but epochs endpoint is empty, check that windows contain epoch data.
 
 **Debug Steps**:
 
