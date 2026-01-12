@@ -110,10 +110,11 @@ Failure Tracking:
    - Environment variable: `BULK_SERVICE_PEER_IDS` (comma-separated list of libp2p peer IDs)
 
 **Whitelist Behavior**:
-- Whitelisted Peer IDs bypass rate limiting (unlimited submissions per epoch)
+- **Full Node Peer IDs** (`FULL_NODE_PEER_IDS`): Bypass rate limiting and spam tracking entirely (unlimited submissions, no tracking)
+- **Bulk Service Peer IDs** (`BULK_SERVICE_PEER_IDS`): Bypass peer ID rate limiting but are tracked by snapshotter address. Snapshotter addresses can be flagged independently even if peer ID is whitelisted.
 - Whitelisted Peer IDs still undergo validation checks (signature verification, slot validation)
-- Whitelisted Peer IDs are NOT tracked for spam reporting (no validation failure tracking, no submission count tracking)
-- Whitelisted Peer IDs cannot be flagged (even if consensus reached, whitelist takes precedence)
+- Full Node Peer IDs cannot be flagged (whitelist takes precedence)
+- Bulk Service Peer IDs cannot be flagged by peer ID, but their associated snapshotter addresses can be flagged independently
 
 ### 1.1 Track Validation Failures
 
@@ -135,14 +136,19 @@ Failure Tracking:
 
 ### 1.2 Track Submissions Per Epoch Per Peer
 
-**CRITICAL**: Track by **Peer ID** (primary identifier for DDoS protection)
-**IMPORTANT**: Skip tracking and rate limiting if Peer ID is whitelisted (`FULL_NODE_PEER_IDS` or `BULK_SERVICE_PEER_IDS`)
+**CRITICAL**: Track by **Peer ID** (primary identifier for DDoS protection) OR **Snapshotter Address** (for bulk service peers)
+**IMPORTANT**: 
+- **Full Node Peer IDs**: Skip all tracking (peer ID and snapshotter address)
+- **Bulk Service Peer IDs**: Skip peer ID tracking but continue snapshotter address tracking
+- **Regular Peers**: Track by both peer ID and snapshotter address
 
-- **Primary tracking**: Submission count per `(peerID, epochID)`
-- Key: `{protocol}:{market}:spam:submissions:peer:{peerID}:snapshotter:{snapshotterAddr}:epoch:{epochID}`
+- **Regular peers**: Submission count per `(peerID, epochID)` and per `(snapshotterAddr, epochID)`
+- **Bulk service peers**: Submission count per `(snapshotterAddr, epochID)` only (peer ID tracking skipped)
+- Key (peer ID): `{protocol}:{market}:spam:submissions:peer:{peerID}:epoch:{epochID}`
+- Key (snapshotter): `{protocol}:{market}:spam:submissions:snapshotter:{snapshotterAddr}:epoch:{epochID}`
 - Increment on successful signature verification (before slot validation)
-- Check against limit: 2 submissions/epoch for lite nodes (unless peer is whitelisted by Peer ID)
-- **TTL**: Default expiry of 24 hours (set on first increment)
+- Check against limit: MAX_SUBMISSIONS_PER_EPOCH_LITE (2) submissions/epoch
+- **TTL**: Default expiry of 2 hours (set on first increment)
 
 ### 1.3 Spam Tracker Component
 
@@ -150,15 +156,16 @@ Failure Tracking:
 
 ```go
 const (
-    // Maximum validation failures per epoch before reporting
-    // Triggers immediately when threshold reached in a single epoch (no consecutive requirement)
+    // Maximum validation failures per epoch before immediate reporting
     MAX_VALIDATION_FAILURES_PER_EPOCH = 5
+    
+    // Maximum validation failures per epoch for consecutive tracking
+    MAX_VALIDATION_FAILURES_PER_EPOCH_CONSECUTIVE = 2
     
     // Maximum submissions per epoch for lite nodes (full nodes bypass)
     MAX_SUBMISSIONS_PER_EPOCH_LITE = 2
     
-    // Number of consecutive epochs with rate limit violations before reporting
-    // Rate limit violations require this many consecutive epochs with violations
+    // Number of consecutive epochs with violations before reporting
     CONSISTENT_VIOLATIONS_THRESHOLD = 3
     
     // Minimum validators needed for consensus (hardcoded for consistency)
@@ -173,21 +180,25 @@ const (
 
 **Violation Reporting Logic**:
 
-1. **Validation Failures** (immediate reporting):
+1. **Validation Failures**:
    - **What it is**: Technical errors that cause submission rejection (invalid format, bad signature, wrong slot)
    - **When tracked**: Called `TrackValidationFailure()` when submission fails validation
-   - **Reporting threshold**: If `validationFailureCount >= 5` in **any single epoch** → report immediately
-   - **No consecutive epochs required** - triggers immediately when threshold reached
-   - **Example**: Epoch 100 has 5 validation failures (bad signatures, invalid formats) → report at epoch 100
+   - **Immediate reporting**: If `validationFailureCount >= MAX_VALIDATION_FAILURES_PER_EPOCH` (5) in **any single epoch** → report immediately
+   - **Consecutive reporting**: If `validationFailureCount >= MAX_VALIDATION_FAILURES_PER_EPOCH_CONSECUTIVE` (2) per epoch for >= CONSISTENT_VIOLATIONS_THRESHOLD (3) consecutive epochs → report
+   - **Examples**: 
+     - Immediate: Epoch 100 has 5 validation failures → report at epoch 100
+     - Consecutive: Epochs 100-102 each have >= 2 validation failures → report at epoch 102
 
 2. **Rate Limit Violations** (consecutive epochs required):
    - **What it is**: Too many **successful** submissions (submissions that passed all validations)
    - **When tracked**: Called `TrackSubmissionCount()` AFTER successful signature verification
-   - **Reporting threshold**: If `submissionCount > 2` in current epoch, check previous epochs
-   - **Report only if**: **all 3 consecutive epochs** (including current) have violations
-   - **Example**: 
-     - Epochs 100, 101, 102 all have >2 successful submissions → report at epoch 102 ✓
-     - Epoch 101 has ≤2 submissions → no report (breaks consecutive chain) ✗
+   - **Regular peers**: Tracked by peer ID. If `submissionCount > MAX_SUBMISSIONS_PER_EPOCH_LITE` (2) in current epoch, check previous epochs
+   - **Bulk service peers**: Tracked by snapshotter address. If `snapshotterSubmissionCount > MAX_SUBMISSIONS_PER_EPOCH_LITE` (2) per snapshotter address in current epoch, check previous epochs
+   - **Report only if**: **all CONSISTENT_VIOLATIONS_THRESHOLD (3) consecutive epochs** (including current) have violations
+   - **Examples**: 
+     - Regular peer: Epochs 100, 101, 102 all have >2 successful submissions → report at epoch 102 (violationType="rate_limit") ✓
+     - Bulk service peer: Epochs 100, 101, 102 all have >2 successful submissions for snapshotterAddr → report at epoch 102 (violationType="rate_limit_snapshotter") ✓
+     - If any epoch in chain has ≤2 submissions → no report (breaks consecutive chain) ✗
 
 **Key Distinction**:
 - **Validation failures** = submissions that FAILED validation (rejected due to errors)
@@ -212,37 +223,50 @@ const (
 
 ```go
 type SpamReport struct {
-    PeerID          string   // PRIMARY: libp2p peer ID
-    SnapshotterAddr string   // Secondary: Ethereum address
-    ViolationType   string   // "validation_failure" or "rate_limit"
+    PeerID          string   // PRIMARY: libp2p peer ID (or context for bulk service peers)
+    SnapshotterAddr string   // Secondary: Ethereum address (PRIMARY for bulk service peer reports)
+    ViolationType   string   // "validation_failure", "rate_limit", or "rate_limit_snapshotter"
     EpochID         uint64   // Epoch where violation occurred
     Count           int      // Number of violations/submissions
-    Evidence        []string // Details (e.g., "validation_failures: 5")
+    Evidence        []string // Details (e.g., "validation_failures: 5", "consecutive_epochs_with_violations: 3")
     ReporterID      string   // Validator ID that generated this report
     Timestamp       int64    // Unix timestamp
 }
 ```
 
+**Report Types**:
+- **Peer ID Reports** (`violationType="rate_limit"` or `"validation_failure"`): For regular peers, aggregated by peer ID. When consensus reached, both peer ID and associated snapshotter addresses are flagged.
+- **Snapshotter Address Reports** (`violationType="rate_limit_snapshotter"`): For bulk service peers, aggregated by snapshotter address. When consensus reached, only the snapshotter address is flagged (peer ID remains whitelisted).
+
 ### 2.2 Spam Report Aggregation
 
-**CRITICAL**: Aggregate by **Peer ID** (primary identifier), not snapshotter address
+**CRITICAL**: Aggregate by **Peer ID** (regular peers) OR **Snapshotter Address** (bulk service peers)
 
-- Receive spam reports from other validators
-- **Aggregate reports per epoch**: `(peerID, epochID)` - PRIMARY aggregation key
+- Receive spam reports from other validators via Redis queue (`IncomingSpamReports`)
+- **Peer ID Reports** (`violationType != "rate_limit_snapshotter"`): Aggregate by `(peerID, windowID)`
+  - Key: `{protocol}:{market}:spam:reports:peer:{peerID}:window:{windowID}`
+  - Tracked in: `{protocol}:{market}:spam:reports:window:{windowID}:peers` SET
+- **Snapshotter Address Reports** (`violationType == "rate_limit_snapshotter"`): Aggregate by `(snapshotterAddr, windowID)`
+  - Key: `{protocol}:{market}:spam:reports:snapshotter:{snapshotterAddr}:window:{windowID}`
+  - Tracked in: `{protocol}:{market}:spam:reports:window:{windowID}:snapshotters` SET
 - Track which validators reported (for consensus)
 - **Aggregation Windows**: Use 10-epoch windows (hardcoded for consensus consistency)
+- Window ID calculation: `windowID = ((epochID + 9) / 10) * 10` (round up to next multiple of 10)
 
 ### 2.3 Consensus Mechanism & On-Chain Flagging
 
 **Window-Based Aggregation**:
 - At end of aggregation window (when `epochID % 10 == 0`):
-  1. For each peer with reports in the window:
+  1. **For each peer with reports in the window**:
      - **CRITICAL**: Check if peer is whitelisted FIRST (whitelisted peers cannot be flagged)
      - If whitelisted, skip flagging (whitelist takes precedence over consensus)
      - Check if reports received from >= `SPAM_CONSENSUS_THRESHOLD` validators (hardcoded: 2)
-  2. If consensus reached for a peer (and peer is NOT whitelisted):
-     - **Update on-chain flagged state** (permanent until cleared)
-     - Store peer ID and associated snapshotter addresses
+     - If consensus reached (and peer is NOT whitelisted):
+       - **Flag peer on-chain** via `FlagPeer()` (flags both peer ID and associated snapshotter addresses)
+  2. **For each snapshotter address with reports in the window** (bulk service peers):
+     - Check if reports received from >= `SPAM_CONSENSUS_THRESHOLD` validators (hardcoded: 2)
+     - If consensus reached:
+       - **Flag snapshotter address independently** via `FlagSnapshotter()` (peer ID remains whitelisted)
   3. **Update Redis cache** from on-chain state
 
 **On-Chain State Management**:
@@ -372,44 +396,81 @@ Track metrics:
 
 ### Overview
 
-The spam protection system uses a two-phase approach:
-1. **Immediate Reporting**: When thresholds are exceeded in an epoch, reports are immediately broadcast
+The spam protection system uses a multi-phase approach with time-based batching:
+1. **Batched Per-Epoch Reporting**: When thresholds are exceeded in an epoch, reports are stored and batched, then sent after a collection window (LEVEL1_FINALIZATION_DELAY_SECONDS + 10 seconds)
 2. **Window-Based Aggregation**: Reports are collected over 10-epoch windows before checking consensus
+3. **Two-Stage Delay for Consensus**: After sending local reports, an additional delay (SPAM_REPORT_CONSENSUS_DELAY_SECONDS, default: 10 seconds) waits for other validators' reports before checking consensus
 
 ### Phase 1: Within-Epoch Reporting
 
 #### When Reports Are Generated
 
-A spam report is **immediately broadcast** when a peer exceeds thresholds in the current epoch:
+A spam report is **stored for batching** when a peer exceeds thresholds in the current epoch. All reports for an epoch are collected and sent together after the collection window closes:
 
-**1. Validation Failures (Immediate)**
-- **Trigger**: `validationFailureCount >= 5` in **any single epoch**
-- **Example**: 
-  - Epoch 100: Peer submits 5 submissions with invalid signatures
-  - **Result**: Spam report broadcast immediately at epoch 100
-- **No consecutive epochs required** - triggers as soon as threshold reached
+**1. Validation Failures (Batched)**
+- **Immediate Trigger**: `validationFailureCount >= MAX_VALIDATION_FAILURES_PER_EPOCH` (5) in **any single epoch**
+- **Consecutive Trigger**: `validationFailureCount >= MAX_VALIDATION_FAILURES_PER_EPOCH_CONSECUTIVE` (2) per epoch for >= CONSISTENT_VIOLATIONS_THRESHOLD (3) consecutive epochs
+- **Examples**: 
+  - Immediate: Epoch 100: Peer submits 5 submissions with invalid signatures → Spam report stored immediately
+  - Consecutive: Epochs 100-102: Peer submits 2 invalid submissions each epoch → Spam report stored at epoch 102 (3 consecutive epochs)
+- **Result**: Spam report stored in Redis, batched with other epoch reports, sent after collection window (LEVEL1_FINALIZATION_DELAY_SECONDS + 10 seconds)
 
-**2. Rate Limit Violations (Consecutive Epochs Required)**
-- **Trigger**: `submissionCount > 2` in current epoch **AND** previous 2 epochs also had violations
-- **Example**:
-  - Epoch 98: 3 submissions (>2) ✓
-  - Epoch 99: 3 submissions (>2) ✓
-  - Epoch 100: 3 submissions (>2) ✓
-  - **Result**: Spam report broadcast at epoch 100 (3 consecutive epochs)
-- **If epoch 99 had ≤2 submissions**: No report (breaks consecutive chain)
+**2. Rate Limit Violations (Consecutive Epochs Required, Batched)**
+- **Regular Peers**: `submissionCount > MAX_SUBMISSIONS_PER_EPOCH_LITE` (2) in current epoch **AND** previous 2 epochs also had violations
+- **Bulk Service Peers**: `snapshotterSubmissionCount > MAX_SUBMISSIONS_PER_EPOCH_LITE` (2) per snapshotter address in current epoch **AND** previous 2 epochs also had violations for the same snapshotter address
+- **Examples**:
+  - Regular peer: Epochs 98-100 all have >2 submissions → Spam report stored for epoch 100 (violationType="rate_limit")
+  - Bulk service peer: Epochs 98-100 all have >2 submissions for snapshotterAddr → Spam report stored for epoch 100 (violationType="rate_limit_snapshotter")
+- **Result**: Spam report stored in Redis, batched with other epoch reports, sent after collection window
+- **If any epoch in chain has ≤2 submissions**: No report (breaks consecutive chain)
 
 #### Report Generation Flow
 
+**Dequeuer Component** (local tracking only):
 ```
 Dequeuer.ProcessSubmission()
     ↓
 TrackSubmissionCount() or TrackValidationFailure()
     ↓
-CheckAndReport() called after tracking
+Stores tracking data in Redis (epoch peer sets, counts)
+```
+
+**Event Monitor Component** (local aggregation and report sending):
+```
+EventMonitor detects epoch boundary (epochID % 10 == 0)
     ↓
-ShouldReportSpam() checks thresholds
+SpamAggregator.CreateWindowAndAggregateLocalData()
     ↓
-If threshold exceeded → ReportSpam() broadcasts to validator mesh
+Reads tracking data from Redis (epoch peer sets)
+    ↓
+Aggregates data into window (epochs 1-10, 11-20, etc.)
+    ↓
+Checks thresholds (ShouldReportSpam) for each epoch in window
+    ↓
+If threshold exceeded → Creates SpamReport
+    ↓
+Stores report in Redis LIST (pending:epoch:{epochID}) via SpamReporter
+    ↓
+(Reports are batched per epoch and sent after collection window)
+```
+
+**Per-Epoch Report Collection** (for ALL epochs, not just boundaries):
+```
+EventMonitor detects EpochReleased event (any epoch)
+    ↓
+SpamReportWindowManager.StartReportCollectionWindow() starts timer
+    ↓
+Timer waits for collection window (LEVEL1_FINALIZATION_DELAY_SECONDS + 10 seconds)
+    ↓
+Timer fires → collectPendingReports() → batchSendReports()
+    ↓
+Reports sent to:
+  - OutgoingSpamReports queue → p2p-gateway broadcasts
+  - IncomingSpamReports queue → spam-aggregator processes
+  - Direct injection → event-monitor's aggregator (local aggregation)
+    ↓
+If window boundary (epochID % 10 == 0):
+  - Schedule consensus check after additional delay (SPAM_REPORT_CONSENSUS_DELAY_SECONDS)
 ```
 
 ### Phase 2: Aggregation Windows
@@ -450,12 +511,16 @@ When a spam report is received:
    - Epoch 21-30 → Window 30
    - etc.
    - **Note**: Epoch 0 is dummy/heartbeat only, not processed
-2. **Store in Window**: Reports are stored per peer per window:
-   - Key: `{protocol}:{market}:spam:reports:peer:{peerID}:window:{windowID}`
-   - Window peers set: `{protocol}:{market}:spam:reports:window:{windowID}:peers` (SET)
-3. **Track Validators**: Each unique validator that reports the same peer is counted
-4. **Track Snapshotters**: Associated snapshotter addresses are collected
-5. **Track Frequency**: Count total reports per peer across the window
+2. **Determine Aggregation Key**:
+   - **Peer ID Reports** (`violationType != "rate_limit_snapshotter"`): Aggregate by peer ID
+     - Key: `{protocol}:{market}:spam:reports:peer:{peerID}:window:{windowID}`
+     - Tracked in: `{protocol}:{market}:spam:reports:window:{windowID}:peers` SET
+   - **Snapshotter Address Reports** (`violationType == "rate_limit_snapshotter"`): Aggregate by snapshotter address
+     - Key: `{protocol}:{market}:spam:reports:snapshotter:{snapshotterAddr}:window:{windowID}`
+     - Tracked in: `{protocol}:{market}:spam:reports:window:{windowID}:snapshotters` SET
+3. **Track Validators**: Each unique validator that reports the same peer/snapshotter is counted
+4. **Track Snapshotters**: Associated snapshotter addresses are collected (for peer ID reports)
+5. **Track Frequency**: Count total reports per peer/snapshotter across the window
 
 #### Aggregation Metrics
 
@@ -520,8 +585,13 @@ At epoch 30: Window 30 (epochs 21-30) is complete → Check consensus → Flag i
    - Get aggregated report (contains validatorCount, reportCount, etc.)
    - Skip if whitelisted
    - Check if `validatorCount >= 2`
-   - If yes → **Flag peer on-chain (blacklist)**
-5. **Clear/Reset** window 10 (or mark as processed) to start fresh for window 20
+   - If yes → **Flag peer on-chain** via `FlagPeer()` (flags both peer ID and associated snapshotter addresses)
+5. **Get all snapshotter addresses** with reports in window 10 (using deterministic SET: `{protocol}:{market}:spam:reports:window:{windowID}:snapshotters`)
+6. For each snapshotter address:
+   - Get aggregated report (contains validatorCount, reportCount, etc.)
+   - Check if `validatorCount >= 2`
+   - If yes → **Flag snapshotter address independently** via `FlagSnapshotter()` (peer ID remains whitelisted)
+7. **Clear/Reset** window 10 (or mark as processed) to start fresh for window 20
 
 #### Example: Full Flow
 

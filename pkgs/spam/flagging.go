@@ -154,6 +154,54 @@ func (f *FlaggingService) IsPeerFlagged(ctx context.Context, peerID string) (boo
 	return false, nil
 }
 
+// FlagSnapshotter flags a snapshotter address independently (without flagging peer ID)
+// Used for bulk service peers where snapshotter addresses are tracked separately
+// Does NOT check peer whitelist (snapshotter addresses can be flagged even if peer is whitelisted)
+func (f *FlaggingService) FlagSnapshotter(ctx context.Context, snapshotterAddr string, firstEpoch, lastEpoch uint64) error {
+	now := time.Now().Unix()
+
+	// TODO: Flag on-chain via contract method
+	// For now, we'll just update Redis cache
+	// In production, this would call:
+	// contract.flagSnapshotter(snapshotterAddr, firstEpoch, lastEpoch)
+
+	// Update Redis cache
+	snapshotterInfo := &FlaggedPeerInfo{
+		FlaggedAt:        now,
+		FirstEpoch:       firstEpoch,
+		LastEpoch:        lastEpoch,
+		SnapshotterAddrs: []string{snapshotterAddr},
+		SyncedAt:         now,
+	}
+
+	// Store snapshotter address flagging info
+	snapshotterKey := f.getFlaggedSnapshotterKey(snapshotterAddr)
+	snapshotterData, err := json.Marshal(snapshotterInfo)
+	if err != nil {
+		return fmt.Errorf("failed to marshal flagged snapshotter info: %w", err)
+	}
+	if err := f.redisClient.Set(ctx, snapshotterKey, snapshotterData, FLAGGED_STATE_TTL).Err(); err != nil {
+		return fmt.Errorf("failed to store flagged snapshotter info: %w", err)
+	}
+
+	// Update flagged snapshotters set for quick lookup
+	flaggedSnapshottersKey := f.getFlaggedSnapshottersSetKey()
+	if err := f.redisClient.SAdd(ctx, flaggedSnapshottersKey, snapshotterAddr).Err(); err != nil {
+		log.Warnf("Failed to add snapshotter to flagged set: %v", err)
+	}
+	if err := f.redisClient.Expire(ctx, flaggedSnapshottersKey, FLAGGED_STATE_TTL).Err(); err != nil {
+		log.Warnf("Failed to set TTL on flagged snapshotters set: %v", err)
+	}
+
+	log.WithFields(log.Fields{
+		"snapshotter_addr": snapshotterAddr,
+		"first_epoch":       firstEpoch,
+		"last_epoch":        lastEpoch,
+	}).Infof("🚩 Flagged snapshotter address %s (independent of peer ID)", snapshotterAddr)
+
+	return nil
+}
+
 // IsSnapshotterFlagged checks if a snapshotter address is flagged
 func (f *FlaggingService) IsSnapshotterFlagged(ctx context.Context, snapshotterAddr string) (bool, error) {
 	// Check Redis cache first

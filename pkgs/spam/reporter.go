@@ -62,9 +62,12 @@ func NewSpamReporterWithAggregator(redisClient *redis.Client, keyBuilder *redisl
 
 // ReportSpam stores a spam report in Redis for batching (will be sent after collection window)
 func (r *SpamReporter) ReportSpam(ctx context.Context, peerID, snapshotterAddr string, epochID uint64, violationType string, count int, evidence []string) error {
-	// Skip reporting if peer is whitelisted
-	if r.whitelist != nil && r.whitelist.IsWhitelisted(peerID) {
-		return nil
+	// Skip reporting if peer is whitelisted, EXCEPT for snapshotter address violations (rate_limit_snapshotter)
+	// Snapshotter address violations can be reported even if the peer ID is whitelisted (for bulk service peers)
+	if violationType != "rate_limit_snapshotter" {
+		if r.whitelist != nil && r.whitelist.IsWhitelisted(peerID) {
+			return nil
+		}
 	}
 
 	// Create spam report
@@ -84,14 +87,26 @@ func (r *SpamReporter) ReportSpam(ctx context.Context, peerID, snapshotterAddr s
 		return fmt.Errorf("failed to store pending spam report: %w", err)
 	}
 
-	log.WithFields(log.Fields{
-		"peer_id":          peerID,
-		"snapshotter_addr": snapshotterAddr,
-		"violation_type":   violationType,
-		"epoch_id":         epochID,
-		"count":            count,
-		"reporter_id":      r.reporterID,
-	}).Debugf("Stored spam report for peer %s epoch %d (will be sent after collection window)", peerID, epochID)
+	// Log differently for snapshotter address reports vs peer ID reports
+	if violationType == "rate_limit_snapshotter" {
+		log.WithFields(log.Fields{
+			"peer_id":          peerID,
+			"snapshotter_addr": snapshotterAddr,
+			"violation_type":   violationType,
+			"epoch_id":         epochID,
+			"count":            count,
+			"reporter_id":      r.reporterID,
+		}).Infof("📝 Stored snapshotter address spam report for bulk service peer %s snapshotter %s epoch %d (will flag snapshotter address only after consensus)", peerID, snapshotterAddr, epochID)
+	} else {
+		log.WithFields(log.Fields{
+			"peer_id":          peerID,
+			"snapshotter_addr": snapshotterAddr,
+			"violation_type":   violationType,
+			"epoch_id":         epochID,
+			"count":            count,
+			"reporter_id":      r.reporterID,
+		}).Infof("📝 Stored peer ID spam report for peer %s epoch %d (will flag peer ID and associated snapshotter addresses after consensus)", peerID, epochID)
+	}
 
 	return nil
 }
@@ -132,12 +147,59 @@ func (r *SpamReporter) storePendingReport(ctx context.Context, epochID uint64, r
 
 // CheckAndReport checks thresholds and reports if exceeded
 func (r *SpamReporter) CheckAndReport(ctx context.Context, peerID, snapshotterAddr string, epochID uint64) error {
-	// Skip reporting if peer is whitelisted
-	if r.whitelist != nil && r.whitelist.IsWhitelisted(peerID) {
+	// Check if peer is whitelisted
+	isWhitelisted := false
+	isBulkService := false
+	if r.whitelist != nil {
+		isWhitelisted = r.whitelist.IsWhitelisted(peerID)
+		if isWhitelisted {
+			isBulkService = r.whitelist.IsBulkService(peerID)
+		}
+	}
+
+	// For bulk service peers: Check snapshotter address violations instead of peer ID violations
+	if isBulkService && snapshotterAddr != "" {
+		shouldReport, violationType, err := r.tracker.ShouldReportSpamForSnapshotter(ctx, snapshotterAddr, epochID)
+		if err != nil {
+			return fmt.Errorf("failed to check spam thresholds for snapshotter: %w", err)
+		}
+
+		if !shouldReport {
+			log.Debugf("Spam check for bulk service peer %s snapshotter %s epoch %d: shouldReport=false (thresholds not met)", peerID, snapshotterAddr, epochID)
+			return nil
+		}
+
+		log.Infof("⚠️ Spam check for bulk service peer %s snapshotter %s epoch %d: shouldReport=true, violationType=%s (snapshotter address will be flagged after consensus)", peerID, snapshotterAddr, epochID, violationType)
+
+		// Get counts for evidence
+		count, err := r.tracker.GetSnapshotterSubmissionCount(ctx, snapshotterAddr, epochID)
+		if err != nil {
+			return fmt.Errorf("failed to get snapshotter submission count: %w", err)
+		}
+
+		// Include consecutive epochs information in evidence
+		consecutiveViolations, err := r.tracker.CheckConsecutiveSnapshotterRateLimitViolations(ctx, snapshotterAddr, epochID)
+		if err != nil {
+			log.Warnf("Failed to get consecutive violations count: %v", err)
+			consecutiveViolations = 1 // Fallback to 1 if check fails
+		}
+		evidence := []string{
+			fmt.Sprintf("submissions: %d (limit: %d)", count, MAX_SUBMISSIONS_PER_EPOCH_LITE),
+			fmt.Sprintf("consecutive_epochs_with_violations: %d (threshold: %d)", consecutiveViolations, CONSISTENT_VIOLATIONS_THRESHOLD),
+		}
+
+		// Report spam (will be stored in Redis and sent after collection window)
+		// Note: For bulk service peers, the report is keyed by snapshotter address
+		// The peerID is included for context but the violation is tracked per snapshotter address
+		return r.ReportSpam(ctx, peerID, snapshotterAddr, epochID, violationType, count, evidence)
+	}
+
+	// Skip reporting if peer is whitelisted (full node)
+	if isWhitelisted {
 		return nil
 	}
 
-	// Check if spam should be reported
+	// Regular peers: Check peer ID violations
 	shouldReport, violationType, err := r.tracker.ShouldReportSpam(ctx, peerID, epochID)
 	if err != nil {
 		return fmt.Errorf("failed to check spam thresholds: %w", err)
@@ -148,11 +210,10 @@ func (r *SpamReporter) CheckAndReport(ctx context.Context, peerID, snapshotterAd
 		return nil
 	}
 
-	log.Infof("Spam check for peer %s epoch %d: shouldReport=true, violationType=%s", peerID, epochID, violationType)
-
 	// Get counts for evidence
 	var count int
 	var evidence []string
+	var reportReason string
 
 	switch violationType {
 	case "validation_failure":
@@ -160,7 +221,25 @@ func (r *SpamReporter) CheckAndReport(ctx context.Context, peerID, snapshotterAd
 		if err != nil {
 			return fmt.Errorf("failed to get validation failure count: %w", err)
 		}
-		evidence = []string{fmt.Sprintf("validation_failures: %d", count)}
+		// Check if it's immediate or consecutive
+		isImmediate := count >= MAX_VALIDATION_FAILURES_PER_EPOCH
+		if isImmediate {
+			reportReason = fmt.Sprintf("immediate (failures: %d >= threshold: %d)", count, MAX_VALIDATION_FAILURES_PER_EPOCH)
+			evidence = []string{fmt.Sprintf("validation_failures: %d (immediate threshold: %d)", count, MAX_VALIDATION_FAILURES_PER_EPOCH)}
+		} else {
+			// Consecutive violations
+			consecutiveFailures, err := r.tracker.CheckConsecutiveValidationFailures(ctx, peerID, epochID)
+			if err != nil {
+				log.Warnf("Failed to get consecutive failures count: %v", err)
+				consecutiveFailures = 1 // Fallback to 1 if check fails
+			}
+			reportReason = fmt.Sprintf("consecutive (failures: %d >= threshold: %d for %d consecutive epochs >= threshold: %d)", count, MAX_VALIDATION_FAILURES_PER_EPOCH_CONSECUTIVE, consecutiveFailures, CONSISTENT_VIOLATIONS_THRESHOLD)
+			evidence = []string{
+				fmt.Sprintf("validation_failures: %d (consecutive threshold: %d)", count, MAX_VALIDATION_FAILURES_PER_EPOCH_CONSECUTIVE),
+				fmt.Sprintf("consecutive_epochs_with_violations: %d (threshold: %d)", consecutiveFailures, CONSISTENT_VIOLATIONS_THRESHOLD),
+			}
+		}
+		log.Infof("⚠️ Spam check for peer %s epoch %d: shouldReport=true, violationType=%s, reason=%s (peer ID and associated snapshotter addresses will be flagged after consensus)", peerID, epochID, violationType, reportReason)
 	case "rate_limit":
 		count, err = r.tracker.GetSubmissionCount(ctx, peerID, epochID)
 		if err != nil {

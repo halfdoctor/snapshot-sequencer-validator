@@ -254,15 +254,28 @@ func (a *SpamAggregator) processSpamReportDirect(data []byte) {
 		}).Infof("📨 Received spam report from validator %s for peer %s epoch %d", report.ReporterID, report.PeerID, report.EpochID)
 	}
 
-	// Skip if peer is whitelisted
-	if a.whitelist != nil && a.whitelist.IsWhitelisted(report.PeerID) {
-		log.Debugf("Skipping spam report for whitelisted peer: %s", report.PeerID)
-		return
+	// Check if this is a snapshotter address report (for bulk service peers)
+	isSnapshotterReport := report.ViolationType == "rate_limit_snapshotter"
+
+	// For snapshotter reports, skip peer whitelist check (snapshotter addresses can be flagged independently)
+	// For regular reports, skip if peer is whitelisted
+	if !isSnapshotterReport {
+		if a.whitelist != nil && a.whitelist.IsWhitelisted(report.PeerID) {
+			log.Debugf("Skipping spam report for whitelisted peer: %s", report.PeerID)
+			return
+		}
 	}
 
 	// Calculate aggregation window ID (end epoch of the window)
 	windowID := ((int(report.EpochID) + a.windowSize - 1) / a.windowSize) * a.windowSize
-	windowKey := a.getAggregationWindowKey(report.PeerID, windowID)
+
+	// For snapshotter reports, aggregate by snapshotter address; for regular reports, aggregate by peer ID
+	var windowKey string
+	if isSnapshotterReport && report.SnapshotterAddr != "" {
+		windowKey = a.getAggregationWindowKeyForSnapshotter(report.SnapshotterAddr, windowID)
+	} else {
+		windowKey = a.getAggregationWindowKey(report.PeerID, windowID)
+	}
 
 	// Use Lua script for atomic update
 	reportJson, err := json.Marshal(report)
@@ -304,14 +317,28 @@ func (a *SpamAggregator) processSpamReportDirect(data []byte) {
 
 	validatorCount, _ := result.(int64)
 
-	// Add peer to window peers set
-	windowPeersKey := a.getWindowPeersKey(windowID)
-	if err := a.redisClient.SAdd(a.ctx, windowPeersKey, report.PeerID).Err(); err != nil {
-		log.Errorf("Failed to add peer to window peers set: %v", err)
+	// Add peer to window peers set (or snapshotter to window snapshotters set)
+	if isSnapshotterReport && report.SnapshotterAddr != "" {
+		// For snapshotter reports, track by snapshotter address
+		windowSnapshottersKey := a.getWindowSnapshottersKey(windowID)
+		if err := a.redisClient.SAdd(a.ctx, windowSnapshottersKey, report.SnapshotterAddr).Err(); err != nil {
+			log.Errorf("Failed to add snapshotter to window snapshotters set: %v", err)
+		} else {
+			// Set TTL on the set
+			if err := a.redisClient.Expire(a.ctx, windowSnapshottersKey, AGGREGATION_TTL).Err(); err != nil {
+				log.Warnf("Failed to set TTL on window snapshotters set: %v", err)
+			}
+		}
 	} else {
-		// Set TTL on the set
-		if err := a.redisClient.Expire(a.ctx, windowPeersKey, AGGREGATION_TTL).Err(); err != nil {
-			log.Warnf("Failed to set TTL on window peers set: %v", err)
+		// For regular reports, track by peer ID
+		windowPeersKey := a.getWindowPeersKey(windowID)
+		if err := a.redisClient.SAdd(a.ctx, windowPeersKey, report.PeerID).Err(); err != nil {
+			log.Errorf("Failed to add peer to window peers set: %v", err)
+		} else {
+			// Set TTL on the set
+			if err := a.redisClient.Expire(a.ctx, windowPeersKey, AGGREGATION_TTL).Err(); err != nil {
+				log.Warnf("Failed to set TTL on window peers set: %v", err)
+			}
 		}
 	}
 
@@ -322,13 +349,24 @@ func (a *SpamAggregator) processSpamReportDirect(data []byte) {
 		log.Errorf("Failed to add window to master set: %v", err)
 	}
 
-	log.WithFields(log.Fields{
-		"peer_id":         report.PeerID,
-		"epoch_id":        report.EpochID,
-		"window_id":       windowID,
-		"validator_count": validatorCount,
-		"reporter_id":     report.ReporterID,
-	}).Infof("Atomically aggregated spam report for peer %s (window %d, validators: %d)", report.PeerID, windowID, validatorCount)
+	if isSnapshotterReport && report.SnapshotterAddr != "" {
+		log.WithFields(log.Fields{
+			"snapshotter_addr": report.SnapshotterAddr,
+			"peer_id":          report.PeerID,
+			"epoch_id":         report.EpochID,
+			"window_id":        windowID,
+			"validator_count":  validatorCount,
+			"reporter_id":      report.ReporterID,
+		}).Infof("Atomically aggregated spam report for snapshotter %s (window %d, validators: %d)", report.SnapshotterAddr, windowID, validatorCount)
+	} else {
+		log.WithFields(log.Fields{
+			"peer_id":         report.PeerID,
+			"epoch_id":        report.EpochID,
+			"window_id":       windowID,
+			"validator_count": validatorCount,
+			"reporter_id":     report.ReporterID,
+		}).Infof("Atomically aggregated spam report for peer %s (window %d, validators: %d)", report.PeerID, windowID, validatorCount)
+	}
 }
 
 // processSpamReportDirectFallback is the fallback non-atomic implementation
@@ -339,17 +377,33 @@ func (a *SpamAggregator) processSpamReportDirectFallback(data []byte) {
 		return
 	}
 
-	// Skip if peer is whitelisted
-	if a.whitelist != nil && a.whitelist.IsWhitelisted(report.PeerID) {
-		log.Debugf("Skipping spam report for whitelisted peer: %s", report.PeerID)
-		return
+	// Check if this is a snapshotter address report (for bulk service peers)
+	isSnapshotterReport := report.ViolationType == "rate_limit_snapshotter"
+
+	// For snapshotter reports, skip peer whitelist check (snapshotter addresses can be flagged independently)
+	// For regular reports, skip if peer is whitelisted
+	if !isSnapshotterReport {
+		if a.whitelist != nil && a.whitelist.IsWhitelisted(report.PeerID) {
+			log.Debugf("Skipping spam report for whitelisted peer: %s", report.PeerID)
+			return
+		}
 	}
 
 	windowID := ((int(report.EpochID) + a.windowSize - 1) / a.windowSize) * a.windowSize
-	windowKey := a.getAggregationWindowKey(report.PeerID, windowID)
+
+	// For snapshotter reports, aggregate by snapshotter address; for regular reports, aggregate by peer ID
+	var windowKey string
+	var identifier string // Used as peerID parameter in getOrCreateAggregatedReport
+	if isSnapshotterReport && report.SnapshotterAddr != "" {
+		windowKey = a.getAggregationWindowKeyForSnapshotter(report.SnapshotterAddr, windowID)
+		identifier = report.SnapshotterAddr // Use snapshotter address as identifier
+	} else {
+		windowKey = a.getAggregationWindowKey(report.PeerID, windowID)
+		identifier = report.PeerID // Use peer ID as identifier
+	}
 
 	// Get or create aggregated report
-	aggregated, err := a.getOrCreateAggregatedReport(windowKey, report.PeerID)
+	aggregated, err := a.getOrCreateAggregatedReport(windowKey, identifier)
 	if err != nil {
 		log.Errorf("Failed to get/create aggregated report: %v", err)
 		return
@@ -405,13 +459,26 @@ func (a *SpamAggregator) processSpamReportDirectFallback(data []byte) {
 		return
 	}
 
-	// Add peer to window peers set
-	windowPeersKey := a.getWindowPeersKey(windowID)
-	if err := a.redisClient.SAdd(a.ctx, windowPeersKey, report.PeerID).Err(); err != nil {
-		log.Errorf("Failed to add peer to window peers set: %v", err)
+	// Add peer to window peers set (or snapshotter to window snapshotters set)
+	if isSnapshotterReport && report.SnapshotterAddr != "" {
+		// For snapshotter reports, track by snapshotter address
+		windowSnapshottersKey := a.getWindowSnapshottersKey(windowID)
+		if err := a.redisClient.SAdd(a.ctx, windowSnapshottersKey, report.SnapshotterAddr).Err(); err != nil {
+			log.Errorf("Failed to add snapshotter to window snapshotters set: %v", err)
+		} else {
+			if err := a.redisClient.Expire(a.ctx, windowSnapshottersKey, AGGREGATION_TTL).Err(); err != nil {
+				log.Warnf("Failed to set TTL on window snapshotters set: %v", err)
+			}
+		}
 	} else {
-		if err := a.redisClient.Expire(a.ctx, windowPeersKey, AGGREGATION_TTL).Err(); err != nil {
-			log.Warnf("Failed to set TTL on window peers set: %v", err)
+		// For regular reports, track by peer ID
+		windowPeersKey := a.getWindowPeersKey(windowID)
+		if err := a.redisClient.SAdd(a.ctx, windowPeersKey, report.PeerID).Err(); err != nil {
+			log.Errorf("Failed to add peer to window peers set: %v", err)
+		} else {
+			if err := a.redisClient.Expire(a.ctx, windowPeersKey, AGGREGATION_TTL).Err(); err != nil {
+				log.Warnf("Failed to set TTL on window peers set: %v", err)
+			}
 		}
 	}
 
@@ -422,13 +489,24 @@ func (a *SpamAggregator) processSpamReportDirectFallback(data []byte) {
 		log.Errorf("Failed to add window to master set: %v", err)
 	}
 
-	log.WithFields(log.Fields{
-		"peer_id":         report.PeerID,
-		"epoch_id":        report.EpochID,
-		"window_id":       windowID,
-		"validator_count": aggregated.ValidatorCount,
-		"reporter_id":     report.ReporterID,
-	}).Infof("Aggregated spam report for peer %s (window %d, validators: %d) [fallback]", report.PeerID, windowID, aggregated.ValidatorCount)
+	if isSnapshotterReport && report.SnapshotterAddr != "" {
+		log.WithFields(log.Fields{
+			"snapshotter_addr": report.SnapshotterAddr,
+			"peer_id":          report.PeerID,
+			"epoch_id":         report.EpochID,
+			"window_id":        windowID,
+			"validator_count":  aggregated.ValidatorCount,
+			"reporter_id":      report.ReporterID,
+		}).Infof("Aggregated spam report for snapshotter %s (window %d, validators: %d) [fallback]", report.SnapshotterAddr, windowID, aggregated.ValidatorCount)
+	} else {
+		log.WithFields(log.Fields{
+			"peer_id":         report.PeerID,
+			"epoch_id":        report.EpochID,
+			"window_id":       windowID,
+			"validator_count": aggregated.ValidatorCount,
+			"reporter_id":     report.ReporterID,
+		}).Infof("Aggregated spam report for peer %s (window %d, validators: %d) [fallback]", report.PeerID, windowID, aggregated.ValidatorCount)
+	}
 }
 
 // CheckWindowForConsensus checks a specific window for consensus and flags if reached
@@ -455,6 +533,10 @@ func (a *SpamAggregator) CheckWindowForConsensus(ctx context.Context, currentEpo
 	}
 
 	// For each peer with reports in the window, check consensus
+	// This handles peer ID reports from regular lite nodes (not whitelisted)
+	// Regular lite nodes are tracked by peer ID and reported when they exceed MAX_SUBMISSIONS_PER_EPOCH_LITE
+	// submissions per epoch for CONSISTENT_VIOLATIONS_THRESHOLD consecutive epochs
+	// (or >= MAX_VALIDATION_FAILURES_PER_EPOCH validation failures in a single epoch)
 	for _, peerID := range peerIDs {
 		// Get aggregated report for this peer in this window
 		windowKey := a.getAggregationWindowKey(peerID, windowID)
@@ -473,6 +555,7 @@ func (a *SpamAggregator) CheckWindowForConsensus(ctx context.Context, currentEpo
 		// Check if consensus threshold reached
 		if aggregated.ValidatorCount >= SPAM_CONSENSUS_THRESHOLD {
 			// Flag on-chain
+			// Note: FlagPeer() flags both the peer ID AND associated snapshotter addresses
 			if err := a.flagging.FlagPeer(ctx, peerID, aggregated.SnapshotterAddrs, aggregated.FirstEpoch, aggregated.LastEpoch); err != nil {
 				log.Errorf("Failed to flag peer %s: %v", peerID, err)
 				continue
@@ -486,6 +569,47 @@ func (a *SpamAggregator) CheckWindowForConsensus(ctx context.Context, currentEpo
 				"first_epoch":       aggregated.FirstEpoch,
 				"last_epoch":        aggregated.LastEpoch,
 			}).Infof("🚩 Consensus reached for peer %s (validators: %d)", peerID, aggregated.ValidatorCount)
+		}
+	}
+
+	// Check snapshotter addresses with reports in the window
+	// This handles snapshotter address reports from bulk service peers (whitelisted peer IDs)
+	// Bulk service peers are tracked by snapshotter address instead of peer ID
+	// Snapshotter addresses are reported when they exceed MAX_SUBMISSIONS_PER_EPOCH_LITE submissions
+	// per epoch for CONSISTENT_VIOLATIONS_THRESHOLD consecutive epochs
+	windowSnapshottersKey := a.getWindowSnapshottersKey(windowID)
+	snapshotterAddrs, err := a.redisClient.SMembers(ctx, windowSnapshottersKey).Result()
+	if err != nil {
+		if err != redis.Nil {
+			log.Warnf("Failed to get window snapshotters set: %v", err)
+		}
+	} else if len(snapshotterAddrs) > 0 {
+		// For each snapshotter address with reports in the window, check consensus
+		for _, snapshotterAddr := range snapshotterAddrs {
+			// Get aggregated report for this snapshotter address in this window
+			windowKey := a.getAggregationWindowKeyForSnapshotter(snapshotterAddr, windowID)
+			aggregated, err := a.getOrCreateAggregatedReport(windowKey, snapshotterAddr)
+			if err != nil {
+				log.Errorf("Failed to get aggregated report for snapshotter key %s: %v", windowKey, err)
+				continue
+			}
+
+			// Check if consensus threshold reached
+			if aggregated.ValidatorCount >= SPAM_CONSENSUS_THRESHOLD {
+				// Flag snapshotter address independently (not peer ID)
+				if err := a.flagging.FlagSnapshotter(ctx, snapshotterAddr, aggregated.FirstEpoch, aggregated.LastEpoch); err != nil {
+					log.Errorf("Failed to flag snapshotter %s: %v", snapshotterAddr, err)
+					continue
+				}
+
+				log.WithFields(log.Fields{
+					"snapshotter_addr": snapshotterAddr,
+					"window_id":        windowID,
+					"validator_count":  aggregated.ValidatorCount,
+					"first_epoch":      aggregated.FirstEpoch,
+					"last_epoch":       aggregated.LastEpoch,
+				}).Infof("🚩 Consensus reached for snapshotter address %s (validators: %d)", snapshotterAddr, aggregated.ValidatorCount)
+			}
 		}
 	}
 
@@ -680,6 +804,17 @@ func (a *SpamAggregator) storeAggregatedReport(windowKey string, aggregated *Agg
 // getAggregationWindowKey returns the Redis key for an aggregation window
 func (a *SpamAggregator) getAggregationWindowKey(peerID string, windowID int) string {
 	return fmt.Sprintf("%s:%s:spam:reports:peer:%s:window:%d", a.keyBuilder.ProtocolState, a.keyBuilder.DataMarket, peerID, windowID)
+}
+
+// getAggregationWindowKeyForSnapshotter returns the Redis key for an aggregation window for a snapshotter address
+func (a *SpamAggregator) getAggregationWindowKeyForSnapshotter(snapshotterAddr string, windowID int) string {
+	return fmt.Sprintf("%s:%s:spam:reports:snapshotter:%s:window:%d", a.keyBuilder.ProtocolState, a.keyBuilder.DataMarket, snapshotterAddr, windowID)
+}
+
+// getWindowSnapshottersKey returns the Redis key for the set of snapshotter addresses in a window
+// Format: {protocol}:{market}:spam:reports:window:{windowID}:snapshotters
+func (a *SpamAggregator) getWindowSnapshottersKey(windowID int) string {
+	return fmt.Sprintf("%s:%s:spam:reports:window:%d:snapshotters", a.keyBuilder.ProtocolState, a.keyBuilder.DataMarket, windowID)
 }
 
 // CreateWindowAndAggregateLocalData creates a window at epoch boundary and aggregates all local tracking data
