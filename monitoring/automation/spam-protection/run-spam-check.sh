@@ -64,6 +64,8 @@ Step 1: Check if EventMonitor is Processing Epochs
 Step 2: Check if Tracking is Happening
 - Check dequeuer logs for "tracked.*submission" or "tracked.*validation"
 - Look for peer tracking activity
+- Check for bulk service peer snapshotter tracking: "Tracked submission for bulk service peer"
+- Check for consecutive validation failure tracking: "consecutive.*validation.*failure"
 
 Step 3: Check Current Epoch and Window Boundaries
 - Get current epoch from API
@@ -72,14 +74,19 @@ Step 3: Check Current Epoch and Window Boundaries
 Step 4: Check Redis for Epoch Tracking Data
 - Verify epoch peer sets exist
 - Check for windows master set
+- Check for snapshotter address tracking keys (bulk service peers)
+- Check for both peer ID and snapshotter address aggregation windows
 
 Step 5: Check Monitoring API for Epoch Activity
 - Query /api/v1/spam/epochs
 - Query /api/v1/spam/windows
 
-Step 6: Verify Event-Monitor Window Creation
+Step 6: Verify Event-Monitor Window Creation and Report Collection
 - Check for "Successfully created spam aggregation window" messages
 - Verify window creation at boundaries
+- Check for collection window timers: "Waiting.*seconds before sending reports"
+- Check for report batching: "Generated local spam report" or "Stored.*spam report"
+- Check for consensus delay scheduling: "checking consensus" or "CheckWindowForConsensus"
 
 FINAL OUTPUT FORMAT:
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -100,11 +107,16 @@ EPOCH PROCESSING:
 TRACKING STATUS:
   Active:           [YES/NO]
   Peers Tracked:    [count if available]
+  Bulk Service Tracking: [YES/NO] - snapshotter address tracking
+  Consecutive Validation Failures: [YES/NO] - consecutive epoch tracking
 
 WINDOW CREATION:
   Windows Exist:    [YES/NO]
   Last Window:      [ID if available]
   Creation Status:  [WORKING/NOT WORKING]
+  Snapshotter Windows: [YES/NO] - bulk service peer aggregation windows
+  Collection Window: [ACTIVE/INACTIVE] - per-epoch report batching
+  Consensus Delay:  [SCHEDULED/NOT SCHEDULED] - at boundaries
 
 REDIS DATA:
   Epoch Keys:       [EXISTS/EMPTY]

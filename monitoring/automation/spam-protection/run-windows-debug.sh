@@ -42,7 +42,7 @@ cd $DSV_DIR
    ./dsv.sh spam-aggregator-logs | grep -iE "(spam aggregator component starting|initializing spam|redis queue|event monitor|spam protection components initialized)"
 
 3. CHECK FOR EPOCH BOUNDARY EVENTS:
-   ./dsv.sh spam-aggregator-logs | grep -iE "(epoch.*released|aggregation window boundary|creating window|window.*aggregated)"
+   ./dsv.sh spam-aggregator-logs | grep -iE "(epoch.*released|aggregation window boundary|creating window|window.*aggregated|Waiting.*seconds before sending reports|checking consensus|CheckWindowForConsensus)"
 
 4. CHECK CURRENT EPOCH:
    CURRENT_EPOCH=\$(curl -s "http://localhost:9091/api/v1/epochs/active" | jq -r '.current_epoch')
@@ -54,11 +54,17 @@ cd $DSV_DIR
 5. CHECK REDIS FOR WINDOWS:
    docker exec snapshot-sequencer-validator-redis-1 redis-cli SMEMBERS "0x3B5A0FB70ef68B5dd677C7d614dFB89961f97401:0xb5cE2F9B71e785e3eC0C45EDE06Ad95c3bb71a4d:spam:reports:windows"
 
-6. CHECK EVENT-MONITOR WINDOW CREATION:
-   ./dsv.sh event-logs | grep -iE "(EpochReleased|aggregation window boundary|CreateWindowAndAggregateLocalData|Successfully created spam aggregation window|Failed to create spam aggregation window)"
+6. CHECK EVENT-MONITOR WINDOW CREATION AND REPORT COLLECTION:
+   ./dsv.sh event-logs | grep -iE "(EpochReleased|aggregation window boundary|CreateWindowAndAggregateLocalData|Successfully created spam aggregation window|Failed to create spam aggregation window|Generated local spam report|Stored.*spam report|Waiting.*seconds before sending reports|checking consensus|CheckWindowForConsensus)"
 
 7. CHECK FOR TRACKING DATA (shows if system is working at all):
    docker exec snapshot-sequencer-validator-redis-1 redis-cli KEYS "*spam:epoch:*:peers" | head -5
+   
+8. CHECK FOR SNAPSHOTTER ADDRESS TRACKING (bulk service peers):
+   docker exec snapshot-sequencer-validator-redis-1 redis-cli KEYS "*spam:submissions:snapshotter:*" | head -5
+   
+9. CHECK FOR SNAPSHOTTER AGGREGATION WINDOWS:
+   docker exec snapshot-sequencer-validator-redis-1 redis-cli KEYS "*spam:reports:snapshotter:*:window:*" | head -5
 
 DIAGNOSIS FORMAT:
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -78,9 +84,12 @@ EPOCH STATUS:
   Time to Boundary: [estimate if possible]
 
 WINDOW STATUS:
-  Redis Windows:    [COUNT or EMPTY]
+  Redis Windows (Peer ID):    [COUNT or EMPTY]
+  Redis Windows (Snapshotter): [COUNT or EMPTY]
   API Windows:      [COUNT or EMPTY]
   Last Created:     [window ID or "none"]
+  Collection Window: [ACTIVE/INACTIVE] - per-epoch report batching
+  Consensus Delay:  [SCHEDULED/NOT SCHEDULED] - at boundaries
 
 INITIALIZATION CHECKS:
   Spam Components:  [INITIALIZED/NOT INITIALIZED/ERROR]

@@ -40,6 +40,9 @@ cd $DSV_DIR
 
 2. RECENT SPAM-AGGREGATOR LOGS (last 20 lines):
    ./dsv.sh spam-aggregator-logs | tail -20
+   
+2b. CHECK FOR REPORT COLLECTION AND CONSENSUS:
+   ./dsv.sh event-logs | grep -iE "(Generated local spam report|Waiting.*seconds before sending reports|checking consensus|CheckWindowForConsensus)" | tail -10
 
 3. WINDOWS FROM API:
    curl -s "http://localhost:9091/api/v1/spam/windows" | jq '.'
