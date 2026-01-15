@@ -36,8 +36,9 @@ YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
 # Redis connection (defaults to localhost:6379)
+# Uses REDIS_BIND_PORT from .env.example (external binding port)
 REDIS_HOST="${REDIS_HOST:-localhost}"
-REDIS_PORT="${REDIS_PORT:-6379}"
+REDIS_PORT="${REDIS_BIND_PORT:-${REDIS_PORT:-6379}}"
 
 # Parse arguments
 CLEAR_ALL=true
@@ -92,7 +93,11 @@ fi
 echo -e "${GREEN}Clearing spam protection flagged state...${NC}"
 echo "Protocol State: $PROTOCOL_STATE"
 echo "Data Market: $DATA_MARKET"
-echo "Redis: $REDIS_HOST:$REDIS_PORT"
+if [ "$USE_DOCKER_EXEC" = true ]; then
+    echo "Redis: docker exec ${REDIS_CONTAINER} redis-cli"
+else
+    echo "Redis: $REDIS_HOST:$REDIS_PORT"
+fi
 if [ "$CLEAR_ALL" = true ]; then
     echo "Mode: Clear ALL flagged state"
 else
@@ -107,11 +112,36 @@ echo ""
 
 # Redis CLI command
 REDIS_CLI="redis-cli -h $REDIS_HOST -p $REDIS_PORT"
+USE_DOCKER_EXEC=false
+REDIS_CONTAINER=""
 
 # Check Redis connection
 if ! $REDIS_CLI ping > /dev/null 2>&1; then
-    echo -e "${RED}Error: Cannot connect to Redis at $REDIS_HOST:$REDIS_PORT${NC}"
-    exit 1
+    echo -e "${YELLOW}Warning: Cannot connect to Redis at $REDIS_HOST:$REDIS_PORT${NC}"
+    echo -e "${YELLOW}Attempting to use docker exec fallback...${NC}"
+    
+    # Try to find Redis container (parent directory name + -redis-1)
+    # Get parent directory name (git repo name)
+    PARENT_DIR=$(basename "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)")
+    REDIS_CONTAINER="${PARENT_DIR}-redis-1"
+    
+    # Check if container exists
+    if docker ps --format '{{.Names}}' | grep -q "^${REDIS_CONTAINER}$"; then
+        USE_DOCKER_EXEC=true
+        REDIS_CLI="docker exec ${REDIS_CONTAINER} redis-cli"
+        echo -e "${GREEN}Using docker exec with container: ${REDIS_CONTAINER}${NC}"
+        
+        # Test connection via docker exec
+        if ! $REDIS_CLI ping > /dev/null 2>&1; then
+            echo -e "${RED}Error: Cannot connect to Redis via docker exec${NC}"
+            exit 1
+        fi
+    else
+        echo -e "${RED}Error: Redis container '${REDIS_CONTAINER}' not found${NC}"
+        echo "Available containers:"
+        docker ps --format '{{.Names}}' | grep -i redis || echo "  (none found)"
+        exit 1
+    fi
 fi
 
 # Build patterns based on mode
@@ -132,7 +162,9 @@ else
     fi
     
     if [ -n "$SPECIFIC_SNAPSHOTTER_ADDR" ]; then
-        SNAPSHOTTER_PATTERN="${PROTOCOL_STATE}:${DATA_MARKET}:spam:consensus_flagged:snapshotter:${SPECIFIC_SNAPSHOTTER_ADDR}"
+        # Try both original case and lowercase (addresses might be stored in lowercase)
+        SNAPSHOTTER_ADDR_LOWER=$(echo "$SPECIFIC_SNAPSHOTTER_ADDR" | tr '[:upper:]' '[:lower:]')
+        SNAPSHOTTER_PATTERN="${PROTOCOL_STATE}:${DATA_MARKET}:spam:consensus_flagged:snapshotter:*"
         CLEAR_SNAPSHOTTER_SET=true
     else
         SNAPSHOTTER_PATTERN=""
@@ -230,13 +262,24 @@ fi
 DELETED_SNAPSHOTTERS=0
 if [ -n "$SNAPSHOTTER_PATTERN" ]; then
     echo -e "${YELLOW}Deleting flagged snapshotter keys...${NC}"
-    while IFS= read -r key; do
-        if [ -n "$key" ]; then
-            $REDIS_CLI DEL "$key" > /dev/null 2>&1
-            DELETED_SNAPSHOTTERS=$((DELETED_SNAPSHOTTERS + 1))
-            echo "  Deleted: $key"
-        fi
-    done < <($REDIS_CLI --scan --pattern "$SNAPSHOTTER_PATTERN" 2>/dev/null)
+    if [ -n "$SPECIFIC_SNAPSHOTTER_ADDR" ]; then
+        while IFS= read -r key; do
+            if [ -n "$key" ]; then
+                $REDIS_CLI DEL "$key" > /dev/null 2>&1
+                DELETED_SNAPSHOTTERS=$((DELETED_SNAPSHOTTERS + 1))
+                echo "  Deleted: $key"
+            fi
+        done < <($REDIS_CLI --scan --pattern "$SNAPSHOTTER_PATTERN" 2>/dev/null)
+    else
+        # For all snapshotters, delete all matching keys
+        while IFS= read -r key; do
+            if [ -n "$key" ]; then
+                $REDIS_CLI DEL "$key" > /dev/null 2>&1
+                DELETED_SNAPSHOTTERS=$((DELETED_SNAPSHOTTERS + 1))
+                echo "  Deleted: $key"
+            fi
+        done < <($REDIS_CLI --scan --pattern "$SNAPSHOTTER_PATTERN" 2>/dev/null)
+    fi
 fi
 
 # Remove from flagged sets
