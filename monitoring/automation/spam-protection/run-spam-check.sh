@@ -4,14 +4,9 @@
 # Full spam protection health check following Steps 0-6
 # Run from the decentralized-sequencer repository root
 
-set -e
-
-# Find repo root (where dsv.sh and this script exist)
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
-DSV_DIR="$REPO_ROOT"
-LOG_DIR="$SCRIPT_DIR/logs"
-MONITORING_DOC="$REPO_ROOT/docs/SPAM_PROTECTION_MONITORING.md"
+LOG_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/logs"
+DSV_DIR="/home/ubuntu/snapshot-sequencer-validator"
+MONITORING_DOC="$DSV_DIR/docs/SPAM_PROTECTION_MONITORING.md"
 
 mkdir -p "$LOG_DIR"
 
@@ -23,33 +18,18 @@ LOG_FILE="$LOG_DIR/spam-check-${TIMESTAMP}.txt"
   echo "=== DSV Spam Protection Check ==="
   echo "Started: $(date)"
   echo "Running on: $(hostname)"
-  echo "Repo root: $REPO_ROOT"
+  echo "DSV Directory: $DSV_DIR"
   echo ""
-} > "$LOG_FILE"
-
-# Pre-fetch monitoring documentation if available
-if [ -f "$MONITORING_DOC" ]; then
-    MONITORING_CONTENT=$(cat "$MONITORING_DOC")
-    PROMPT_INCLUDE="
-You have access to the monitoring guide. Reference it for detailed debugging steps.
-"
-else
-    PROMPT_INCLUDE="
-Note: SPAM_PROTECTION_MONITORING.md not found at $MONITORING_DOC. Proceeding with general troubleshooting.
-"
-fi
+} | tee "$LOG_FILE"
 
 # Run Claude with inline prompt (bypass all permission checks)
-claude -p --permission-mode bypassPermissions >> "$LOG_FILE" 2>&1 <<EOF
+claude -p --permission-mode bypassPermissions >> "$LOG_FILE" 2>&1 <<'EOF'
 You are a DSV monitoring assistant analyzing spam protection on this system.
-
-You are in the repository root: $REPO_ROOT
-$PROMPT_INCLUDE
 
 TASK: Execute Steps 0-6 from the SPAM_PROTECTION_MONITORING guide to diagnose spam protection status.
 
 Change to DSV directory and run the following checks sequentially:
-cd $DSV_DIR
+cd /home/ubuntu/snapshot-sequencer-validator
 
 Step 0: Verify DDoS Protection Components Initialized
 - Check dequeuer logs for initialization messages
@@ -64,8 +44,6 @@ Step 1: Check if EventMonitor is Processing Epochs
 Step 2: Check if Tracking is Happening
 - Check dequeuer logs for "tracked.*submission" or "tracked.*validation"
 - Look for peer tracking activity
-- Check for bulk service peer snapshotter tracking: "Tracked submission for bulk service peer"
-- Check for consecutive validation failure tracking: "consecutive.*validation.*failure"
 
 Step 3: Check Current Epoch and Window Boundaries
 - Get current epoch from API
@@ -74,19 +52,14 @@ Step 3: Check Current Epoch and Window Boundaries
 Step 4: Check Redis for Epoch Tracking Data
 - Verify epoch peer sets exist
 - Check for windows master set
-- Check for snapshotter address tracking keys (bulk service peers)
-- Check for both peer ID and snapshotter address aggregation windows
 
 Step 5: Check Monitoring API for Epoch Activity
 - Query /api/v1/spam/epochs
 - Query /api/v1/spam/windows
 
-Step 6: Verify Event-Monitor Window Creation and Report Collection
+Step 6: Verify Event-Monitor Window Creation
 - Check for "Successfully created spam aggregation window" messages
 - Verify window creation at boundaries
-- Check for collection window timers: "Waiting.*seconds before sending reports"
-- Check for report batching: "Generated local spam report" or "Stored.*spam report"
-- Check for consensus delay scheduling: "checking consensus" or "CheckWindowForConsensus"
 
 FINAL OUTPUT FORMAT:
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -107,16 +80,11 @@ EPOCH PROCESSING:
 TRACKING STATUS:
   Active:           [YES/NO]
   Peers Tracked:    [count if available]
-  Bulk Service Tracking: [YES/NO] - snapshotter address tracking
-  Consecutive Validation Failures: [YES/NO] - consecutive epoch tracking
 
 WINDOW CREATION:
   Windows Exist:    [YES/NO]
   Last Window:      [ID if available]
   Creation Status:  [WORKING/NOT WORKING]
-  Snapshotter Windows: [YES/NO] - bulk service peer aggregation windows
-  Collection Window: [ACTIVE/INACTIVE] - per-epoch report batching
-  Consensus Delay:  [SCHEDULED/NOT SCHEDULED] - at boundaries
 
 REDIS DATA:
   Epoch Keys:       [EXISTS/EMPTY]
@@ -131,7 +99,8 @@ RECOMMENDATIONS:
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 IMPORTANT INSTRUCTIONS:
-- Run commands directly in $DSV_DIR
+- All documentation is provided above. DO NOT ask to read any files.
+- You are already on the VPS - run commands directly in /home/ubuntu/snapshot-sequencer-validator
 - Use ./dsv.sh {component}-logs for log access
 - Use curl for API checks (port 9091)
 - Use docker exec for Redis queries
