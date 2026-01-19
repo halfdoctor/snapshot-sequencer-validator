@@ -48,7 +48,6 @@ type Aggregator struct {
 
 	// relayer-py integration
 	relayerPyEndpoint string       // relayer-py service endpoint
-	useNewContracts   bool         // Enable new contract submissions
 	httpClient        *http.Client // HTTP client for relayer communication
 
 	// Track aggregation state
@@ -107,14 +106,14 @@ func NewAggregator(cfg *config.Settings) (*Aggregator, error) {
 	if cfg.EnableOnChainSubmission {
 		log.Info("🔗 Initializing VPA client for priority checking")
 
-		// Fetch VPA address from NEW ProtocolState contract if not provided
+		// Fetch VPA address from ProtocolState contract if not provided
 		vpaContractAddr := common.HexToAddress(cfg.VPAContractAddress)
 		if vpaContractAddr == (common.Address{}) {
-			log.Infof("🔍 Fetching VPA address from NEW ProtocolState contract...")
+			log.Infof("🔍 Fetching VPA address from ProtocolState contract...")
 
 			// Use shared VPA fetching function
 			rpcURL := cfg.RPCNodes[0]
-			fetchedVPAAddress, err := vpa.FetchVPAAddress(rpcURL, cfg.NewProtocolStateContract)
+			fetchedVPAAddress, err := vpa.FetchVPAAddress(rpcURL, cfg.ProtocolStateContract)
 			if err != nil {
 				log.Warnf("⚠️  Failed to fetch VPA address: %v", err)
 				vpaContractAddr = common.Address{}
@@ -125,18 +124,17 @@ func NewAggregator(cfg *config.Settings) (*Aggregator, error) {
 		}
 
 		// Initialize VPA caching client with fetched address
-		// Use NEW data market address for Redis key building since we submit to new contracts
-		vpaDataMarket := cfg.NewDataMarket
-		if vpaDataMarket == "" {
-			// Fallback to old data market if new one not configured
-			vpaDataMarket = dataMarket
+		// Use first data market for Redis key building
+		vpaDataMarket := dataMarket
+		if len(cfg.DataMarketAddresses) > 0 {
+			vpaDataMarket = cfg.DataMarketAddresses[0]
 		}
 		if vpaContractAddr != (common.Address{}) && cfg.VPAValidatorAddress != "" {
 			// Use first RPC node for VPA
 			rpcURL := cfg.RPCNodes[0]
 			vpaClient, err = vpa.NewPriorityCachingClient(
 				rpcURL, vpaContractAddr.Hex(), cfg.VPAValidatorAddress,
-				redisClient, protocolState, vpaDataMarket, cfg.NewProtocolStateContract)
+				redisClient, protocolState, vpaDataMarket, cfg.ProtocolStateContract)
 			if err != nil {
 				cancel()
 				return nil, fmt.Errorf("failed to initialize VPA caching client: %w", err)
@@ -169,7 +167,6 @@ func NewAggregator(cfg *config.Settings) (*Aggregator, error) {
 		vpaClient:         vpaClient,
 		rpcClient:         rpcClient,
 		relayerPyEndpoint: cfg.RelayerPyEndpoint,
-		useNewContracts:   cfg.UseNewContracts,
 		httpClient: &http.Client{
 			Timeout: 30 * time.Second,
 		},
@@ -963,11 +960,9 @@ func (a *Aggregator) aggregateEpoch(epochIDStr string) {
 		"projects":         len(aggregatedBatch.ProjectVotes),
 	}).Info("Aggregator: Completed aggregation")
 
-	// Attempt new contract submission if enabled
-	if a.useNewContracts {
-		epochID, _ := strconv.ParseUint(epochIDStr, 10, 64)
-		go a.handleNewContractSubmission(epochID, &aggregatedBatch)
-	}
+	// Attempt VPA-based contract submission
+	epochIDUint, _ := strconv.ParseUint(epochIDStr, 10, 64)
+	go a.handleNewContractSubmission(epochIDUint, &aggregatedBatch)
 
 	// Add monitoring metrics for Level 2 aggregation
 	timestamp := time.Now().Unix()
@@ -1324,12 +1319,12 @@ func (a *Aggregator) handleNewContractSubmission(epochID uint64, aggregatedBatch
 		"projects": len(aggregatedBatch.ProjectIds),
 	}).Info("🚀 Starting new contract submission")
 
-	// Get new data market address for submission
-	newDataMarket := a.config.NewDataMarket
-	if newDataMarket == "" {
-		log.WithField("epoch", epochIDStr).Error("No new data market address configured")
+	// Get data market address for submission (use first configured market)
+	if len(a.config.DataMarketAddresses) == 0 {
+		log.WithField("epoch", epochIDStr).Error("No data market address configured")
 		return
 	}
+	newDataMarket := a.config.DataMarketAddresses[0]
 
 	// Check if already submitted
 	a.mu.Lock()
@@ -1626,7 +1621,7 @@ func (a *Aggregator) sendBatchSizeToRelayer(epochID uint64, dataMarketAddr strin
 // Returns true if endBatchSubmissions was called (submissions completed), false otherwise
 // This is used to prevent Priority 2+ validators from submitting if Priority 1 already completed submissions
 func (a *Aggregator) checkEpochHasSubmission(dataMarketAddr string, epochID uint64) (bool, error) {
-	if a.rpcClient == nil || a.config.NewProtocolStateContract == "" {
+	if a.rpcClient == nil || a.config.ProtocolStateContract == "" {
 		// Can't check on-chain, rely on contract's duplicate prevention
 		log.WithFields(logrus.Fields{
 			"epoch":       epochID,
@@ -1654,7 +1649,7 @@ func (a *Aggregator) checkEpochHasSubmission(dataMarketAddr string, epochID uint
 	eventSig := event.ID
 
 	// Prepare filter query
-	protocolStateAddr := common.HexToAddress(a.config.NewProtocolStateContract)
+	protocolStateAddr := common.HexToAddress(a.config.ProtocolStateContract)
 	dataMarket := common.HexToAddress(dataMarketAddr)
 	epochIDBig := big.NewInt(int64(epochID))
 
@@ -1703,14 +1698,8 @@ func (a *Aggregator) storePriorityCheck(epochID uint64, dataMarketAddr string, p
 	epochIDStr := strconv.FormatUint(epochID, 10)
 	timestamp := time.Now().Unix()
 
-	// Use NEW protocol state contract for VPA data if this is the new data market
-	// VPA data should be namespaced by new protocol:new market, not legacy protocol:new market
+	// Use protocol state contract for VPA data (namespaced)
 	protocolState := a.keyBuilder.ProtocolState
-	if a.config.NewDataMarket != "" && strings.EqualFold(dataMarketAddr, a.config.NewDataMarket) {
-		if a.config.NewProtocolState != "" {
-			protocolState = a.config.NewProtocolState
-		}
-	}
 
 	// Create KeyBuilder for this data market (namespaced)
 	kb := rediskeys.NewKeyBuilder(protocolState, dataMarketAddr)
@@ -1768,14 +1757,8 @@ func (a *Aggregator) storeSubmissionMetrics(epochID uint64, dataMarketAddr strin
 	epochIDStr := strconv.FormatUint(epochID, 10)
 	timestamp := time.Now().Unix()
 
-	// Use NEW protocol state contract for VPA data if this is the new data market
-	// VPA data should be namespaced by new protocol:new market, not legacy protocol:new market
+	// Use protocol state contract for VPA data (namespaced)
 	protocolState := a.keyBuilder.ProtocolState
-	if a.config.NewDataMarket != "" && strings.EqualFold(dataMarketAddr, a.config.NewDataMarket) {
-		if a.config.NewProtocolState != "" {
-			protocolState = a.config.NewProtocolState
-		}
-	}
 
 	// Create KeyBuilder for this data market (namespaced)
 	kb := rediskeys.NewKeyBuilder(protocolState, dataMarketAddr)

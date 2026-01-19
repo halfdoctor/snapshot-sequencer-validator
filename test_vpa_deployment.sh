@@ -38,7 +38,7 @@ source "$ENV_FILE"
 set +a
 
 # Validate required VPA variables
-REQUIRED_VARS=("USE_NEW_CONTRACTS" "NEW_PROTOCOL_STATE_CONTRACT" "NEW_DATA_MARKET_CONTRACT" "RELAYER_PY_ENDPOINT" "VPA_SIGNER_ADDRESSES" "VPA_SIGNER_PRIVATE_KEYS")
+REQUIRED_VARS=("PROTOCOL_STATE_CONTRACT" "DATA_MARKET_ADDRESSES" "RELAYER_PY_ENDPOINT" "VPA_SIGNER_ADDRESSES" "VPA_SIGNER_PRIVATE_KEYS")
 
 for var in "${REQUIRED_VARS[@]}"; do
     if [ -z "${!var}" ]; then
@@ -196,9 +196,8 @@ print_color "$GREEN" "   5. ✅ Docker build requirements validated"
 
 echo ""
 print_color "$CYAN" "🔧 Configuration Summary:"
-echo "   USE_NEW_CONTRACTS: $USE_NEW_CONTRACTS"
-echo "   Protocol State: $NEW_PROTOCOL_STATE_CONTRACT"
-echo "   Data Market: $NEW_DATA_MARKET_CONTRACT"
+echo "   Protocol State: $PROTOCOL_STATE_CONTRACT"
+echo "   Data Market: $DATA_MARKET_ADDRESSES"
 echo "   Signers: $(python3 -c "import json; data=json.load(open('/tmp/test_relayer_settings.json')); print(len(data.get('signers', [])))") configured"
 
 echo ""

@@ -31,11 +31,11 @@ var log = logrus.New()
 // @BasePath /api/v1
 
 type MonitorAPI struct {
-	redis            *redis.Client
-	ctx              context.Context
-	keyBuilder       *keys.KeyBuilder
-	newDataMarket    string // NEW_DATA_MARKET_CONTRACT for VPA endpoints
-	newProtocolState string // NEW_PROTOCOL_STATE_CONTRACT for VPA endpoints
+	redis         *redis.Client
+	ctx           context.Context
+	keyBuilder    *keys.KeyBuilder
+	dataMarket    string // First data market address for VPA endpoints (from DATA_MARKET_ADDRESSES)
+	protocolState string // Protocol state contract address for VPA endpoints
 }
 
 // DashboardSummary provides overall system health and metrics
@@ -169,14 +169,23 @@ type VPAStatsResponse struct {
 }
 
 func NewMonitorAPI(redisClient *redis.Client, protocol, market string) *MonitorAPI {
-	newMarket := getEnv("NEW_DATA_MARKET_CONTRACT", "")
-	newProtocol := getEnv("NEW_PROTOCOL_STATE_CONTRACT", "")
+	// Get protocol state contract and first data market for VPA endpoints
+	protocolState := getEnv("PROTOCOL_STATE_CONTRACT", "")
+	dataMarketsStr := getEnv("DATA_MARKET_ADDRESSES", "")
+	var dataMarket string
+	if dataMarketsStr != "" {
+		// Use first data market address
+		markets := strings.Split(dataMarketsStr, ",")
+		if len(markets) > 0 {
+			dataMarket = strings.TrimSpace(markets[0])
+		}
+	}
 	return &MonitorAPI{
-		redis:            redisClient,
-		ctx:              context.Background(),
-		keyBuilder:       keys.NewKeyBuilder(protocol, market),
-		newDataMarket:    newMarket,
-		newProtocolState: newProtocol,
+		redis:         redisClient,
+		ctx:           context.Background(),
+		keyBuilder:    keys.NewKeyBuilder(protocol, market),
+		dataMarket:    dataMarket,
+		protocolState: protocolState,
 	}
 }
 
@@ -1903,7 +1912,7 @@ func (m *MonitorAPI) VPAEpochStatus(c *gin.Context) {
 	protocol := c.Query("protocol")
 	market := c.Query("market")
 
-	// Use specified protocol/market or fall back to NEW_DATA_MARKET_CONTRACT (VPA is only for new markets)
+	// Use specified protocol/market or fall back to configured protocol/data market for VPA endpoints
 	kb := m.keyBuilder
 	if protocol != "" || market != "" {
 		if protocol == "" {
@@ -1914,13 +1923,13 @@ func (m *MonitorAPI) VPAEpochStatus(c *gin.Context) {
 		}
 		kb = keys.NewKeyBuilder(protocol, market)
 	} else {
-		// Default to NEW_DATA_MARKET_CONTRACT for VPA endpoints
-		if m.newDataMarket != "" {
+		// Default to configured protocol/data market for VPA endpoints
+		if m.dataMarket != "" {
 			protocolToUse := m.keyBuilder.ProtocolState
-			if m.newProtocolState != "" {
-				protocolToUse = m.newProtocolState
+			if m.protocolState != "" {
+				protocolToUse = m.protocolState
 			}
-			kb = keys.NewKeyBuilder(protocolToUse, m.newDataMarket)
+			kb = keys.NewKeyBuilder(protocolToUse, m.dataMarket)
 		}
 	}
 
@@ -1986,7 +1995,7 @@ func (m *MonitorAPI) VPATimeline(c *gin.Context) {
 	timelineType := c.DefaultQuery("type", "both")
 	limitStr := c.DefaultQuery("limit", "50")
 
-	// Use specified protocol/market or fall back to NEW_DATA_MARKET_CONTRACT (VPA is only for new markets)
+	// Use specified protocol/market or fall back to configured protocol/data market for VPA endpoints
 	kb := m.keyBuilder
 	if protocol != "" || market != "" {
 		if protocol == "" {
@@ -1997,13 +2006,13 @@ func (m *MonitorAPI) VPATimeline(c *gin.Context) {
 		}
 		kb = keys.NewKeyBuilder(protocol, market)
 	} else {
-		// Default to NEW_DATA_MARKET_CONTRACT for VPA endpoints
-		if m.newDataMarket != "" {
+		// Default to configured protocol/data market for VPA endpoints
+		if m.dataMarket != "" {
 			protocolToUse := m.keyBuilder.ProtocolState
-			if m.newProtocolState != "" {
-				protocolToUse = m.newProtocolState
+			if m.protocolState != "" {
+				protocolToUse = m.protocolState
 			}
-			kb = keys.NewKeyBuilder(protocolToUse, m.newDataMarket)
+			kb = keys.NewKeyBuilder(protocolToUse, m.dataMarket)
 		}
 	}
 
@@ -2088,7 +2097,7 @@ func (m *MonitorAPI) VPAStats(c *gin.Context) {
 	protocol := c.Query("protocol")
 	market := c.Query("market")
 
-	// Use specified protocol/market or fall back to NEW_DATA_MARKET_CONTRACT (VPA is only for new markets)
+	// Use specified protocol/market or fall back to configured protocol/data market for VPA endpoints
 	kb := m.keyBuilder
 	if protocol != "" || market != "" {
 		if protocol == "" {
@@ -2099,13 +2108,13 @@ func (m *MonitorAPI) VPAStats(c *gin.Context) {
 		}
 		kb = keys.NewKeyBuilder(protocol, market)
 	} else {
-		// Default to NEW_DATA_MARKET_CONTRACT for VPA endpoints
-		if m.newDataMarket != "" {
+		// Default to configured protocol/data market for VPA endpoints
+		if m.dataMarket != "" {
 			protocolToUse := m.keyBuilder.ProtocolState
-			if m.newProtocolState != "" {
-				protocolToUse = m.newProtocolState
+			if m.protocolState != "" {
+				protocolToUse = m.protocolState
 			}
-			kb = keys.NewKeyBuilder(protocolToUse, m.newDataMarket)
+			kb = keys.NewKeyBuilder(protocolToUse, m.dataMarket)
 		}
 	}
 
@@ -2176,7 +2185,7 @@ func (m *MonitorAPI) EpochLifecycle(c *gin.Context) {
 	protocol := c.Query("protocol")
 	market := c.Query("market")
 
-	// Use specified protocol/market or fall back to NEW_DATA_MARKET_CONTRACT
+	// Use specified protocol/market or fall back to configured protocol/data market
 	kb := m.keyBuilder
 	if protocol != "" || market != "" {
 		if protocol == "" {
@@ -2187,12 +2196,12 @@ func (m *MonitorAPI) EpochLifecycle(c *gin.Context) {
 		}
 		kb = keys.NewKeyBuilder(protocol, market)
 	} else {
-		if m.newDataMarket != "" {
+		if m.dataMarket != "" {
 			protocolToUse := m.keyBuilder.ProtocolState
-			if m.newProtocolState != "" {
-				protocolToUse = m.newProtocolState
+			if m.protocolState != "" {
+				protocolToUse = m.protocolState
 			}
-			kb = keys.NewKeyBuilder(protocolToUse, m.newDataMarket)
+			kb = keys.NewKeyBuilder(protocolToUse, m.dataMarket)
 		}
 	}
 

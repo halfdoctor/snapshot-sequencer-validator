@@ -107,7 +107,7 @@ services:
       - ENABLE_PROTOCOL_STATE_CACHER=${ENABLE_PROTOCOL_STATE_CACHER:-false}
       # Protocol State Cacher Configuration (needed to check cold sync status)
       - SLOT_SYNC_INTERVAL_SECONDS=${SLOT_SYNC_INTERVAL_SECONDS:-3600}
-      - CONTRACT_ABI_PATH=${CONTRACT_ABI_PATH:-./abi/LegacyProtocolState.json}
+      - CONTRACT_ABI_PATH=${CONTRACT_ABI_PATH:-./abi/PowerloomProtocolState.abi.json}
     depends_on:
       redis:
         condition: service_healthy
@@ -137,9 +137,6 @@ services:
       # VPA Configuration for priority monitoring
       - VPA_CONTRACT_ADDRESS=${VPA_CONTRACT_ADDRESS:-}
       - VPA_VALIDATOR_ADDRESS=${VPA_VALIDATOR_ADDRESS}
-      - NEW_PROTOCOL_STATE_CONTRACT=${NEW_PROTOCOL_STATE_CONTRACT}
-      - NEW_DATA_MARKET_CONTRACT=${NEW_DATA_MARKET_CONTRACT}
-      - USE_NEW_CONTRACTS=${USE_NEW_CONTRACTS}
       # Component toggles - ONLY EVENT MONITOR
       - ENABLE_LISTENER=false
       - ENABLE_DEQUEUER=false
@@ -162,7 +159,7 @@ services:
       - PROTOCOL_STATE_CONTRACT=${PROTOCOL_STATE_CONTRACT}
       - DATA_MARKET_ADDRESSES=${DATA_MARKET_ADDRESSES}
       # Contract ABI path
-      - CONTRACT_ABI_PATH=${CONTRACT_ABI_PATH:-./abi/LegacyProtocolState.json}
+      - CONTRACT_ABI_PATH=${CONTRACT_ABI_PATH:-./abi/PowerloomProtocolState.abi.json}
       # Event monitoring config
       - EVENT_POLL_INTERVAL=${EVENT_POLL_INTERVAL:-12}
       - EVENT_START_BLOCK=${EVENT_START_BLOCK:-0}
@@ -206,7 +203,7 @@ services:
       # Contract addresses
       - PROTOCOL_STATE_CONTRACT=${PROTOCOL_STATE_CONTRACT}
       # Contract ABI path
-      - CONTRACT_ABI_PATH=${CONTRACT_ABI_PATH:-./abi/LegacyProtocolState.json}
+      - CONTRACT_ABI_PATH=${CONTRACT_ABI_PATH:-./abi/PowerloomProtocolState.abi.json}
       # Protocol State Cacher Configuration
       - SLOT_SYNC_INTERVAL_SECONDS=${SLOT_SYNC_INTERVAL_SECONDS:-3600}
       - SLOT_SYNC_BATCH_SIZE=${SLOT_SYNC_BATCH_SIZE:-20}
@@ -326,9 +323,6 @@ services:
       - PROTOCOL_STATE_CONTRACT=${PROTOCOL_STATE_CONTRACT}
       - DATA_MARKET_ADDRESSES=${DATA_MARKET_ADDRESSES}
       - POWERLOOM_RPC_NODES=${POWERLOOM_RPC_NODES}
-      - NEW_PROTOCOL_STATE_CONTRACT=${NEW_PROTOCOL_STATE_CONTRACT}
-      - NEW_DATA_MARKET_CONTRACT=${NEW_DATA_MARKET_CONTRACT}
-      - USE_NEW_CONTRACTS=${USE_NEW_CONTRACTS}
       # VPA Configuration - Required for VPA client initialization
       - ENABLE_ONCHAIN_SUBMISSION=${ENABLE_ONCHAIN_SUBMISSION:-true}
       - VPA_CONTRACT_ADDRESS=${VPA_CONTRACT_ADDRESS:-}

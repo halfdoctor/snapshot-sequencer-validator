@@ -22,11 +22,10 @@ type Settings struct {
 	SequencerID string
 
 	// Ethereum RPC Configuration
-	RPCNodes                 []string // Primary RPC nodes for load balancing
-	ArchiveRPCNodes          []string // Archive nodes for historical queries
-	ProtocolStateContract    string   // Protocol state contract address (manages identities)
-	NewProtocolStateContract string   // NEW ProtocolState contract address (VPA-enabled)
-	ChainID                  int64
+	RPCNodes              []string // Primary RPC nodes for load balancing
+	ArchiveRPCNodes       []string // Archive nodes for historical queries
+	ProtocolStateContract string   // Protocol state contract address (manages identities, VPA-enabled)
+	ChainID               int64
 
 	// Data Market Configuration
 	DataMarketAddresses []string         // String addresses
@@ -132,11 +131,8 @@ type Settings struct {
 	VPAContractAddress  string // VPA contract address for priority monitoring
 	VPAValidatorAddress string // This validator's address for VPA client
 
-	// New Contract Submission Configuration
-	RelayerPyEndpoint string // relayer-py service endpoint for new contract submissions
-	UseNewContracts   bool   // Enable submission to new VPA-enabled contracts
-	NewProtocolState  string // New ProtocolState contract address
-	NewDataMarket     string // New DataMarket contract address
+	// VPA Contract Submission Configuration
+	RelayerPyEndpoint string // relayer-py service endpoint for VPA-based contract submissions
 
 	// Stream Configuration for Deterministic Aggregation
 	StreamConsumerGroup string        // Consumer group name for aggregator
@@ -296,11 +292,8 @@ func LoadConfig() error {
 		VPAContractAddress:  getEnv("VPA_CONTRACT_ADDRESS", ""),
 		VPAValidatorAddress: getEnv("VPA_VALIDATOR_ADDRESS", ""),
 
-		// New Contract Submission Configuration
+		// VPA Contract Submission Configuration
 		RelayerPyEndpoint: getEnv("RELAYER_PY_ENDPOINT", ""),
-		UseNewContracts:   getBoolEnv("USE_NEW_CONTRACTS", false),
-		NewProtocolState:  getEnv("NEW_PROTOCOL_STATE_CONTRACT", ""),
-		NewDataMarket:     getEnv("NEW_DATA_MARKET_CONTRACT", ""),
 
 		// Stream Configuration for Deterministic Aggregation
 		StreamConsumerGroup: getEnv("STREAM_CONSUMER_GROUP", "aggregator-group"),
@@ -344,8 +337,7 @@ func LoadConfig() error {
 		IPFSAPI: getEnv("IPFS_HOST", ""),
 
 		// Contract Addresses
-		ProtocolStateContract:    getEnv("PROTOCOL_STATE_CONTRACT", ""),
-		NewProtocolStateContract: getEnv("NEW_PROTOCOL_STATE_CONTRACT", ""),
+		ProtocolStateContract: getEnv("PROTOCOL_STATE_CONTRACT", ""),
 
 		// P2P Gateway Submission Processing Configuration
 		P2PGatewaySubmissionWorkers:  getEnvAsInt("P2P_GATEWAY_SUBMISSION_WORKERS", 10),

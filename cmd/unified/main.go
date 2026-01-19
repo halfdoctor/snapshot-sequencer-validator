@@ -679,21 +679,14 @@ func main() {
 			FinalizationBatchSize: cfg.FinalizationBatchSize,
 
 			// VPA Configuration
-			VPAContractAddress:       cfg.VPAContractAddress,
-			VPAValidatorAddress:      cfg.VPAValidatorAddress,
-			VPARPCURL:                strings.Join(cfg.RPCNodes, ","), // Use RPCNodes from config
-			ProtocolState:            cfg.ProtocolStateContract,
-			NewProtocolStateContract: cfg.NewProtocolStateContract, // Use from config, not os.Getenv
+			VPAContractAddress:  cfg.VPAContractAddress,
+			VPAValidatorAddress: cfg.VPAValidatorAddress,
+			VPARPCURL:           strings.Join(cfg.RPCNodes, ","), // Use RPCNodes from config
+			ProtocolState:       cfg.ProtocolStateContract,
 
 			// Window Config Configuration
 			WindowConfigCacheTTL: 5 * time.Minute, // Default cache TTL
 			EstimatedMaxPriority: 10,              // Default safe upper bound for total window calculation
-			NewDataMarketContracts: func() []string {
-				if cfg.NewDataMarket != "" {
-					return []string{cfg.NewDataMarket}
-				}
-				return []string{}
-			}(),
 
 			// Spam protection components
 			SpamComponents: spamComponents,
