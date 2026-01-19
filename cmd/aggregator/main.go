@@ -40,22 +40,21 @@ type Aggregator struct {
 	redisClient *redis.Client
 	ipfsClient  *ipfs.Client
 	config      *config.Settings
-	keyBuilder  *rediskeys.KeyBuilder
+	keyBuilders map[string]*rediskeys.KeyBuilder // dataMarket -> KeyBuilder (for multi-market support)
 
 	// Contract clients for on-chain integration
-	vpaClient *vpa.PriorityCachingClient // Enhanced caching client for VPA priority checking
-	rpcClient *ethclient.Client          // Ethereum RPC client for on-chain checks
+	vpaClients map[string]*vpa.PriorityCachingClient // dataMarket -> VPA client (one per data market)
+	rpcClient  *ethclient.Client                     // Ethereum RPC client for on-chain checks
 
 	// relayer-py integration
 	relayerPyEndpoint string       // relayer-py service endpoint
 	httpClient        *http.Client // HTTP client for relayer communication
 
-	// Track aggregation state
-	epochBatches map[uint64]map[string]*consensus.FinalizedBatch // epochID -> validatorID -> batch
-	epochTimers  map[uint64]*time.Timer                          // epochID -> aggregation window timer
+	// Track aggregation state (using composite keys: dataMarket:epochID)
+	epochTimers map[string]*time.Timer // "dataMarket:epochID" -> aggregation window timer
 
-	// Track submission state
-	submissionState map[uint64]bool // epochID -> submitted
+	// Track submission state (using composite keys: dataMarket:epochID)
+	submissionState map[string]bool // "dataMarket:epochID" -> submitted
 
 	mu sync.RWMutex
 }
@@ -91,20 +90,11 @@ func NewAggregator(cfg *config.Settings) (*Aggregator, error) {
 		}
 	}
 
-	// Create key builder with first data market (assuming single market for now)
-	protocolState := cfg.ProtocolStateContract
-	dataMarket := ""
-	if len(cfg.DataMarketAddresses) > 0 {
-		dataMarket = cfg.DataMarketAddresses[0]
-	}
-	keyBuilder := rediskeys.NewKeyBuilder(protocolState, dataMarket)
-
-	// Initialize VPA client for priority checking (required for new contract submissions)
-	var vpaClient *vpa.PriorityCachingClient
-	var err error
+	// Initialize VPA clients for priority checking (one per data market)
+	vpaClients := make(map[string]*vpa.PriorityCachingClient)
 
 	if cfg.EnableOnChainSubmission {
-		log.Info("🔗 Initializing VPA client for priority checking")
+		log.Info("🔗 Initializing VPA clients for priority checking")
 
 		// Fetch VPA address from ProtocolState contract if not provided
 		vpaContractAddr := common.HexToAddress(cfg.VPAContractAddress)
@@ -123,23 +113,21 @@ func NewAggregator(cfg *config.Settings) (*Aggregator, error) {
 			}
 		}
 
-		// Initialize VPA caching client with fetched address
-		// Use first data market for Redis key building
-		vpaDataMarket := dataMarket
-		if len(cfg.DataMarketAddresses) > 0 {
-			vpaDataMarket = cfg.DataMarketAddresses[0]
-		}
+		// Initialize VPA caching client for each data market
 		if vpaContractAddr != (common.Address{}) && cfg.VPAValidatorAddress != "" {
-			// Use first RPC node for VPA
 			rpcURL := cfg.RPCNodes[0]
-			vpaClient, err = vpa.NewPriorityCachingClient(
-				rpcURL, vpaContractAddr.Hex(), cfg.VPAValidatorAddress,
-				redisClient, protocolState, vpaDataMarket, cfg.ProtocolStateContract)
-			if err != nil {
-				cancel()
-				return nil, fmt.Errorf("failed to initialize VPA caching client: %w", err)
+			for _, dataMarket := range cfg.DataMarketAddresses {
+				checksummedMarket := common.HexToAddress(dataMarket).Hex()
+				vpaClient, err := vpa.NewPriorityCachingClient(
+					rpcURL, vpaContractAddr.Hex(), cfg.VPAValidatorAddress,
+					redisClient, cfg.ProtocolStateContract, checksummedMarket, "")
+				if err != nil {
+					cancel()
+					return nil, fmt.Errorf("failed to initialize VPA caching client for data market %s: %w", checksummedMarket, err)
+				}
+				vpaClients[checksummedMarket] = vpaClient
+				log.WithField("data_market", checksummedMarket).Info("✅ VPA caching client initialized")
 			}
-			log.Info("✅ VPA caching client initialized")
 		} else {
 			log.Warn("⚠️  VPA contract address or validator address not available")
 		}
@@ -163,50 +151,60 @@ func NewAggregator(cfg *config.Settings) (*Aggregator, error) {
 		redisClient:       redisClient,
 		ipfsClient:        ipfsClient,
 		config:            cfg,
-		keyBuilder:        keyBuilder,
-		vpaClient:         vpaClient,
+		keyBuilders:       make(map[string]*rediskeys.KeyBuilder),
+		vpaClients:        vpaClients,
 		rpcClient:         rpcClient,
 		relayerPyEndpoint: cfg.RelayerPyEndpoint,
 		httpClient: &http.Client{
 			Timeout: 30 * time.Second,
 		},
-		epochBatches:    make(map[uint64]map[string]*consensus.FinalizedBatch),
-		epochTimers:     make(map[uint64]*time.Timer),
-		submissionState: make(map[uint64]bool),
+		epochTimers:     make(map[string]*time.Timer),
+		submissionState: make(map[string]bool),
 	}
 
-	// Initialize stream consumer (mandatory for deterministic aggregation)
-	if err := aggregator.initializeStreamConsumer(); err != nil {
+	// Initialize stream consumers for all data markets (mandatory for deterministic aggregation)
+	if err := aggregator.initializeStreamConsumers(); err != nil {
 		cancel()
-		return nil, fmt.Errorf("failed to initialize stream consumer: %w", err)
+		return nil, fmt.Errorf("failed to initialize stream consumers: %w", err)
 	}
 
 	return aggregator, nil
 }
 
-// initializeStreamConsumer sets up the aggregator as a stream consumer
-func (a *Aggregator) initializeStreamConsumer() error {
-	streamKey := a.keyBuilder.AggregationStream()
+// initializeStreamConsumers sets up stream consumers for all configured data markets
+func (a *Aggregator) initializeStreamConsumers() error {
 	groupName := a.config.StreamConsumerGroup
 	consumerName := a.config.StreamConsumerName
 
-	log.WithFields(logrus.Fields{
-		"stream":   streamKey,
-		"group":    groupName,
-		"consumer": consumerName,
-	}).Info("Initializing Redis stream consumer")
+	// Initialize stream consumer for each data market
+	for _, dataMarket := range a.config.DataMarketAddresses {
+		// Normalize to checksummed format
+		checksummedMarket := common.HexToAddress(dataMarket).Hex()
+		kb := a.getKeyBuilder(checksummedMarket)
+		streamKey := kb.AggregationStream()
 
-	// Ensure consumer group exists (create with stream if needed)
-	err := a.redisClient.XGroupCreateMkStream(a.ctx, streamKey, groupName, "0").Err()
-	if err != nil {
-		if err.Error() != "BUSYGROUP Consumer Group name already exists" {
-			return fmt.Errorf("failed to create consumer group: %w", err)
+		log.WithFields(logrus.Fields{
+			"stream":      streamKey,
+			"data_market": checksummedMarket,
+			"group":       groupName,
+			"consumer":    consumerName,
+		}).Info("Initializing Redis stream consumer")
+
+		// Ensure consumer group exists (create with stream if needed)
+		err := a.redisClient.XGroupCreateMkStream(a.ctx, streamKey, groupName, "0").Err()
+		if err != nil {
+			if err.Error() != "BUSYGROUP Consumer Group name already exists" {
+				return fmt.Errorf("failed to create consumer group for data market %s: %w", checksummedMarket, err)
+			}
+			log.WithFields(logrus.Fields{
+				"group":       groupName,
+				"data_market": checksummedMarket,
+			}).Info("Consumer group already exists")
 		}
-		log.WithField("group", groupName).Info("Consumer group already exists")
-	}
 
-	// Start stream consumer goroutine
-	go a.consumeStreamMessages()
+		// Start stream consumer goroutine for this data market
+		go a.consumeStreamMessages(checksummedMarket, kb)
+	}
 
 	// Start consumer health monitoring
 	go a.monitorConsumerHealth()
@@ -214,16 +212,17 @@ func (a *Aggregator) initializeStreamConsumer() error {
 	return nil
 }
 
-// consumeStreamMessages consumes messages from the aggregation stream
-func (a *Aggregator) consumeStreamMessages() {
-	streamKey := a.keyBuilder.AggregationStream()
+// consumeStreamMessages consumes messages from the aggregation stream for a specific data market
+func (a *Aggregator) consumeStreamMessages(dataMarket string, kb *rediskeys.KeyBuilder) {
+	streamKey := kb.AggregationStream()
 	groupName := a.config.StreamConsumerGroup
 	consumerName := a.config.StreamConsumerName
 
 	log.WithFields(logrus.Fields{
-		"stream":   streamKey,
-		"group":    groupName,
-		"consumer": consumerName,
+		"stream":      streamKey,
+		"data_market": dataMarket,
+		"group":       groupName,
+		"consumer":    consumerName,
 	}).Info("Starting stream consumer")
 
 	for {
@@ -249,7 +248,10 @@ func (a *Aggregator) consumeStreamMessages() {
 					// Context cancelled, exit
 					return
 				}
-				log.WithError(err).Error("Failed to read from stream")
+				log.WithError(err).WithFields(logrus.Fields{
+					"stream":      streamKey,
+					"data_market": dataMarket,
+				}).Error("Failed to read from stream")
 				time.Sleep(5 * time.Second) // Back off on error
 				continue
 			}
@@ -259,12 +261,13 @@ func (a *Aggregator) consumeStreamMessages() {
 				for _, message := range stream.Messages {
 					if err := a.processStreamMessage(message); err != nil {
 						log.WithError(err).WithFields(logrus.Fields{
-							"message_id": message.ID,
-							"stream":     streamKey,
+							"message_id":  message.ID,
+							"stream":      streamKey,
+							"data_market": dataMarket,
 						}).Error("Failed to process stream message")
 
 						// Move problematic message to dead letter queue
-						a.moveToDeadLetterQueue(streamKey, groupName, message)
+						a.moveToDeadLetterQueue(streamKey, groupName, message, dataMarket)
 					}
 				}
 			}
@@ -300,12 +303,27 @@ func (a *Aggregator) processStreamMessage(message redis.XMessage) error {
 		return fmt.Errorf("missing type field in message")
 	}
 
+	// Extract data_market (mandatory field)
+	dataMarketRaw, ok := message.Values["data_market"]
+	if !ok {
+		log.Warnf("Skipping stream message without data_market field - old format not supported: %v", message.ID)
+		return nil
+	}
+	dataMarketStr, ok := dataMarketRaw.(string)
+	if !ok || dataMarketStr == "" {
+		log.Warnf("Skipping stream message without data_market field - old format not supported: %v", message.ID)
+		return nil
+	}
+	// Normalize to checksummed format
+	dataMarket := common.HexToAddress(dataMarketStr).Hex()
+
 	log.WithFields(logrus.Fields{
-		"message_id": message.ID,
-		"epoch":      epoch,
-		"validator":  validator,
-		"type":       msgType,
-		"timestamp":  timestamp,
+		"message_id":  message.ID,
+		"epoch":       epoch,
+		"validator":   validator,
+		"type":        msgType,
+		"timestamp":   timestamp,
+		"data_market": dataMarket,
 	}).Debug("Processing stream message")
 
 	// Only process validator batch messages
@@ -314,8 +332,11 @@ func (a *Aggregator) processStreamMessage(message redis.XMessage) error {
 		return nil
 	}
 
+	// Get appropriate KeyBuilder for this data market
+	kb := a.getKeyBuilder(dataMarket)
+
 	// Check if epoch is already aggregated
-	aggregatedKey := a.keyBuilder.BatchAggregated(epoch)
+	aggregatedKey := kb.BatchAggregated(epoch)
 	exists, err := a.redisClient.Exists(a.ctx, aggregatedKey).Result()
 	if err != nil {
 		return fmt.Errorf("failed to check aggregation status: %w", err)
@@ -326,14 +347,14 @@ func (a *Aggregator) processStreamMessage(message redis.XMessage) error {
 		return nil
 	}
 
-	// Start or extend aggregation window for this epoch
-	a.startAggregationWindow(epoch)
+	// Start or extend aggregation window for this epoch (with data market)
+	a.startAggregationWindow(epoch, dataMarket)
 
 	return nil
 }
 
 // moveToDeadLetterQueue moves problematic messages to a dead letter queue
-func (a *Aggregator) moveToDeadLetterQueue(streamKey, groupName string, message redis.XMessage) {
+func (a *Aggregator) moveToDeadLetterQueue(streamKey, groupName string, message redis.XMessage, dataMarket string) {
 	deadLetterKey := streamKey + ":dlq"
 
 	// Add message to dead letter queue with metadata
@@ -343,6 +364,7 @@ func (a *Aggregator) moveToDeadLetterQueue(streamKey, groupName string, message 
 		"error_time":     time.Now().Unix(),
 		"consumer_group": groupName,
 		"error_reason":   "processing_failed",
+		"data_market":    dataMarket,
 	}
 
 	if err := a.redisClient.XAdd(a.ctx, &redis.XAddArgs{
@@ -358,10 +380,11 @@ func (a *Aggregator) moveToDeadLetterQueue(streamKey, groupName string, message 
 	log.WithFields(logrus.Fields{
 		"message_id":  message.ID,
 		"dead_letter": deadLetterKey,
+		"data_market": dataMarket,
 	}).Warn("Moved problematic message to dead letter queue")
 }
 
-// monitorConsumerHealth monitors the health of the stream consumer
+// monitorConsumerHealth monitors the health of stream consumers for all data markets
 func (a *Aggregator) monitorConsumerHealth() {
 	ticker := time.NewTicker(120 * time.Second) // Check every 2 minutes
 	defer ticker.Stop()
@@ -371,48 +394,59 @@ func (a *Aggregator) monitorConsumerHealth() {
 		case <-a.ctx.Done():
 			return
 		case <-ticker.C:
-			streamKey := a.keyBuilder.AggregationStream()
 			groupName := a.config.StreamConsumerGroup
 			consumerName := a.config.StreamConsumerName
 
-			// Check consumer info
-			consumers, err := a.redisClient.XInfoConsumers(a.ctx, streamKey, groupName).Result()
-			if err != nil {
-				log.WithError(err).Error("Failed to get consumer info")
-				continue
-			}
+			// Monitor health for each data market stream
+			for _, dataMarket := range a.config.DataMarketAddresses {
+				checksummedMarket := common.HexToAddress(dataMarket).Hex()
+				kb := a.getKeyBuilder(checksummedMarket)
+				streamKey := kb.AggregationStream()
 
-			// Find our consumer
-			var ourConsumer *redis.XInfoConsumer
-			for _, consumer := range consumers {
-				if consumer.Name == consumerName {
-					ourConsumer = &consumer
-					break
+				// Check consumer info
+				consumers, err := a.redisClient.XInfoConsumers(a.ctx, streamKey, groupName).Result()
+				if err != nil {
+					log.WithError(err).WithField("data_market", checksummedMarket).Error("Failed to get consumer info")
+					continue
 				}
-			}
 
-			if ourConsumer == nil {
-				log.WithField("consumer", consumerName).Warn("Our consumer not found in group")
-				continue
-			}
+				// Find our consumer
+				var ourConsumer *redis.XInfoConsumer
+				for _, consumer := range consumers {
+					if consumer.Name == consumerName {
+						ourConsumer = &consumer
+						break
+					}
+				}
 
-			// Log consumer health
-			log.WithFields(logrus.Fields{
-				"consumer": consumerName,
-				"pending":  ourConsumer.Pending,
-				"idle":     ourConsumer.Idle,
-			}).Debug("Consumer health check")
+				if ourConsumer == nil {
+					log.WithFields(logrus.Fields{
+						"consumer":    consumerName,
+						"data_market": checksummedMarket,
+					}).Warn("Our consumer not found in group")
+					continue
+				}
 
-			// Check for long idle time (potential consumer stall)
-			if time.Duration(ourConsumer.Idle) > a.config.StreamIdleTimeout {
+				// Log consumer health
 				log.WithFields(logrus.Fields{
-					"consumer": consumerName,
-					"idle":     ourConsumer.Idle,
-					"pending":  ourConsumer.Pending,
-				}).Warn("Consumer appears stalled")
+					"consumer":    consumerName,
+					"data_market": checksummedMarket,
+					"pending":     ourConsumer.Pending,
+					"idle":        ourConsumer.Idle,
+				}).Debug("Consumer health check")
 
-				// Attempt to claim stalled messages
-				a.claimStalledMessages(streamKey, groupName, consumerName)
+				// Check for long idle time (potential consumer stall)
+				if time.Duration(ourConsumer.Idle) > a.config.StreamIdleTimeout {
+					log.WithFields(logrus.Fields{
+						"consumer":    consumerName,
+						"data_market": checksummedMarket,
+						"idle":        ourConsumer.Idle,
+						"pending":     ourConsumer.Pending,
+					}).Warn("Consumer appears stalled")
+
+					// Attempt to claim stalled messages
+					a.claimStalledMessages(streamKey, groupName, consumerName)
+				}
 			}
 		}
 	}
@@ -473,16 +507,22 @@ func (a *Aggregator) claimStalledMessages(streamKey, groupName, consumerName str
 }
 
 func (a *Aggregator) processAggregationQueue() {
-	// Get namespaced queue key for Level 1 aggregation only
-	level1Queue := a.keyBuilder.AggregationQueueLevel1()
+	// Process Level 1 aggregation queues for all configured data markets
+	queueKeys := make([]string, 0, len(a.config.DataMarketAddresses))
+	for _, dataMarket := range a.config.DataMarketAddresses {
+		checksummedMarket := common.HexToAddress(dataMarket).Hex()
+		kb := a.getKeyBuilder(checksummedMarket)
+		queueKeys = append(queueKeys, kb.AggregationQueueLevel1())
+	}
 
 	for {
 		select {
 		case <-a.ctx.Done():
 			return
 		default:
-			// Check for Level 1 aggregation (finalizer worker parts) - namespaced
-			result, err := a.redisClient.BRPop(a.ctx, time.Second, level1Queue).Result()
+			// Check for Level 1 aggregation (finalizer worker parts) - namespaced by data market
+			// BRPop with multiple keys will pop from the first available queue
+			result, err := a.redisClient.BRPop(a.ctx, time.Second, queueKeys...).Result()
 			if err == nil && len(result) >= 2 {
 				// Parse the complex JSON from finalizer workers
 				var aggData map[string]interface{}
@@ -534,24 +574,57 @@ func parseEpochID(epochIDStr string) (uint64, error) {
 	return uint64(floatVal), nil
 }
 
-// startAggregationWindow initiates or extends the aggregation window for Level 2
-func (a *Aggregator) startAggregationWindow(epochIDStr string) {
+// getKeyBuilder returns a KeyBuilder for the given data market, creating one if needed.
+// The dataMarket address is normalized to checksummed format before use.
+func (a *Aggregator) getKeyBuilder(dataMarket string) *rediskeys.KeyBuilder {
+	// Normalize to checksummed format
+	checksummedMarket := common.HexToAddress(dataMarket).Hex()
+
+	a.mu.RLock()
+	kb, exists := a.keyBuilders[checksummedMarket]
+	a.mu.RUnlock()
+
+	if exists {
+		return kb
+	}
+
+	// Create new KeyBuilder for this data market
+	kb = rediskeys.NewKeyBuilder(a.config.ProtocolStateContract, checksummedMarket)
+
+	a.mu.Lock()
+	a.keyBuilders[checksummedMarket] = kb
+	a.mu.Unlock()
+
+	return kb
+}
+
+func (a *Aggregator) startAggregationWindow(epochIDStr string, dataMarket string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
-	// Convert to uint64 for map key
+	// Convert to uint64 for validation
 	epochID, err := parseEpochID(epochIDStr)
 	if err != nil {
 		log.WithError(err).Error("Failed to parse epoch ID for aggregation window")
 		return
 	}
 
+	// Use composite key: dataMarket:epochID
+	checksummedMarket := common.HexToAddress(dataMarket).Hex()
+	compositeKey := fmt.Sprintf("%s:%d", checksummedMarket, epochID)
+
 	// Check if timer already exists
-	if _, exists := a.epochTimers[epochID]; exists {
+	if _, exists := a.epochTimers[compositeKey]; exists {
 		// Window already started - just log that we received another batch
-		log.WithField("epoch", epochID).Info("⏱️  Additional validator batch received during aggregation window")
+		log.WithFields(logrus.Fields{
+			"epoch":       epochID,
+			"data_market": checksummedMarket,
+		}).Info("⏱️  Additional validator batch received during aggregation window")
 		return
 	}
+
+	// Get KeyBuilder for this data market
+	kb := a.getKeyBuilder(dataMarket)
 
 	// Start new aggregation window timer
 	timer := time.AfterFunc(a.config.AggregationWindowDuration, func() {
@@ -561,7 +634,7 @@ func (a *Aggregator) startAggregationWindow(epochIDStr string) {
 		}).Info("⏰ Aggregation window expired - finalizing Level 2 aggregation")
 
 		// Update epoch state - transitioning to aggregating phase
-		epochStateKey := a.keyBuilder.EpochState(epochIDStr)
+		epochStateKey := kb.EpochState(epochIDStr)
 		a.redisClient.HSet(a.ctx, epochStateKey, map[string]interface{}{
 			"level2_status": "aggregating",
 			"last_updated":  time.Now().Unix(),
@@ -569,19 +642,20 @@ func (a *Aggregator) startAggregationWindow(epochIDStr string) {
 		a.redisClient.Expire(a.ctx, epochStateKey, 7*24*time.Hour)
 
 		// Perform aggregation after window expires
-		a.aggregateEpoch(epochIDStr)
+		a.aggregateEpoch(epochIDStr, dataMarket)
 
 		// Clean up timer
 		a.mu.Lock()
-		delete(a.epochTimers, epochID)
+		delete(a.epochTimers, compositeKey)
 		a.mu.Unlock()
 	})
 
-	a.epochTimers[epochID] = timer
+	a.epochTimers[compositeKey] = timer
 
 	// Update epoch state hash - Level 2 aggregation started (collecting phase)
+	// kb is already set above (line 633)
 	timestamp := time.Now().Unix()
-	epochStateKey := a.keyBuilder.EpochState(epochIDStr)
+	epochStateKey := kb.EpochState(epochIDStr)
 	a.redisClient.HSet(a.ctx, epochStateKey, map[string]interface{}{
 		"level2_status":     "collecting",
 		"level2_started_at": timestamp,
@@ -607,9 +681,23 @@ func (a *Aggregator) aggregateWorkerParts(epochIDStr string, totalParts int) {
 
 	// Collect all batch parts from finalizer workers
 	aggregatedResults := make(map[string]interface{})
+	var dataMarket string
+	var kb *rediskeys.KeyBuilder // Will be set after extracting dataMarket from first part
 
 	for i := 0; i < totalParts; i++ {
-		partKey := a.keyBuilder.BatchPart(strconv.FormatUint(epochID, 10), i)
+		// Get KeyBuilder - use kb if we've extracted dataMarket, otherwise try first configured market
+		var partKeyBuilder *rediskeys.KeyBuilder
+		if kb != nil {
+			partKeyBuilder = kb
+		} else if len(a.config.DataMarketAddresses) > 0 {
+			// Before we know the data market, try the first configured one
+			// This will be corrected once we extract dataMarket from the first part
+			partKeyBuilder = a.getKeyBuilder(common.HexToAddress(a.config.DataMarketAddresses[0]).Hex())
+		} else {
+			log.Errorf("No data markets configured, cannot get batch part %d", i)
+			continue
+		}
+		partKey := partKeyBuilder.BatchPart(strconv.FormatUint(epochID, 10), i)
 		partData, err := a.redisClient.Get(a.ctx, partKey).Result()
 		if err != nil {
 			log.Errorf("Failed to get batch part %d for epoch %d: %v", i, epochID, err)
@@ -622,8 +710,33 @@ func (a *Aggregator) aggregateWorkerParts(epochIDStr string, totalParts int) {
 			continue
 		}
 
+		// Extract data_market from first batch part (mandatory field)
+		if i == 0 {
+			dataMarketRaw, ok := partResults["data_market"]
+			if !ok {
+				log.Warnf("Skipping batch part without data_market field - old format not supported: epoch=%s, part=%d", epochIDStr, i)
+				return
+			}
+			dataMarketStr, ok := dataMarketRaw.(string)
+			if !ok || dataMarketStr == "" {
+				log.Warnf("Skipping batch part without data_market field - old format not supported: epoch=%s, part=%d", epochIDStr, i)
+				return
+			}
+			// Normalize to checksummed format
+			dataMarket = common.HexToAddress(dataMarketStr).Hex()
+			// Get KeyBuilder for this data market
+			kb = a.getKeyBuilder(dataMarket)
+		}
+
+		// Extract projects from partResults
+		projects, ok := partResults["projects"].(map[string]interface{})
+		if !ok {
+			log.Errorf("Failed to extract projects from batch part %d", i)
+			continue
+		}
+
 		// Merge results from this worker
-		for projectID, data := range partResults {
+		for projectID, data := range projects {
 			aggregatedResults[projectID] = data
 		}
 
@@ -632,7 +745,17 @@ func (a *Aggregator) aggregateWorkerParts(epochIDStr string, totalParts int) {
 	}
 
 	// Create finalized batch from aggregated worker results
-	finalizedBatch := a.createFinalizedBatchFromParts(epochID, aggregatedResults)
+	finalizedBatch := a.createFinalizedBatchFromParts(epochID, aggregatedResults, dataMarket)
+	if finalizedBatch == nil {
+		log.Errorf("Failed to create finalized batch for epoch %d", epochID)
+		return
+	}
+
+	// kb is already set from extracting dataMarket above
+	if kb == nil {
+		log.Errorf("KeyBuilder not initialized for epoch %d", epochID)
+		return
+	}
 
 	if a.ipfsClient != nil {
 		if cid, err := a.ipfsClient.StoreFinalizedBatch(a.ctx, finalizedBatch); err == nil {
@@ -651,7 +774,7 @@ func (a *Aggregator) aggregateWorkerParts(epochIDStr string, totalParts int) {
 	}
 
 	// Store as our local finalized batch (now with BatchIPFSCID populated)
-	finalizedKey := a.keyBuilder.FinalizedBatch(strconv.FormatUint(epochID, 10))
+	finalizedKey := kb.FinalizedBatch(strconv.FormatUint(epochID, 10))
 	finalizedData, _ := json.Marshal(finalizedBatch)
 	if err := a.redisClient.Set(a.ctx, finalizedKey, finalizedData, 24*time.Hour).Err(); err != nil {
 		log.WithError(err).Error("Failed to store finalized batch")
@@ -666,7 +789,7 @@ func (a *Aggregator) aggregateWorkerParts(epochIDStr string, totalParts int) {
 
 	// Update epoch state hash - Level 1 completed
 	timestamp := time.Now().Unix()
-	epochStateKey := a.keyBuilder.EpochState(strconv.FormatUint(epochID, 10))
+	epochStateKey := kb.EpochState(strconv.FormatUint(epochID, 10))
 	a.redisClient.HSet(a.ctx, epochStateKey, map[string]interface{}{
 		"level1_status":       "completed",
 		"level1_completed_at": timestamp,
@@ -681,13 +804,13 @@ func (a *Aggregator) aggregateWorkerParts(epochIDStr string, totalParts int) {
 	pipe := a.redisClient.Pipeline()
 
 	// 1. Add to batches timeline
-	pipe.ZAdd(a.ctx, a.keyBuilder.MetricsBatchesTimeline(), redis.Z{
+	pipe.ZAdd(a.ctx, kb.MetricsBatchesTimeline(), redis.Z{
 		Score:  float64(timestamp),
 		Member: fmt.Sprintf("local:%d", epochID),
 	})
 
 	// 2. Store local batch metrics with TTL
-	batchMetricsKey := a.keyBuilder.MetricsBatchLocal(strconv.FormatUint(epochID, 10))
+	batchMetricsKey := kb.MetricsBatchLocal(strconv.FormatUint(epochID, 10))
 	batchMetricsData := map[string]interface{}{
 		"epoch_id":      epochID,
 		"type":          "local",
@@ -702,7 +825,7 @@ func (a *Aggregator) aggregateWorkerParts(epochIDStr string, totalParts int) {
 	pipe.SetEx(a.ctx, batchMetricsKey, string(jsonData), 24*time.Hour)
 
 	// 3. Add to validator batches timeline
-	validatorBatchesKey := a.keyBuilder.MetricsValidatorBatches(a.config.SequencerID)
+	validatorBatchesKey := kb.MetricsValidatorBatches(a.config.SequencerID)
 	pipe.ZAdd(a.ctx, validatorBatchesKey, redis.Z{
 		Score:  float64(timestamp),
 		Member: epochID,
@@ -718,15 +841,16 @@ func (a *Aggregator) aggregateWorkerParts(epochIDStr string, totalParts int) {
 
 	// CRITICAL: Write to aggregation stream to trigger Level 2 aggregation (single unified path)
 	// This ensures our own local batch triggers aggregation, not just batches from other validators
-	streamKey := a.keyBuilder.AggregationStream()
+	streamKey := kb.AggregationStream()
 	// finalizedKey already declared above (line 631), reuse it
 
 	streamValues := map[string]interface{}{
-		"epoch":     epochIDStr,
-		"validator": a.config.SequencerID,
-		"batch_key": finalizedKey,
-		"timestamp": time.Now().Unix(),
-		"type":      "validator_batch",
+		"epoch":       epochIDStr,
+		"validator":   a.config.SequencerID,
+		"batch_key":   finalizedKey,
+		"timestamp":   time.Now().Unix(),
+		"type":        "validator_batch",
+		"data_market": finalizedBatch.DataMarket, // EIP-55 checksummed format
 	}
 
 	// Add to stream with retry logic (same as P2P gateway)
@@ -762,7 +886,7 @@ func (a *Aggregator) aggregateWorkerParts(epochIDStr string, totalParts int) {
 
 	if msgData, err := json.Marshal(broadcastMsg); err == nil {
 		// Use namespaced broadcast queue
-		broadcastQueue := a.keyBuilder.OutgoingBroadcastBatch()
+		broadcastQueue := kb.OutgoingBroadcastBatch()
 		if err := a.redisClient.LPush(a.ctx, broadcastQueue, msgData).Err(); err != nil {
 			log.WithError(err).Error("Failed to queue batch for validator network broadcast")
 		} else {
@@ -775,13 +899,20 @@ func (a *Aggregator) aggregateWorkerParts(epochIDStr string, totalParts int) {
 
 	// Clean up tracking data (namespaced)
 	a.redisClient.Del(a.ctx,
-		a.keyBuilder.EpochPartsCompleted(epochIDStr),
-		a.keyBuilder.EpochPartsTotal(epochIDStr),
-		a.keyBuilder.EpochPartsReady(epochIDStr),
+		kb.EpochPartsCompleted(epochIDStr),
+		kb.EpochPartsTotal(epochIDStr),
+		kb.EpochPartsReady(epochIDStr),
 	)
 }
 
-func (a *Aggregator) createFinalizedBatchFromParts(epochID uint64, projectSubmissions map[string]interface{}) *consensus.FinalizedBatch {
+func (a *Aggregator) createFinalizedBatchFromParts(epochID uint64, projectSubmissions map[string]interface{}, dataMarket string) *consensus.FinalizedBatch {
+	// Validate that dataMarket is not empty
+	if dataMarket == "" {
+		log.Errorf("dataMarket is required but missing for epoch %d", epochID)
+		return nil
+	}
+	// Ensure data market is checksummed (normalize if needed)
+	dataMarket = common.HexToAddress(dataMarket).Hex()
 	// Extract project data and create proper finalized batch
 	projectIDs := make([]string, 0)
 	snapshotCIDs := make([]string, 0)
@@ -854,6 +985,7 @@ func (a *Aggregator) createFinalizedBatchFromParts(epochID uint64, projectSubmis
 		Timestamp:         uint64(time.Now().Unix()),
 		ProjectVotes:      projectVotes,
 		SubmissionDetails: submissionDetails,
+		DataMarket:        dataMarket, // EIP-55 checksummed format
 	}
 
 	// Note: IPFS storage is now handled in the calling function (aggregateWorkerParts)
@@ -862,9 +994,12 @@ func (a *Aggregator) createFinalizedBatchFromParts(epochID uint64, projectSubmis
 	return finalizedBatch
 }
 
-func (a *Aggregator) aggregateEpoch(epochIDStr string) {
+func (a *Aggregator) aggregateEpoch(epochIDStr string, dataMarket string) {
+	// Get KeyBuilder for this data market
+	kb := a.getKeyBuilder(dataMarket)
+
 	// Check if we've already aggregated this epoch recently (deduplication) - namespaced
-	aggregatedKey := a.keyBuilder.BatchAggregated(epochIDStr)
+	aggregatedKey := kb.BatchAggregated(epochIDStr)
 	exists, err := a.redisClient.Exists(a.ctx, aggregatedKey).Result()
 	if err != nil {
 		log.WithField("epoch", epochIDStr).WithError(err).Error("Failed to check aggregated status")
@@ -877,7 +1012,7 @@ func (a *Aggregator) aggregateEpoch(epochIDStr string) {
 
 	// Get our own finalized batch from the unified sequencer's finalizer
 	// Use namespaced key
-	ourBatchKey := a.keyBuilder.FinalizedBatch(epochIDStr)
+	ourBatchKey := kb.FinalizedBatch(epochIDStr)
 	var ourBatchData string
 	ourBatchData, _ = a.redisClient.Get(a.ctx, ourBatchKey).Result()
 
@@ -896,7 +1031,7 @@ func (a *Aggregator) aggregateEpoch(epochIDStr string) {
 	}
 
 	// Get all validators for this epoch using deterministic approach
-	epochValidatorsKey := a.keyBuilder.EpochValidators(epochIDStr)
+	epochValidatorsKey := kb.EpochValidators(epochIDStr)
 	validatorIDs, err := a.redisClient.SMembers(a.ctx, epochValidatorsKey).Result()
 	if err != nil {
 		log.WithError(err).WithField("epoch", epochIDStr).Error("Failed to get epoch validators")
@@ -911,7 +1046,7 @@ func (a *Aggregator) aggregateEpoch(epochIDStr string) {
 		if validatorID == a.config.SequencerID {
 			continue
 		}
-		batchKey := a.keyBuilder.IncomingBatch(epochIDStr, validatorID)
+		batchKey := kb.IncomingBatch(epochIDStr, validatorID)
 		incomingKeys = append(incomingKeys, batchKey)
 	}
 
@@ -927,8 +1062,8 @@ func (a *Aggregator) aggregateEpoch(epochIDStr string) {
 		"total_validators": totalValidators,
 	}).Info("Starting epoch aggregation")
 
-	// Aggregate all batches
-	aggregatedBatch := a.createAggregatedBatch(ourBatch, incomingKeys)
+	// Aggregate all batches (with data market)
+	aggregatedBatch := a.createAggregatedBatch(ourBatch, incomingKeys, dataMarket)
 
 	// Store in IPFS before Redis to ensure BatchIPFSCID is populated
 	if a.ipfsClient != nil {
@@ -969,7 +1104,7 @@ func (a *Aggregator) aggregateEpoch(epochIDStr string) {
 	epochID, _ := parseEpochID(epochIDStr)
 
 	// Update epoch state hash - Level 2 completed, transition to onchain_submission phase
-	epochStateKey := a.keyBuilder.EpochState(epochIDStr)
+	epochStateKey := kb.EpochState(epochIDStr)
 	a.redisClient.HSet(a.ctx, epochStateKey, map[string]interface{}{
 		"level2_status":       "completed",
 		"level2_completed_at": timestamp,
@@ -982,13 +1117,13 @@ func (a *Aggregator) aggregateEpoch(epochIDStr string) {
 	pipe := a.redisClient.Pipeline()
 
 	// 1. Add to batches timeline
-	pipe.ZAdd(a.ctx, a.keyBuilder.MetricsBatchesTimeline(), redis.Z{
+	pipe.ZAdd(a.ctx, kb.MetricsBatchesTimeline(), redis.Z{
 		Score:  float64(timestamp),
 		Member: fmt.Sprintf("aggregated:%s", utils.FormatEpochID(epochIDStr)),
 	})
 
 	// 2. Store aggregated batch metrics with TTL
-	batchMetricsKey := a.keyBuilder.MetricsBatchAggregated(epochIDStr)
+	batchMetricsKey := kb.MetricsBatchAggregated(epochIDStr)
 	batchMetricsData := map[string]interface{}{
 		"epoch_id":         epochID,
 		"type":             "aggregated",
@@ -1003,7 +1138,7 @@ func (a *Aggregator) aggregateEpoch(epochIDStr string) {
 	pipe.SetEx(a.ctx, batchMetricsKey, string(jsonData), 24*time.Hour)
 
 	// 3. Store validator list with TTL (include local + remote validators)
-	validatorsKey := a.keyBuilder.MetricsBatchValidators(epochIDStr)
+	validatorsKey := kb.MetricsBatchValidators(epochIDStr)
 	allValidators := extractValidatorIDs(incomingKeys)
 	// Add local validator ID
 	allValidators = append(allValidators, a.config.SequencerID)
@@ -1032,13 +1167,23 @@ func (a *Aggregator) aggregateEpoch(epochIDStr string) {
 	}
 }
 
-func (a *Aggregator) createAggregatedBatch(ourBatch *consensus.FinalizedBatch, incomingKeys []string) consensus.FinalizedBatch {
+func (a *Aggregator) createAggregatedBatch(ourBatch *consensus.FinalizedBatch, incomingKeys []string, dataMarket string) consensus.FinalizedBatch {
+	// Extract data market from ourBatch if available, otherwise use passed parameter
+	if ourBatch != nil && ourBatch.DataMarket != "" {
+		// Normalize to checksummed format
+		dataMarket = common.HexToAddress(ourBatch.DataMarket).Hex()
+	} else if dataMarket == "" {
+		// This shouldn't happen if called correctly, but log warning
+		log.Warnf("createAggregatedBatch called without dataMarket and ourBatch.DataMarket is empty")
+	}
+
 	// Initialize aggregated batch
 	aggregated := consensus.FinalizedBatch{
 		SubmissionDetails: make(map[string][]submissions.SubmissionMetadata),
 		ProjectVotes:      make(map[string]uint32),
 		Timestamp:         uint64(time.Now().Unix()),
 		SequencerId:       a.config.SequencerID, // Set our node's ID
+		DataMarket:        dataMarket,           // EIP-55 checksummed format
 	}
 
 	// Track all validators' views
@@ -1107,6 +1252,19 @@ func (a *Aggregator) createAggregatedBatch(ourBatch *consensus.FinalizedBatch, i
 
 		if aggregated.EpochId == 0 {
 			aggregated.EpochId = batch.EpochId
+		}
+
+		// Validate incoming batch has DataMarket field
+		if batch.DataMarket == "" {
+			log.Warnf("Skipping incoming batch without DataMarket field - old format not supported: epoch=%d, validator=%s", batch.EpochId, validatorID)
+			continue
+		}
+		// Normalize to checksummed format
+		batch.DataMarket = common.HexToAddress(batch.DataMarket).Hex()
+		// Ensure it matches the expected data market
+		if batch.DataMarket != dataMarket {
+			log.Warnf("Incoming batch DataMarket mismatch: expected=%s, got=%s, epoch=%d, validator=%s", dataMarket, batch.DataMarket, batch.EpochId, validatorID)
+			continue
 		}
 
 		validatorViews[validatorID] = &batch
@@ -1227,35 +1385,41 @@ func (a *Aggregator) reportMetrics() {
 		case <-a.ctx.Done():
 			return
 		case <-ticker.C:
-			// Count aggregated batches using timeline entries (matches monitoring API)
-			// This counts all finalized batches, not just active ones
-			aggregatedCount := 0
-			timelineKey := a.keyBuilder.MetricsBatchesTimeline()
-			// Count entries with "aggregated:" prefix in timeline
-			timelineEntries, err := a.redisClient.ZRange(a.ctx, timelineKey, 0, -1).Result()
-			if err == nil {
-				for _, entry := range timelineEntries {
-					if strings.HasPrefix(entry, "aggregated:") {
-						aggregatedCount++
+			// Aggregate metrics across all data markets
+			totalAggregatedCount := 0
+			validatorSet := make(map[string]bool) // Use map to avoid duplicates across all markets
+
+			// Process metrics for each data market
+			for _, dataMarket := range a.config.DataMarketAddresses {
+				checksummedMarket := common.HexToAddress(dataMarket).Hex()
+				kb := a.getKeyBuilder(checksummedMarket)
+
+				// Count aggregated batches using timeline entries (matches monitoring API)
+				timelineKey := kb.MetricsBatchesTimeline()
+				timelineEntries, err := a.redisClient.ZRange(a.ctx, timelineKey, 0, -1).Result()
+				if err == nil {
+					for _, entry := range timelineEntries {
+						if strings.HasPrefix(entry, "aggregated:") {
+							totalAggregatedCount++
+						}
 					}
 				}
-			}
 
-			// Count active validators using deterministic aggregation
-			// Use ActiveEpochs and EpochValidators sets instead of SCAN
-			var validators []string
-			validatorSet := make(map[string]bool) // Use map to avoid duplicates
+				// Get all active epochs for this data market
+				activeEpochs, err := a.redisClient.SMembers(a.ctx, kb.ActiveEpochs()).Result()
+				if err != nil {
+					log.WithError(err).WithField("data_market", checksummedMarket).Debug("Failed to get active epochs for validator counting")
+					continue
+				}
 
-			// Get all active epochs
-			activeEpochs, err := a.redisClient.SMembers(a.ctx, a.keyBuilder.ActiveEpochs()).Result()
-			if err != nil {
-				log.WithError(err).Debug("Failed to get active epochs for validator counting")
-			} else {
 				// Get validators from each active epoch
 				for _, epochID := range activeEpochs {
-					epochValidators, err := a.redisClient.SMembers(a.ctx, a.keyBuilder.EpochValidators(epochID)).Result()
+					epochValidators, err := a.redisClient.SMembers(a.ctx, kb.EpochValidators(epochID)).Result()
 					if err != nil {
-						log.WithError(err).WithField("epoch", epochID).Debug("Failed to get epoch validators")
+						log.WithError(err).WithFields(logrus.Fields{
+							"epoch":       epochID,
+							"data_market": checksummedMarket,
+						}).Debug("Failed to get epoch validators")
 						continue
 					}
 					// Add validators to set to avoid duplicates
@@ -1266,13 +1430,15 @@ func (a *Aggregator) reportMetrics() {
 			}
 
 			// Convert map to slice
+			validators := make([]string, 0, len(validatorSet))
 			for validatorID := range validatorSet {
 				validators = append(validators, validatorID)
 			}
 
 			log.WithFields(logrus.Fields{
-				"aggregated_batches": aggregatedCount,
+				"aggregated_batches": totalAggregatedCount,
 				"active_validators":  len(validators),
+				"data_markets":       len(a.config.DataMarketAddresses),
 			}).Info("Aggregator metrics")
 		}
 	}
@@ -1319,18 +1485,23 @@ func (a *Aggregator) handleNewContractSubmission(epochID uint64, aggregatedBatch
 		"projects": len(aggregatedBatch.ProjectIds),
 	}).Info("🚀 Starting new contract submission")
 
-	// Get data market address for submission (use first configured market)
-	if len(a.config.DataMarketAddresses) == 0 {
-		log.WithField("epoch", epochIDStr).Error("No data market address configured")
+	// Get data market address from aggregated batch (mandatory field)
+	if aggregatedBatch.DataMarket == "" {
+		log.Warnf("Cannot submit batch without DataMarket field - skipping: epoch=%s", epochIDStr)
 		return
 	}
-	newDataMarket := a.config.DataMarketAddresses[0]
+	newDataMarket := aggregatedBatch.DataMarket // Already checksummed
 
-	// Check if already submitted
+	// Check if already submitted (using composite key: dataMarket:epochID)
+	checksummedMarket := common.HexToAddress(newDataMarket).Hex()
+	compositeKey := fmt.Sprintf("%s:%d", checksummedMarket, epochID)
 	a.mu.Lock()
-	if a.submissionState[epochID] {
+	if a.submissionState[compositeKey] {
 		a.mu.Unlock()
-		log.WithField("epoch", epochIDStr).Info("Already submitted for this epoch")
+		log.WithFields(logrus.Fields{
+			"epoch":       epochIDStr,
+			"data_market": checksummedMarket,
+		}).Info("Already submitted for this epoch")
 		return
 	}
 	a.mu.Unlock()
@@ -1350,14 +1521,19 @@ func (a *Aggregator) handleNewContractSubmission(epochID uint64, aggregatedBatch
 func (a *Aggregator) submitBatchViaRelayer(epochID uint64, aggregatedBatch *consensus.FinalizedBatch, dataMarketAddr string) error {
 	epochIDStr := strconv.FormatUint(epochID, 10)
 
-	// First check if we have VPA priority (this checks priority assignment, not timing)
-	if a.vpaClient == nil {
-		log.WithField("epoch", epochIDStr).Debug("VPA client not initialized, skipping new contract submission")
+	// Get VPA client for this data market
+	checksummedMarket := common.HexToAddress(dataMarketAddr).Hex()
+	vpaClient, exists := a.vpaClients[checksummedMarket]
+	if !exists {
+		log.WithFields(logrus.Fields{
+			"epoch":       epochIDStr,
+			"data_market": checksummedMarket,
+		}).Debug("VPA client not initialized for this data market, skipping new contract submission")
 		return nil
 	}
 
 	// Check if validator has priority for this epoch
-	priority, err := a.vpaClient.GetMyPriority(a.ctx, dataMarketAddr, epochID)
+	priority, err := vpaClient.GetMyPriority(a.ctx, dataMarketAddr, epochID)
 	if err != nil {
 		log.WithError(err).WithFields(logrus.Fields{
 			"epoch":       epochIDStr,
@@ -1402,7 +1578,7 @@ func (a *Aggregator) submitBatchViaRelayer(epochID uint64, aggregatedBatch *cons
 	waitCtx, cancel := context.WithTimeout(a.ctx, 10*time.Minute)
 	defer cancel()
 
-	if err := a.vpaClient.WaitForSubmissionWindow(waitCtx, dataMarketAddr, epochID, priority); err != nil {
+	if err := vpaClient.WaitForSubmissionWindow(waitCtx, dataMarketAddr, epochID, priority); err != nil {
 		if err == context.DeadlineExceeded {
 			log.WithFields(logrus.Fields{
 				"epoch":    epochIDStr,
@@ -1575,9 +1751,11 @@ func (a *Aggregator) submitBatchViaRelayer(epochID uint64, aggregatedBatch *cons
 	// Store submission metrics (queued successfully, tx_hash will be empty since relayer processes async)
 	a.storeSubmissionMetrics(epochID, dataMarketAddr, priority, true, "", 0)
 
-	// Mark as submitted for this epoch
+	// Mark as submitted for this epoch (using composite key: dataMarket:epochID)
+	// checksummedMarket already declared above
+	compositeKey := fmt.Sprintf("%s:%d", checksummedMarket, epochID)
 	a.mu.Lock()
-	a.submissionState[epochID] = true
+	a.submissionState[compositeKey] = true
 	a.mu.Unlock()
 
 	return nil
@@ -1698,8 +1876,8 @@ func (a *Aggregator) storePriorityCheck(epochID uint64, dataMarketAddr string, p
 	epochIDStr := strconv.FormatUint(epochID, 10)
 	timestamp := time.Now().Unix()
 
-	// Use protocol state contract for VPA data (namespaced)
-	protocolState := a.keyBuilder.ProtocolState
+	// Use protocol state contract for VPA data
+	protocolState := a.config.ProtocolStateContract
 
 	// Create KeyBuilder for this data market (namespaced)
 	kb := rediskeys.NewKeyBuilder(protocolState, dataMarketAddr)
@@ -1757,8 +1935,8 @@ func (a *Aggregator) storeSubmissionMetrics(epochID uint64, dataMarketAddr strin
 	epochIDStr := strconv.FormatUint(epochID, 10)
 	timestamp := time.Now().Unix()
 
-	// Use protocol state contract for VPA data (namespaced)
-	protocolState := a.keyBuilder.ProtocolState
+	// Use protocol state contract for VPA data
+	protocolState := a.config.ProtocolStateContract
 
 	// Create KeyBuilder for this data market (namespaced)
 	kb := rediskeys.NewKeyBuilder(protocolState, dataMarketAddr)

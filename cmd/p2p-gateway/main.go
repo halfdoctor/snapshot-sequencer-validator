@@ -1069,11 +1069,12 @@ func (g *P2PGateway) handleIncomingBatches() {
 
 		// CRITICAL: Add stream notification (mandatory for deterministic aggregation)
 		streamValues := map[string]interface{}{
-			"epoch":     epochIDStr,
-			"validator": validatorID,
-			"batch_key": key,
-			"timestamp": time.Now().Unix(),
-			"type":      "validator_batch",
+			"epoch":       epochIDStr,
+			"validator":   validatorID,
+			"batch_key":   key,
+			"timestamp":   time.Now().Unix(),
+			"type":        "validator_batch",
+			"data_market": g.keyBuilder.DataMarket, // EIP-55 checksummed format (KeyBuilder normalizes addresses)
 		}
 
 		// Add to stream with retry logic

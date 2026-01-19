@@ -1365,6 +1365,20 @@ func (s *UnifiedSequencer) runFinalizationWorker(workerID int) {
 			batchID := int(batchPart["batch_id"].(float64))
 			totalBatches := int(batchPart["total_batches"].(float64))
 
+			// Extract data_market (mandatory field)
+			dataMarketRaw, ok := batchPart["data_market"]
+			if !ok {
+				log.Warnf("Worker %d: Skipping batch part without data_market field - old format not supported: epoch=%d, batch=%d", workerID, epochID, batchID)
+				continue
+			}
+			dataMarketStr, ok := dataMarketRaw.(string)
+			if !ok || dataMarketStr == "" {
+				log.Warnf("Worker %d: Skipping batch part without data_market field - old format not supported: epoch=%d, batch=%d", workerID, epochID, batchID)
+				continue
+			}
+			// Normalize to checksummed format
+			dataMarket := common.HexToAddress(dataMarketStr).Hex()
+
 			// Extract projects map (not project_ids array)
 			projects, ok := batchPart["projects"].(map[string]interface{})
 			if !ok {
@@ -1380,7 +1394,7 @@ func (s *UnifiedSequencer) runFinalizationWorker(workerID int) {
 			monitor.ProcessingStarted(batchInfo)
 
 			// Process this batch part with projects map
-			if err := s.processBatchPart(epochID, batchID, totalBatches, projects, monitor); err != nil {
+			if err := s.processBatchPart(epochID, batchID, totalBatches, projects, dataMarket, monitor); err != nil {
 				log.Errorf("Worker %d: Failed to process batch part %d for epoch %d: %v",
 					workerID, batchID, epochID, err)
 				monitor.ProcessingFailed(err)
@@ -1393,7 +1407,7 @@ func (s *UnifiedSequencer) runFinalizationWorker(workerID int) {
 	}
 }
 
-func (s *UnifiedSequencer) processBatchPart(epochID uint64, batchID int, totalBatches int, projects map[string]interface{}, _ *workers.WorkerMonitor) error {
+func (s *UnifiedSequencer) processBatchPart(epochID uint64, batchID int, totalBatches int, projects map[string]interface{}, dataMarket string, _ *workers.WorkerMonitor) error {
 	ctx := context.Background()
 
 	// Track batch part as processing
@@ -1476,9 +1490,13 @@ func (s *UnifiedSequencer) processBatchPart(epochID uint64, batchID int, totalBa
 		}
 	}
 
-	// Store batch part results
+	// Store batch part results with data_market
+	partResultsWithMeta := map[string]interface{}{
+		"data_market": dataMarket,
+		"projects":    partResults,
+	}
 	partKey := s.keyBuilder.BatchPart(fmt.Sprintf("%d", epochID), batchID)
-	partData, err := json.Marshal(partResults)
+	partData, err := json.Marshal(partResultsWithMeta)
 	if err != nil {
 		return fmt.Errorf("failed to marshal batch part: %w", err)
 	}
