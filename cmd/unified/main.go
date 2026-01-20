@@ -1568,7 +1568,8 @@ func (s *UnifiedSequencer) processBatchPart(epochID uint64, batchID int, totalBa
 	completed, _ := s.redisClient.Incr(ctx, completedKey).Result()
 
 	// Check if all parts are complete
-	if err := workers.UpdateBatchPartsProgress(s.redisClient, s.config.ProtocolStateContract, s.config.DataMarketAddresses[0], epochStr, int(completed), totalBatches); err != nil {
+	// Use the dataMarket from the batch part, not the first configured data market
+	if err := workers.UpdateBatchPartsProgress(s.redisClient, s.config.ProtocolStateContract, dataMarket, epochStr, int(completed), totalBatches); err != nil {
 		log.WithError(err).Error("Failed to update batch parts progress")
 	}
 
