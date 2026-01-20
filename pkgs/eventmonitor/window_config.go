@@ -59,12 +59,12 @@ func (wc *WindowConfig) LocalFinalizationWindow(fallbackDelay time.Duration) tim
 		totalSeconds.Add(wc.SnapshotCommitWindow, wc.SnapshotRevealWindow)
 		return time.Duration(totalSeconds.Uint64()) * time.Second
 	} else {
-		// Case 2: Snapshot Commit/Reveal disabled - trigger at P1 window start minus 10 seconds
+		// Case 2: Snapshot Commit/Reveal disabled - trigger 2/3rds before P1 window closure
 		// P1 window = PreSubmissionWindow + P1SubmissionWindow
 		// Level 1 finalization must complete before P1 window opens for on-chain submission
 		p1WindowSeconds := new(big.Int)
 		p1WindowSeconds.Add(wc.PreSubmissionWindow, wc.P1SubmissionWindow)
-		
+
 		// Subtract 2/3 of the P1 window to allow for Level 1 finalization and Level 2 aggregation
 		bufferSeconds := new(big.Int).Mul(p1WindowSeconds, big.NewInt(2))
 		bufferSeconds.Div(bufferSeconds, big.NewInt(3))
