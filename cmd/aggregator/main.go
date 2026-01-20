@@ -507,56 +507,131 @@ func (a *Aggregator) claimStalledMessages(streamKey, groupName, consumerName str
 }
 
 func (a *Aggregator) processAggregationQueue() {
-	// Process Level 1 aggregation queues for all configured data markets
-	queueKeys := make([]string, 0, len(a.config.DataMarketAddresses))
+	// Start a separate goroutine for each data market's queue
 	for _, dataMarket := range a.config.DataMarketAddresses {
 		checksummedMarket := common.HexToAddress(dataMarket).Hex()
-		kb := a.getKeyBuilder(checksummedMarket)
-		queueKeys = append(queueKeys, kb.AggregationQueueLevel1())
+		go a.processAggregationQueueForMarket(checksummedMarket)
 	}
+}
+
+// processAggregationQueueForMarket processes Level 1 aggregation queue for a specific data market
+func (a *Aggregator) processAggregationQueueForMarket(dataMarket string) {
+	kb := a.getKeyBuilder(dataMarket)
+	queueKey := kb.AggregationQueueLevel1()
+
+	log.WithFields(logrus.Fields{
+		"data_market":    dataMarket,
+		"queue_key":      queueKey,
+		"protocol_state": a.config.ProtocolStateContract,
+	}).Info("📋 Started Level 1 aggregation queue processor")
 
 	for {
 		select {
 		case <-a.ctx.Done():
 			return
 		default:
-			// Check for Level 1 aggregation (finalizer worker parts) - namespaced by data market
-			// BRPop with multiple keys will pop from the first available queue
-			result, err := a.redisClient.BRPop(a.ctx, time.Second, queueKeys...).Result()
-			if err == nil && len(result) >= 2 {
-				// Parse the complex JSON from finalizer workers
-				var aggData map[string]interface{}
-				if err := json.Unmarshal([]byte(result[1]), &aggData); err != nil {
-					log.WithError(err).Error("Failed to parse aggregation data")
+			// BRPop blocks until a message is available or timeout
+			result, err := a.redisClient.BRPop(a.ctx, time.Second, queueKey).Result()
+			if err != nil {
+				if err == redis.Nil {
+					// Timeout - queue empty, continue polling
 					continue
 				}
-
-				epochIDStr := aggData["epoch_id"].(string)
-				partsCompleted := int(aggData["parts_completed"].(float64))
-				
-				// Extract data_market from queue message (if available)
-				var dataMarket string
-				if dataMarketRaw, ok := aggData["data_market"]; ok {
-					if dataMarketStr, ok := dataMarketRaw.(string); ok && dataMarketStr != "" {
-						dataMarket = common.HexToAddress(dataMarketStr).Hex()
-					}
+				if a.ctx.Err() != nil {
+					return
 				}
-
-				log.WithFields(logrus.Fields{
-					"epoch":      epochIDStr,
-					"parts":     partsCompleted,
+				log.WithError(err).WithFields(logrus.Fields{
+					"queue":       queueKey,
 					"data_market": dataMarket,
-				}).Info("📦 LEVEL 1: Aggregating finalizer worker parts into local batch")
-
-				// Aggregate worker parts into complete local batch
-				// This will write to stream, which triggers Level 2 aggregation via stream consumer
-				a.aggregateWorkerParts(epochIDStr, partsCompleted, dataMarket)
+				}).Error("Failed to read from aggregation queue")
+				time.Sleep(1 * time.Second)
 				continue
 			}
 
-			// Level 2 aggregation is handled by stream consumer (consumeStreamMessages)
-			// No need to poll queue - stream messages trigger aggregation windows
-			time.Sleep(100 * time.Millisecond)
+			if len(result) < 2 {
+				log.WithFields(logrus.Fields{
+					"result_length": len(result),
+					"result":        result,
+					"queue":         queueKey,
+				}).Warn("Invalid result from BRPop - missing data")
+				continue
+			}
+
+			log.WithFields(logrus.Fields{
+				"queue": queueKey,
+				"data":  result[1],
+			}).Info("📨 Received message from aggregation queue")
+
+			// Parse the complex JSON from finalizer workers
+			var aggData map[string]interface{}
+			if err := json.Unmarshal([]byte(result[1]), &aggData); err != nil {
+				log.WithError(err).WithFields(logrus.Fields{
+					"queue": queueKey,
+					"data":  result[1],
+				}).Error("Failed to parse aggregation data")
+				continue
+			}
+
+			epochIDStr, ok := aggData["epoch_id"].(string)
+			if !ok {
+				log.WithFields(logrus.Fields{
+					"data":  aggData,
+					"queue": queueKey,
+				}).Error("Missing epoch_id in aggregation data")
+				continue
+			}
+
+			partsCompletedFloat, ok := aggData["parts_completed"].(float64)
+			if !ok {
+				log.WithFields(logrus.Fields{
+					"data":  aggData,
+					"queue": queueKey,
+				}).Error("Missing or invalid parts_completed in aggregation data")
+				continue
+			}
+			partsCompleted := int(partsCompletedFloat)
+
+			// Extract data_market from queue message (should match, but verify)
+			var dataMarketFromMsg string
+			if dataMarketRaw, ok := aggData["data_market"]; ok {
+				if dataMarketStr, ok := dataMarketRaw.(string); ok && dataMarketStr != "" {
+					dataMarketFromMsg = common.HexToAddress(dataMarketStr).Hex()
+				}
+			}
+
+			// Use data market from message if available, otherwise use the one we're processing
+			finalDataMarket := dataMarket
+			if dataMarketFromMsg != "" {
+				if dataMarketFromMsg != dataMarket {
+					log.WithFields(logrus.Fields{
+						"queue_data_market": dataMarketFromMsg,
+						"expected":          dataMarket,
+						"queue":             queueKey,
+					}).Warn("⚠️  Data market mismatch in queue message")
+				}
+				finalDataMarket = dataMarketFromMsg
+			}
+
+			log.WithFields(logrus.Fields{
+				"epoch":       epochIDStr,
+				"parts":       partsCompleted,
+				"data_market": finalDataMarket,
+			}).Info("📦 LEVEL 1: Aggregating finalizer worker parts into local batch")
+
+			// Aggregate worker parts into complete local batch
+			// This will write to stream, which triggers Level 2 aggregation via stream consumer
+			// Wrap in panic recovery to prevent queue processor from crashing
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						log.WithFields(logrus.Fields{
+							"epoch": epochIDStr,
+							"panic": r,
+						}).Error("Panic in aggregateWorkerParts - recovered")
+					}
+				}()
+				a.aggregateWorkerParts(epochIDStr, partsCompleted, finalDataMarket)
+			}()
 		}
 	}
 }
@@ -684,7 +759,9 @@ func (a *Aggregator) aggregateWorkerParts(epochIDStr string, totalParts int, dat
 	// Convert string to uint64
 	epochID, err := parseEpochID(epochIDStr)
 	if err != nil {
-		log.WithError(err).Error("Failed to parse epoch ID")
+		log.WithError(err).WithFields(logrus.Fields{
+			"epoch": epochIDStr,
+		}).Error("Failed to parse epoch ID")
 		return
 	}
 
@@ -693,65 +770,62 @@ func (a *Aggregator) aggregateWorkerParts(epochIDStr string, totalParts int, dat
 	var dataMarket string
 	var kb *rediskeys.KeyBuilder
 
-	// Use data_market from queue message if provided, otherwise extract from first part
-	if dataMarketFromQueue != "" {
-		dataMarket = dataMarketFromQueue
-		kb = a.getKeyBuilder(dataMarket)
+	// CRITICAL: dataMarketFromQueue MUST be provided - it comes from the queue message
+	// If it's missing, we cannot determine which KeyBuilder to use
+	if dataMarketFromQueue == "" {
+		log.WithFields(logrus.Fields{
+			"epoch": epochIDStr,
+		}).Error("❌ CRITICAL: Missing data_market in queue message - cannot aggregate batch parts without knowing which data market")
+		return
 	}
 
+	// Normalize to checksummed format and get KeyBuilder
+	dataMarket = common.HexToAddress(dataMarketFromQueue).Hex()
+	kb = a.getKeyBuilder(dataMarket)
+
+	log.WithFields(logrus.Fields{
+		"epoch":       epochIDStr,
+		"data_market": dataMarket,
+		"total_parts": totalParts,
+	}).Debug("Starting batch parts aggregation")
+
 	for i := 0; i < totalParts; i++ {
-		// Get KeyBuilder - use kb if we have it, otherwise try first configured market
-		var partKeyBuilder *rediskeys.KeyBuilder
-		if kb != nil {
-			partKeyBuilder = kb
-		} else if len(a.config.DataMarketAddresses) > 0 {
-			// Before we know the data market, try the first configured one
-			// This will be corrected once we extract dataMarket from the first part
-			partKeyBuilder = a.getKeyBuilder(common.HexToAddress(a.config.DataMarketAddresses[0]).Hex())
-		} else {
-			log.Errorf("No data markets configured, cannot get batch part %d", i)
-			continue
-		}
-		partKey := partKeyBuilder.BatchPart(strconv.FormatUint(epochID, 10), i)
+		// Use the KeyBuilder we already have (from queue message)
+		partKey := kb.BatchPart(strconv.FormatUint(epochID, 10), i)
 		partData, err := a.redisClient.Get(a.ctx, partKey).Result()
 		if err != nil {
-			log.Errorf("Failed to get batch part %d for epoch %d: %v", i, epochID, err)
-			continue
+			log.WithError(err).WithFields(logrus.Fields{
+				"epoch":       epochID,
+				"part":        i,
+				"total_parts": totalParts,
+				"data_market": dataMarket,
+				"part_key":    partKey,
+			}).Error("❌ CRITICAL: Failed to get batch part - KeyBuilder mismatch or part not stored")
+			// Don't continue - if we can't find parts, something is wrong
+			return
 		}
 
 		var partResults map[string]interface{}
 		if err := json.Unmarshal([]byte(partData), &partResults); err != nil {
-			log.Errorf("Failed to parse batch part %d: %v", i, err)
-			continue
+			log.WithError(err).WithFields(logrus.Fields{
+				"epoch": epochID,
+				"part":  i,
+			}).Error("Failed to parse batch part")
+			return
 		}
 
-		// Extract data_market from first batch part if not already known (mandatory field)
-		if i == 0 && dataMarket == "" {
-			dataMarketRaw, ok := partResults["data_market"]
-			if !ok {
-				log.Warnf("Skipping batch part without data_market field - old format not supported: epoch=%s, part=%d", epochIDStr, i)
-				return
-			}
-			dataMarketStr, ok := dataMarketRaw.(string)
-			if !ok || dataMarketStr == "" {
-				log.Warnf("Skipping batch part without data_market field - old format not supported: epoch=%s, part=%d", epochIDStr, i)
-				return
-			}
-			// Normalize to checksummed format
-			dataMarket = common.HexToAddress(dataMarketStr).Hex()
-			// Get KeyBuilder for this data market
-			kb = a.getKeyBuilder(dataMarket)
-			// Re-read part 0 with correct KeyBuilder if we had to guess
-			if partKeyBuilder != kb {
-				partKey = kb.BatchPart(strconv.FormatUint(epochID, 10), i)
-				partData, err = a.redisClient.Get(a.ctx, partKey).Result()
-				if err != nil {
-					log.Errorf("Failed to get batch part %d for epoch %d with correct data market: %v", i, epochID, err)
-					continue
-				}
-				if err := json.Unmarshal([]byte(partData), &partResults); err != nil {
-					log.Errorf("Failed to parse batch part %d: %v", i, err)
-					continue
+		// Verify data_market matches (should always match since we got it from queue message)
+		if partDataMarketRaw, ok := partResults["data_market"]; ok {
+			if partDataMarketStr, ok := partDataMarketRaw.(string); ok {
+				partDataMarket := common.HexToAddress(partDataMarketStr).Hex()
+				if partDataMarket != dataMarket {
+					log.WithFields(logrus.Fields{
+						"epoch":             epochID,
+						"part":              i,
+						"queue_data_market": dataMarket,
+						"part_data_market":  partDataMarket,
+					}).Error("❌ CRITICAL: Data market mismatch between queue message and batch part")
+					return
 				}
 			}
 		}
