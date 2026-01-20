@@ -1509,7 +1509,9 @@ func (s *UnifiedSequencer) processBatchPart(epochID uint64, batchID int, totalBa
 		"data_market": dataMarket,
 		"projects":    partResults,
 	}
-	partKey := s.keyBuilder.BatchPart(fmt.Sprintf("%d", epochID), batchID)
+	// Use KeyBuilder for the correct data market to ensure correct Redis key namespace
+	partKeyBuilder := rediskeys.NewKeyBuilder(s.config.ProtocolStateContract, dataMarket)
+	partKey := partKeyBuilder.BatchPart(fmt.Sprintf("%d", epochID), batchID)
 	partData, err := json.Marshal(partResultsWithMeta)
 	if err != nil {
 		return fmt.Errorf("failed to marshal batch part: %w", err)
@@ -1563,8 +1565,8 @@ func (s *UnifiedSequencer) processBatchPart(epochID uint64, batchID int, totalBa
 		log.Debugf("Failed to write monitoring metrics: %v", err)
 	}
 
-	// Update progress tracking using keyBuilder
-	completedKey := s.keyBuilder.EpochPartsCompleted(fmt.Sprintf("%d", epochID))
+	// Update progress tracking - use the same KeyBuilder for the correct data market
+	completedKey := partKeyBuilder.EpochPartsCompleted(fmt.Sprintf("%d", epochID))
 	completed, _ := s.redisClient.Incr(ctx, completedKey).Result()
 
 	// Check if all parts are complete
