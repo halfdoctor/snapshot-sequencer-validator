@@ -214,6 +214,17 @@ func (a *Aggregator) initializeStreamConsumers() error {
 
 // consumeStreamMessages consumes messages from the aggregation stream for a specific data market
 func (a *Aggregator) consumeStreamMessages(dataMarket string, kb *rediskeys.KeyBuilder) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.WithFields(logrus.Fields{
+				"data_market": dataMarket,
+				"panic":       r,
+			}).Error("Stream consumer panicked - restarting")
+			// Restart the consumer
+			go a.consumeStreamMessages(dataMarket, kb)
+		}
+	}()
+
 	streamKey := kb.AggregationStream()
 	groupName := a.config.StreamConsumerGroup
 	consumerName := a.config.StreamConsumerName
@@ -243,7 +254,7 @@ func (a *Aggregator) consumeStreamMessages(dataMarket string, kb *rediskeys.KeyB
 					"stream":      streamKey,
 					"data_market": dataMarket,
 					"read_count":  readCount,
-				}).Debug("Stream consumer still polling (no messages yet)")
+				}).Info("🔄 Stream consumer still polling (no messages yet)")
 			}
 
 			// First, try to claim any pending messages that are stale
@@ -252,8 +263,13 @@ func (a *Aggregator) consumeStreamMessages(dataMarket string, kb *rediskeys.KeyB
 				a.claimStalledMessages(streamKey, groupName, consumerName)
 			}
 
-			// Read messages from stream (both new ">" and pending "0")
-			// Use "0" to also read pending messages that haven't been acknowledged
+			// Read messages from stream
+			log.WithFields(logrus.Fields{
+				"stream":      streamKey,
+				"data_market": dataMarket,
+				"read_count":  readCount,
+			}).Debug("Calling XReadGroup (blocking for new messages)")
+
 			messages, err := a.redisClient.XReadGroup(a.ctx, &redis.XReadGroupArgs{
 				Group:    groupName,
 				Consumer: consumerName,
@@ -265,48 +281,71 @@ func (a *Aggregator) consumeStreamMessages(dataMarket string, kb *rediskeys.KeyB
 			if err != nil {
 				if err == redis.Nil {
 					// No messages available, continue
+					log.WithFields(logrus.Fields{
+						"stream":      streamKey,
+						"data_market": dataMarket,
+						"read_count":  readCount,
+					}).Debug("XReadGroup returned nil (no messages, timeout expired)")
 					continue
 				}
 				if a.ctx.Err() != nil {
 					// Context cancelled, exit
+					log.WithFields(logrus.Fields{
+						"stream":      streamKey,
+						"data_market": dataMarket,
+					}).Info("Stream consumer exiting - context error")
 					return
 				}
 				log.WithError(err).WithFields(logrus.Fields{
 					"stream":      streamKey,
 					"data_market": dataMarket,
+					"read_count":  readCount,
 				}).Error("Failed to read from stream")
 				time.Sleep(5 * time.Second) // Back off on error
 				continue
 			}
 
+			log.WithFields(logrus.Fields{
+				"stream":        streamKey,
+				"data_market":   dataMarket,
+				"message_count": len(messages),
+				"read_count":    readCount,
+			}).Debug("XReadGroup returned messages")
+
 			// Process received messages
 			for _, stream := range messages {
 				for _, message := range stream.Messages {
-					log.WithFields(logrus.Fields{
-						"message_id":  message.ID,
-						"stream":      streamKey,
-						"data_market": dataMarket,
-						"values":      message.Values,
-					}).Debug("📥 Received message from aggregation stream")
+					// Process each message with panic recovery to prevent loop from stopping
+					func(msg redis.XMessage) {
+						defer func() {
+							if r := recover(); r != nil {
+								log.WithFields(logrus.Fields{
+									"message_id":  msg.ID,
+									"stream":      streamKey,
+									"data_market": dataMarket,
+									"panic":       r,
+								}).Error("Panic processing stream message - moving to DLQ")
+								a.moveToDeadLetterQueue(streamKey, groupName, msg, dataMarket)
+							}
+						}()
 
-					if err := a.processStreamMessage(message); err != nil {
-						log.WithError(err).WithFields(logrus.Fields{
-							"message_id":  message.ID,
-							"stream":      streamKey,
-							"data_market": dataMarket,
-						}).Error("Failed to process stream message")
-
-						// Move problematic message to dead letter queue
-						a.moveToDeadLetterQueue(streamKey, groupName, message, dataMarket)
-					} else {
-						// Acknowledge successful processing
-						if err := a.redisClient.XAck(a.ctx, streamKey, groupName, message.ID).Err(); err != nil {
+						if err := a.processStreamMessage(msg); err != nil {
 							log.WithError(err).WithFields(logrus.Fields{
-								"message_id": message.ID,
-								"stream":     streamKey,
-							}).Warn("Failed to acknowledge stream message")
+								"message_id":  msg.ID,
+								"stream":      streamKey,
+								"data_market": dataMarket,
+							}).Error("Failed to process stream message")
+							a.moveToDeadLetterQueue(streamKey, groupName, msg, dataMarket)
+						} else {
+							// Acknowledge successful processing
+							if err := a.redisClient.XAck(a.ctx, streamKey, groupName, msg.ID).Err(); err != nil {
+								log.WithError(err).WithFields(logrus.Fields{
+									"message_id": msg.ID,
+									"stream":     streamKey,
+								}).Warn("Failed to acknowledge stream message")
+							}
 						}
-					}
+					}(message)
 				}
 			}
 		}
@@ -836,8 +875,13 @@ func (a *Aggregator) startAggregationWindow(epochIDStr string, dataMarket string
 		return
 	}
 
-	// Get KeyBuilder for this data market
-	kb := a.getKeyBuilder(dataMarket)
+	// Get KeyBuilder for this data market (already holding lock, so use direct access)
+	checksummedMarketForKB := common.HexToAddress(dataMarket).Hex()
+	kb, exists := a.keyBuilders[checksummedMarketForKB]
+	if !exists {
+		kb = rediskeys.NewKeyBuilder(a.config.ProtocolStateContract, checksummedMarketForKB)
+		a.keyBuilders[checksummedMarketForKB] = kb
+	}
 
 	// Start new aggregation window timer
 	timer := time.AfterFunc(a.config.AggregationWindowDuration, func() {
@@ -1116,9 +1160,10 @@ func (a *Aggregator) aggregateWorkerParts(epochIDStr string, totalParts int, dat
 		}).Result()
 		if err == nil {
 			log.WithFields(logrus.Fields{
-				"epoch":  epochID,
-				"stream": streamKey,
-			}).Debug("✅ Wrote local batch to aggregation stream")
+				"epoch":       epochID,
+				"stream":      streamKey,
+				"data_market": finalizedBatch.DataMarket,
+			}).Info("✅ LEVEL 1: Wrote local batch to aggregation stream (triggers Level 2)")
 			break
 		}
 		if i == maxRetries-1 {
