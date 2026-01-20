@@ -525,12 +525,27 @@ func (a *Aggregator) processAggregationQueueForMarket(dataMarket string) {
 		"protocol_state": a.config.ProtocolStateContract,
 	}).Info("📋 Started Level 1 aggregation queue processor")
 
+	loopCount := 0
 	for {
+		loopCount++
 		select {
 		case <-a.ctx.Done():
+			log.WithFields(logrus.Fields{
+				"queue":       queueKey,
+				"data_market": dataMarket,
+				"loop_count":  loopCount,
+			}).Info("Queue processor exiting - context cancelled")
 			return
 		default:
 			// BRPop blocks until a message is available or timeout
+			if loopCount%60 == 0 {
+				// Log every 60 iterations (roughly every minute) to show loop is alive
+				log.WithFields(logrus.Fields{
+					"queue":       queueKey,
+					"data_market": dataMarket,
+					"loop_count":  loopCount,
+				}).Debug("Queue processor still polling (no messages yet)")
+			}
 			result, err := a.redisClient.BRPop(a.ctx, time.Second, queueKey).Result()
 			if err != nil {
 				if err == redis.Nil {
@@ -538,11 +553,17 @@ func (a *Aggregator) processAggregationQueueForMarket(dataMarket string) {
 					continue
 				}
 				if a.ctx.Err() != nil {
+					log.WithFields(logrus.Fields{
+						"queue":       queueKey,
+						"data_market": dataMarket,
+						"loop_count":  loopCount,
+					}).Info("Queue processor exiting - context error")
 					return
 				}
 				log.WithError(err).WithFields(logrus.Fields{
 					"queue":       queueKey,
 					"data_market": dataMarket,
+					"loop_count":  loopCount,
 				}).Error("Failed to read from aggregation queue")
 				time.Sleep(1 * time.Second)
 				continue
@@ -612,6 +633,17 @@ func (a *Aggregator) processAggregationQueueForMarket(dataMarket string) {
 				finalDataMarket = dataMarketFromMsg
 			}
 
+			// CRITICAL: Validate finalDataMarket is not empty before processing
+			if finalDataMarket == "" {
+				log.WithFields(logrus.Fields{
+					"epoch":                 epochIDStr,
+					"queue_data_market":     dataMarketFromMsg,
+					"goroutine_data_market": dataMarket,
+					"queue":                 queueKey,
+				}).Error("❌ CRITICAL: Cannot determine data market for aggregation - both queue message and goroutine data market are empty")
+				continue // Skip this message and continue processing
+			}
+
 			log.WithFields(logrus.Fields{
 				"epoch":       epochIDStr,
 				"parts":       partsCompleted,
@@ -620,8 +652,8 @@ func (a *Aggregator) processAggregationQueueForMarket(dataMarket string) {
 
 			// Aggregate worker parts into complete local batch
 			// This will write to stream, which triggers Level 2 aggregation via stream consumer
-			// Wrap in panic recovery to prevent queue processor from crashing
-			func() {
+			// Run in goroutine to prevent blocking the BRPop loop
+			go func() {
 				defer func() {
 					if r := recover(); r != nil {
 						log.WithFields(logrus.Fields{
@@ -630,8 +662,27 @@ func (a *Aggregator) processAggregationQueueForMarket(dataMarket string) {
 						}).Error("Panic in aggregateWorkerParts - recovered")
 					}
 				}()
+
+				// Log before calling to track if function returns early
+				log.WithFields(logrus.Fields{
+					"epoch":       epochIDStr,
+					"parts":       partsCompleted,
+					"data_market": finalDataMarket,
+				}).Debug("Calling aggregateWorkerParts")
+
 				a.aggregateWorkerParts(epochIDStr, partsCompleted, finalDataMarket)
+
+				// Log after completion to track successful processing
+				log.WithFields(logrus.Fields{
+					"epoch": epochIDStr,
+				}).Debug("aggregateWorkerParts completed")
 			}()
+
+			// Log after queuing message processing to confirm loop continues immediately
+			log.WithFields(logrus.Fields{
+				"epoch":      epochIDStr,
+				"loop_count": loopCount,
+			}).Debug("Queued message for processing, continuing BRPop loop")
 		}
 	}
 }
@@ -755,13 +806,20 @@ func (a *Aggregator) startAggregationWindow(epochIDStr string, dataMarket string
 }
 
 func (a *Aggregator) aggregateWorkerParts(epochIDStr string, totalParts int, dataMarketFromQueue string) {
+	// Log function entry to track all calls
+	log.WithFields(logrus.Fields{
+		"epoch":                  epochIDStr,
+		"total_parts":            totalParts,
+		"data_market_from_queue": dataMarketFromQueue,
+	}).Info("🔍 aggregateWorkerParts called")
+
 	// epochIDStr is already a parameter, no need to redeclare
 	// Convert string to uint64
 	epochID, err := parseEpochID(epochIDStr)
 	if err != nil {
 		log.WithError(err).WithFields(logrus.Fields{
 			"epoch": epochIDStr,
-		}).Error("Failed to parse epoch ID")
+		}).Error("❌ Failed to parse epoch ID - aggregateWorkerParts returning early")
 		return
 	}
 
@@ -775,7 +833,7 @@ func (a *Aggregator) aggregateWorkerParts(epochIDStr string, totalParts int, dat
 	if dataMarketFromQueue == "" {
 		log.WithFields(logrus.Fields{
 			"epoch": epochIDStr,
-		}).Error("❌ CRITICAL: Missing data_market in queue message - cannot aggregate batch parts without knowing which data market")
+		}).Error("❌ CRITICAL: Missing data_market in queue message - cannot aggregate batch parts without knowing which data market - aggregateWorkerParts returning early")
 		return
 	}
 
@@ -792,15 +850,31 @@ func (a *Aggregator) aggregateWorkerParts(epochIDStr string, totalParts int, dat
 	for i := 0; i < totalParts; i++ {
 		// Use the KeyBuilder we already have (from queue message)
 		partKey := kb.BatchPart(strconv.FormatUint(epochID, 10), i)
-		partData, err := a.redisClient.Get(a.ctx, partKey).Result()
+
+		// Use timeout context to prevent hanging on expired/stale batch parts
+		getCtx, getCancel := context.WithTimeout(a.ctx, 5*time.Second)
+		partData, err := a.redisClient.Get(getCtx, partKey).Result()
+		getCancel()
+
 		if err != nil {
+			if err == redis.Nil {
+				log.WithFields(logrus.Fields{
+					"epoch":       epochID,
+					"part":        i,
+					"total_parts": totalParts,
+					"data_market": dataMarket,
+					"part_key":    partKey,
+				}).Warn("⚠️  Batch part not found (likely expired or cleaned up) - skipping old epoch")
+				// For old epochs, batch parts may have expired - skip gracefully
+				return
+			}
 			log.WithError(err).WithFields(logrus.Fields{
 				"epoch":       epochID,
 				"part":        i,
 				"total_parts": totalParts,
 				"data_market": dataMarket,
 				"part_key":    partKey,
-			}).Error("❌ CRITICAL: Failed to get batch part - KeyBuilder mismatch or part not stored")
+			}).Error("❌ CRITICAL: Failed to get batch part - Redis error")
 			// Don't continue - if we can't find parts, something is wrong
 			return
 		}
