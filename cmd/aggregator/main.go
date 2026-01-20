@@ -533,15 +533,24 @@ func (a *Aggregator) processAggregationQueue() {
 
 				epochIDStr := aggData["epoch_id"].(string)
 				partsCompleted := int(aggData["parts_completed"].(float64))
+				
+				// Extract data_market from queue message (if available)
+				var dataMarket string
+				if dataMarketRaw, ok := aggData["data_market"]; ok {
+					if dataMarketStr, ok := dataMarketRaw.(string); ok && dataMarketStr != "" {
+						dataMarket = common.HexToAddress(dataMarketStr).Hex()
+					}
+				}
 
 				log.WithFields(logrus.Fields{
-					"epoch": epochIDStr,
-					"parts": partsCompleted,
+					"epoch":      epochIDStr,
+					"parts":     partsCompleted,
+					"data_market": dataMarket,
 				}).Info("📦 LEVEL 1: Aggregating finalizer worker parts into local batch")
 
 				// Aggregate worker parts into complete local batch
 				// This will write to stream, which triggers Level 2 aggregation via stream consumer
-				a.aggregateWorkerParts(epochIDStr, partsCompleted)
+				a.aggregateWorkerParts(epochIDStr, partsCompleted, dataMarket)
 				continue
 			}
 
@@ -670,7 +679,7 @@ func (a *Aggregator) startAggregationWindow(epochIDStr string, dataMarket string
 	}).Info("⏱️  Started Level 2 aggregation window - collecting validator batches")
 }
 
-func (a *Aggregator) aggregateWorkerParts(epochIDStr string, totalParts int) {
+func (a *Aggregator) aggregateWorkerParts(epochIDStr string, totalParts int, dataMarketFromQueue string) {
 	// epochIDStr is already a parameter, no need to redeclare
 	// Convert string to uint64
 	epochID, err := parseEpochID(epochIDStr)
@@ -682,10 +691,16 @@ func (a *Aggregator) aggregateWorkerParts(epochIDStr string, totalParts int) {
 	// Collect all batch parts from finalizer workers
 	aggregatedResults := make(map[string]interface{})
 	var dataMarket string
-	var kb *rediskeys.KeyBuilder // Will be set after extracting dataMarket from first part
+	var kb *rediskeys.KeyBuilder
+
+	// Use data_market from queue message if provided, otherwise extract from first part
+	if dataMarketFromQueue != "" {
+		dataMarket = dataMarketFromQueue
+		kb = a.getKeyBuilder(dataMarket)
+	}
 
 	for i := 0; i < totalParts; i++ {
-		// Get KeyBuilder - use kb if we've extracted dataMarket, otherwise try first configured market
+		// Get KeyBuilder - use kb if we have it, otherwise try first configured market
 		var partKeyBuilder *rediskeys.KeyBuilder
 		if kb != nil {
 			partKeyBuilder = kb
@@ -710,8 +725,8 @@ func (a *Aggregator) aggregateWorkerParts(epochIDStr string, totalParts int) {
 			continue
 		}
 
-		// Extract data_market from first batch part (mandatory field)
-		if i == 0 {
+		// Extract data_market from first batch part if not already known (mandatory field)
+		if i == 0 && dataMarket == "" {
 			dataMarketRaw, ok := partResults["data_market"]
 			if !ok {
 				log.Warnf("Skipping batch part without data_market field - old format not supported: epoch=%s, part=%d", epochIDStr, i)
@@ -726,6 +741,19 @@ func (a *Aggregator) aggregateWorkerParts(epochIDStr string, totalParts int) {
 			dataMarket = common.HexToAddress(dataMarketStr).Hex()
 			// Get KeyBuilder for this data market
 			kb = a.getKeyBuilder(dataMarket)
+			// Re-read part 0 with correct KeyBuilder if we had to guess
+			if partKeyBuilder != kb {
+				partKey = kb.BatchPart(strconv.FormatUint(epochID, 10), i)
+				partData, err = a.redisClient.Get(a.ctx, partKey).Result()
+				if err != nil {
+					log.Errorf("Failed to get batch part %d for epoch %d with correct data market: %v", i, epochID, err)
+					continue
+				}
+				if err := json.Unmarshal([]byte(partData), &partResults); err != nil {
+					log.Errorf("Failed to parse batch part %d: %v", i, err)
+					continue
+				}
+			}
 		}
 
 		// Extract projects from partResults

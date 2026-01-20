@@ -158,6 +158,7 @@ func UpdateBatchPartsProgress(redisClient *redis.Client, protocolState, dataMark
 			"epoch_id":        epochID,
 			"parts_completed": completed,
 			"ready_at":        time.Now().Unix(),
+			"data_market":     dataMarket, // Include data market so aggregator knows which KeyBuilder to use
 		}
 		data, _ := json.Marshal(aggData)
 		pipe.LPush(ctx, aggQueueKey, data)
