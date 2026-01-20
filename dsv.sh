@@ -224,13 +224,17 @@ start_services() {
         fi
         print_color "$GREEN" "✅ Successfully cloned relayer-py"
 
-        # Switch to master branch
-        print_color "$CYAN" "🔄 Switching to master branch..."
-        if ! (cd "$RELAYER_DIR" && git checkout master); then
-            print_color "$RED" "❌ Failed to switch to master branch"
+        # Switch to specified branch (from .env) or default to develop
+        RELAYER_BRANCH="${RELAYER_PY_BRANCH:-develop}"
+        print_color "$CYAN" "🔄 Switching to branch: $RELAYER_BRANCH"
+        if [ -n "$RELAYER_PY_BRANCH" ]; then
+            print_color "$CYAN" "   (from RELAYER_PY_BRANCH in .env)"
+        fi
+        if ! (cd "$RELAYER_DIR" && git checkout "$RELAYER_BRANCH" 2>/dev/null); then
+            print_color "$RED" "❌ Failed to switch to $RELAYER_BRANCH branch"
             print_color "$YELLOW" "Continuing with default branch"
         else
-            print_color "$GREEN" "✅ Switched to master branch"
+            print_color "$GREEN" "✅ Switched to $RELAYER_BRANCH branch"
         fi
 
         # relayer-py now reads settings directly from environment variables
