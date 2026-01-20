@@ -457,7 +457,15 @@ func (d *Dequeuer) storeProcessingResult(submissionID string, processed *Process
 
 	// Combined log for both operations (only when both succeed)
 	if zsetErr == nil && hashErr == nil {
-		log.Debugf("✅ Added and stored submission %s to ZSET %s and HASH %s", submissionID, submissionsIdsKey, submissionsDataKey)
+		log.Infof("✅ Added and stored submission %s to ZSET %s and HASH %s", submissionID, submissionsIdsKey, submissionsDataKey)
+	} else {
+		// Log errors if either operation failed
+		if zsetErr != nil {
+			log.Errorf("❌ CRITICAL: Failed to add submission %s to ZSET %s: %v", submissionID, submissionsIdsKey, zsetErr)
+		}
+		if hashErr != nil {
+			log.Errorf("❌ CRITICAL: Failed to store submission %s in HASH %s: %v", submissionID, submissionsDataKey, hashErr)
+		}
 	}
 
 	// Set TTL on BOTH epoch structures (2 hours covers finalization window + buffer)

@@ -1197,6 +1197,7 @@ func (s *UnifiedSequencer) runDequeuerWorker(workerID int) {
 				for _, submission := range p2pSubmission.Submissions {
 					// Validate data market address - reject if not configured
 					if !s.isValidDataMarket(submission.DataMarket) {
+						log.Debugf("Worker %d: Rejected submission for unconfigured data market: Epoch=%d, Market=%s", workerID, submission.Request.EpochId, submission.DataMarket)
 						continue
 					}
 
@@ -1250,8 +1251,11 @@ func (s *UnifiedSequencer) runDequeuerWorker(workerID int) {
 
 				// Validate data market address - reject if not configured
 				if !s.isValidDataMarket(submission.DataMarket) {
+					log.Debugf("Worker %d: Rejected submission for unconfigured data market: Epoch=%d, Market=%s", workerID, submission.Request.EpochId, submission.DataMarket)
 					continue
 				}
+
+				log.Debugf("Worker %d: Parsed single submission: Epoch=%d, Project=%s, Market=%s", workerID, submission.Request.EpochId, submission.Request.ProjectId, submission.DataMarket)
 
 				// Generate submission ID
 				submissionID := fmt.Sprintf("%d-%s-%d-%s",
