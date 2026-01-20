@@ -1050,23 +1050,69 @@ func (pcc *PriorityCachingClient) IsTopPriority(ctx context.Context, dataMarket 
 // getHistoricalPrioritiesFromContract fetches all priorities from VPA contract
 // Returns map with 1-based nodeId as keys (matching getHistoricalPriority contract call)
 // When implemented, must ensure validatorID keys in the map are 1-based nodeIds
-func (pcc *PriorityCachingClient) getHistoricalPrioritiesFromContract(_ context.Context, dataMarket string, epochID uint64) (map[string]int, PriorityMetadata, error) {
-	// This is a placeholder - actual implementation would call VPA contract methods
-	// like getHistoricalPriorities() and getHistoricalValidatorCount()
-	// IMPORTANT: getHistoricalPriorities() returns 0-based validatorIndex, but map keys must be 1-based nodeId
-	// Convert: validatorID = validatorIndex + 1
+func (pcc *PriorityCachingClient) getHistoricalPrioritiesFromContract(ctx context.Context, dataMarket string, epochID uint64) (map[string]int, PriorityMetadata, error) {
+	// Call ProtocolState.getPriorities(dataMarket, epochId) to get all priorities
+	// This returns an array of ValidatorIndexPriority structs with 0-based validatorIndex
+	data, err := pcc.protocolStateABI.Pack("getPriorities",
+		common.HexToAddress(dataMarket),
+		big.NewInt(int64(epochID)))
+	if err != nil {
+		return nil, PriorityMetadata{}, fmt.Errorf("failed to pack getPriorities call: %w", err)
+	}
 
-	// For now, return empty data
+	msg := ethereum.CallMsg{
+		To:   &pcc.protocolStateAddr,
+		Data: data,
+	}
+	result, err := pcc.client.CallContract(ctx, msg, nil)
+	if err != nil {
+		pcc.logger.WithError(err).WithFields(logrus.Fields{
+			"epochID":           epochID,
+			"dataMarket":        dataMarket,
+			"protocolStateAddr": pcc.protocolStateAddr.Hex(),
+		}).Error("ProtocolState.getPriorities() call failed")
+		return nil, PriorityMetadata{}, fmt.Errorf("failed to call ProtocolState.getPriorities: %w", err)
+	}
+
+	// Unpack the result - array of ValidatorIndexPriority structs
+	var prioritiesArray []struct {
+		ValidatorIndex *big.Int `json:"validatorIndex"`
+		Priority       *big.Int `json:"priority"`
+	}
+	err = pcc.protocolStateABI.UnpackIntoInterface(&prioritiesArray, "getPriorities", result)
+	if err != nil {
+		return nil, PriorityMetadata{}, fmt.Errorf("failed to unpack getPriorities result: %w", err)
+	}
+
+	// Convert 0-based validatorIndex to 1-based nodeId for map keys
 	priorities := make(map[string]int)
+	for _, p := range prioritiesArray {
+		if p.ValidatorIndex != nil && p.Priority != nil {
+			// Convert 0-based validatorIndex to 1-based nodeId
+			nodeId := p.ValidatorIndex.Uint64() + 1
+			nodeIdStr := strconv.FormatUint(nodeId, 10)
+			priorities[nodeIdStr] = int(p.Priority.Int64())
+		}
+	}
+
+	// Build metadata - seed is not available from getPriorities(), use empty string
+	// Validator count is the length of priorities array
 	metadata := PriorityMetadata{
 		EpochID:        epochID,
-		Seed:           "",
+		Seed:           "", // Seed is only available from PrioritiesAssigned events, not from getPriorities()
 		Timestamp:      time.Now(),
-		ValidatorCount: 0,
+		ValidatorCount: len(prioritiesArray),
 		DataMarket:     dataMarket,
 	}
 
-	return priorities, metadata, fmt.Errorf("contract calls not yet implemented")
+	pcc.logger.WithFields(logrus.Fields{
+		"epochID":        epochID,
+		"dataMarket":     dataMarket,
+		"validatorCount": len(prioritiesArray),
+		"priorities":     len(priorities),
+	}).Info("Successfully fetched historical priorities from contract")
+
+	return priorities, metadata, nil
 }
 
 // storeCachedPriorities stores cached priorities in Redis
