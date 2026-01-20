@@ -1195,6 +1195,11 @@ func (s *UnifiedSequencer) runDequeuerWorker(workerID int) {
 
 				// Process each submission in the batch
 				for _, submission := range p2pSubmission.Submissions {
+					// Validate data market address - reject if not configured
+					if !s.isValidDataMarket(submission.DataMarket) {
+						continue
+					}
+
 					// Generate submission ID
 					submissionID := fmt.Sprintf("%d-%s-%d-%s",
 						submission.Request.EpochId,
@@ -1207,7 +1212,7 @@ func (s *UnifiedSequencer) runDequeuerWorker(workerID int) {
 						"peer_id": peerID,
 					}
 
-					// Process and store the submission
+					// Process the submission
 					if s.dequeuer != nil {
 						snapshotterAddr, err := s.dequeuer.ProcessSubmission(submission, submissionID, metaData)
 						if err != nil {
@@ -1220,7 +1225,7 @@ func (s *UnifiedSequencer) runDequeuerWorker(workerID int) {
 							}
 						} else {
 							// Log with snapshotter address extracted from EIP-712 signature
-							log.Infof("Worker %d processed and stored submission: Epoch=%d, Project=%s, Slot=%d, Market=%s, CID=%s, Peer=%s, Snapshotter=%s",
+							log.Infof("Worker %d processed submission: Epoch=%d, Project=%s, Slot=%d, Market=%s, CID=%s, Peer=%s, Snapshotter=%s",
 								workerID, submission.Request.EpochId, submission.Request.ProjectId,
 								submission.Request.SlotId, submission.DataMarket, submission.Request.SnapshotCid, peerID, snapshotterAddr)
 						}
@@ -1243,6 +1248,11 @@ func (s *UnifiedSequencer) runDequeuerWorker(workerID int) {
 					continue
 				}
 
+				// Validate data market address - reject if not configured
+				if !s.isValidDataMarket(submission.DataMarket) {
+					continue
+				}
+
 				// Generate submission ID
 				submissionID := fmt.Sprintf("%d-%s-%d-%s",
 					submission.Request.EpochId,
@@ -1255,7 +1265,7 @@ func (s *UnifiedSequencer) runDequeuerWorker(workerID int) {
 					"peer_id": peerID,
 				}
 
-				// Process and store the submission
+				// Process the submission
 				if s.dequeuer != nil {
 					snapshotterAddr, err := s.dequeuer.ProcessSubmission(&submission, submissionID, metaData)
 					if err != nil {
@@ -1268,7 +1278,7 @@ func (s *UnifiedSequencer) runDequeuerWorker(workerID int) {
 						}
 					} else {
 						// Log with snapshotter address extracted from EIP-712 signature
-						log.Infof("Worker %d processed and stored submission: Epoch=%d, Project=%s, Slot=%d, Market=%s, CID=%s, Peer=%s, Snapshotter=%s",
+						log.Infof("Worker %d processed submission: Epoch=%d, Project=%s, Slot=%d, Market=%s, CID=%s, Peer=%s, Snapshotter=%s",
 							workerID, submission.Request.EpochId, submission.Request.ProjectId,
 							submission.Request.SlotId, submission.DataMarket, submission.Request.SnapshotCid, peerID, snapshotterAddr)
 					}
@@ -2001,6 +2011,25 @@ func connectToBootstrap(ctx context.Context, h host.Host, bootstrapAddr string) 
 	}
 
 	log.Infof("✅ Connected to bootstrap node: %s", peerInfo.ID)
+}
+
+// isValidDataMarket checks if a data market address is in the configured list
+func (s *UnifiedSequencer) isValidDataMarket(dataMarketAddr string) bool {
+	if dataMarketAddr == "" {
+		return false
+	}
+
+	// Normalize to checksummed format for comparison
+	checksummedAddr := common.HexToAddress(dataMarketAddr).Hex()
+
+	// Check against configured data markets
+	for _, configuredMarket := range s.config.DataMarketAddresses {
+		if common.HexToAddress(configuredMarket).Hex() == checksummedAddr {
+			return true
+		}
+	}
+
+	return false
 }
 
 func (s *UnifiedSequencer) runEventMonitor() {
