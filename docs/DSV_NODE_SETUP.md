@@ -511,6 +511,8 @@ DEBUG_MODE=true
 
 ### Resource Cleanup
 
+#### Quick Cleanup (dsv.sh commands)
+
 ```bash
 # Clean Redis cache (stale keys)
 ./dsv.sh clean-cache
@@ -524,6 +526,42 @@ DEBUG_MODE=true
 # Remove all containers and volumes
 ./dsv.sh clean
 ```
+
+#### Advanced Cleanup (cleanup_old_redis_keys.py)
+
+For comprehensive Redis key cleanup, especially after refactoring or when dealing with memory pressure:
+
+**Discovery** (see what keys exist):
+```bash
+python3 scripts/cleanup_old_redis_keys.py --discover
+```
+
+**Clean all markets automatically** (recommended for multi-market deployments):
+```bash
+# Dry run first
+python3 scripts/cleanup_old_redis_keys.py --all-markets --keep-hours 24 --cleanup-queues --dry-run
+
+# Actually clean
+python3 scripts/cleanup_old_redis_keys.py --all-markets --keep-hours 24 --cleanup-queues
+```
+
+**Clean queues/streams** (no protocol/market needed):
+```bash
+python3 scripts/cleanup_old_redis_keys.py --cleanup-queues --queue-max-length 1000
+python3 scripts/cleanup_old_redis_keys.py --cleanup-streams --stream-max-length 10000
+```
+
+**Clean non-namespaced timelines** (no protocol/market needed):
+```bash
+python3 scripts/cleanup_old_redis_keys.py --keep-hours 24
+```
+
+**Clean specific protocol/market** (requires protocol/market addresses):
+```bash
+python3 scripts/cleanup_old_redis_keys.py --keep-epochs 60 --protocol 0x1234... --market 0x5678...
+```
+
+See [REDIS_KEYS.md](./REDIS_KEYS.md#manual-redis-key-cleanup) for detailed cleanup documentation and troubleshooting.
 
 ---
 

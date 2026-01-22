@@ -807,3 +807,139 @@ State-tracker manages rolling windows for metrics aggregation. Timeline keys are
 - **Active validators**: 5 minutes TTL (presence heartbeat)
 
 All counters set TTL on first increment to prevent unbounded growth.
+
+## Manual Redis Key Cleanup
+
+When Redis memory usage is high or keys accumulate beyond expected thresholds, use the cleanup script to remove old keys.
+
+### Cleanup Script: `cleanup_old_redis_keys.py`
+
+**Location**: `scripts/cleanup_old_redis_keys.py`
+
+**Purpose**: 
+- Clean up old Redis keys to prevent memory bloat
+- Supports epoch-based cleanup (requires protocol/market) and time-based cleanup (works without protocol/market)
+- Handles multiple protocol:market combinations automatically
+
+**Why Protocol/Market is Needed**:
+- Epoch-based keys are namespaced: `{protocol}:{market}:epoch:{epochId}:...`
+- To determine what's "old", we need the current epoch
+- Current epoch is stored in Redis keys that require protocol/market to access
+- Queue/stream/timeline cleanup can work without protocol/market (they're time-based, not epoch-based)
+
+### Common Cleanup Scenarios
+
+#### 1. Discovery Mode (No Cleanup)
+Scan all keys to see what exists:
+
+```bash
+python3 scripts/cleanup_old_redis_keys.py --discover
+```
+
+This shows:
+- Total keys by type
+- Large queues (>1000 items)
+- Large timelines (>10000 entries)
+- All protocol:market combinations found
+
+#### 2. Clean Queues/Streams (No Protocol/Market Needed)
+For legacy queues or streams that have accumulated:
+
+```bash
+# Dry run first
+python3 scripts/cleanup_old_redis_keys.py --cleanup-queues --queue-max-length 1000 --dry-run
+
+# Actually clean
+python3 scripts/cleanup_old_redis_keys.py --cleanup-queues --queue-max-length 1000
+
+# Clean streams
+python3 scripts/cleanup_old_redis_keys.py --cleanup-streams --stream-max-length 10000 --dry-run
+python3 scripts/cleanup_old_redis_keys.py --cleanup-streams --stream-max-length 10000
+```
+
+#### 3. Clean Non-Namespaced Timelines (No Protocol/Market Needed)
+For non-namespaced timeline keys like `metrics:submissions:timeline`:
+
+```bash
+# Dry run
+python3 scripts/cleanup_old_redis_keys.py --keep-hours 24 --dry-run
+
+# Actually clean (keeps last 24 hours)
+python3 scripts/cleanup_old_redis_keys.py --keep-hours 24
+```
+
+#### 4. Clean ALL Markets Automatically (No Protocol/Market Needed)
+After refactoring with multiple markets support, clean all protocol:market combinations:
+
+```bash
+# Dry run - discovers all markets automatically
+python3 scripts/cleanup_old_redis_keys.py --all-markets --keep-hours 24 --cleanup-queues --dry-run
+
+# Actually clean all markets
+python3 scripts/cleanup_old_redis_keys.py --all-markets --keep-hours 24 --cleanup-queues
+```
+
+This will:
+- Discover all protocol:market combinations
+- Clean timeline entries older than 24 hours
+- Clean legacy queues
+- Remove old epoch-based keys
+
+#### 5. Clean Specific Protocol/Market (Requires Protocol/Market)
+For epoch-based cleanup of a specific protocol:market:
+
+```bash
+# Dry run
+python3 scripts/cleanup_old_redis_keys.py --keep-epochs 60 --protocol 0x1234... --market 0x5678... --dry-run
+
+# Actually clean (keeps last 60 epochs)
+python3 scripts/cleanup_old_redis_keys.py --keep-epochs 60 --protocol 0x1234... --market 0x5678...
+```
+
+### Cleanup Options
+
+- `--discover`: Scan all keys and show what exists (no cleanup)
+- `--dry-run`: Show what would be deleted without actually deleting
+- `--keep-epochs N`: Keep last N epochs (default: 60)
+- `--keep-hours N`: Keep last N hours of timeline data (overrides --keep-epochs for timelines)
+- `--cleanup-queues`: Clean up Redis LIST queues (trim to max length)
+- `--cleanup-streams`: Clean up Redis streams (trim to max length)
+- `--queue-max-length N`: Maximum length for queues after cleanup (default: 1000)
+- `--stream-max-length N`: Maximum length for streams after cleanup (default: 10000)
+- `--all-markets`: Clean up keys for all protocol:market combinations found
+- `--protocol ADDRESS`: Protocol state contract address
+- `--market ADDRESS`: Data market contract address
+- `--host HOST`: Redis host (default: localhost)
+- `--port PORT`: Redis port (default: 6380)
+- `--db DB`: Redis database (default: 0)
+
+### When to Run Cleanup
+
+**Regular Maintenance**:
+- Run `--discover` weekly to check key counts
+- Run `--all-markets --keep-hours 24` monthly to clean old data
+
+**Memory Pressure**:
+- If Redis memory usage is high, run `--all-markets --keep-hours 6 --cleanup-queues --cleanup-streams`
+- Check discovery results first to identify what's consuming memory
+
+**After Refactoring**:
+- After multi-market refactoring, run `--all-markets` to clean up old keys
+- After timeline pruning fixes, run `--keep-hours 24` to clean accumulated non-namespaced timelines
+
+### Troubleshooting
+
+**Script hangs during cleanup**:
+- Large timeline deletions (>100K entries) use batch processing
+- This is normal and may take several minutes
+- The script shows progress with batch counts
+
+**"Protocol and market required" error**:
+- Use `--all-markets` to discover and clean all markets automatically
+- Or use `--keep-hours` for time-based cleanup without protocol/market
+- Or use `--cleanup-queues`/`--cleanup-streams` for queue/stream cleanup
+
+**Timeline not being cleaned**:
+- Ensure state-tracker is running (it prunes timelines daily)
+- Run manual cleanup with `--keep-hours 24` to clean accumulated entries
+- Check if timeline is namespaced (`{protocol}:{market}:metrics:...`) or non-namespaced (`metrics:...`)
