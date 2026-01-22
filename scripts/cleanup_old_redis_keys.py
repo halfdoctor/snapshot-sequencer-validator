@@ -867,6 +867,16 @@ def main():
         if args.cleanup_queues:
             cleanup.cleanup_queues(max_length=args.queue_max_length, dry_run=args.dry_run)
 
+        # If only queue/stream cleanup was requested (no epoch-based cleanup), exit here
+        # This prevents unnecessary protocol/market checks since queue/stream cleanup doesn't need them
+        if (args.cleanup_queues or args.cleanup_streams) and not args.all_markets and not args.protocol and not args.market and not args.keep_hours:
+            cleanup.print_stats()
+            if args.dry_run:
+                print("\n💡 This was a dry run. Use without --dry-run to actually clean up.")
+            else:
+                print("\n✓ Queue/stream cleanup complete.")
+            return 0
+
         # Handle all-markets mode
         if args.all_markets:
             # Discover all protocol:market combinations
@@ -925,11 +935,12 @@ def main():
             return 0
 
         # Single protocol:market cleanup (original behavior)
-        # Allow timeline cleanup without protocol/market if using --keep-hours
-        if (not args.protocol or not args.market) and not args.keep_hours:
-            print("\n❌ Error: --protocol and --market are required (or use --all-markets or --keep-hours)")
+        # Only require protocol/market if we need epoch-based cleanup (not for queue/stream/timeline-only cleanup)
+        if (not args.protocol or not args.market) and not args.keep_hours and not args.cleanup_queues and not args.cleanup_streams:
+            print("\n❌ Error: --protocol and --market are required for epoch-based cleanup")
             print("💡 Tip: Use --discover to see what protocol:market combinations exist")
             print("💡 Tip: Use --keep-hours to clean non-namespaced timelines without protocol/market")
+            print("💡 Tip: Use --cleanup-queues or --cleanup-streams to clean queues/streams without protocol/market")
             return 1
 
         # Get current epoch (only needed for epoch-based cleanup)
@@ -943,10 +954,43 @@ def main():
                 print("\nPlease specify --protocol and --market if auto-detection fails.")
                 return 1
         elif args.keep_hours:
-            # For timeline-only cleanup, we don't need current epoch
-            print(f"\n💡 Timeline-only cleanup mode (using --keep-hours)")
-            # Set a dummy epoch for the function call
-            current_epoch = 0
+            # For timeline-only cleanup without protocol/market, just clean non-namespaced timelines
+            print(f"\n💡 Timeline-only cleanup mode (using --keep-hours, no protocol/market)")
+            # Call timeline cleanup directly
+            cutoff_timestamp = int(time.time()) - (args.keep_hours * 3600)
+            timeline_keys = [
+                "metrics:epochs:timeline",
+                "metrics:batches:timeline",
+                "metrics:submissions:timeline",
+                "metrics:validations:timeline",
+            ]
+            
+            for timeline_key in timeline_keys:
+                try:
+                    if not cleanup.redis_client.exists(timeline_key):
+                        continue
+                    total_size = cleanup.redis_client.zcard(timeline_key)
+                    if total_size == 0:
+                        continue
+                    count_to_remove = cleanup.redis_client.zcount(timeline_key, "-inf", cutoff_timestamp)
+                    if count_to_remove > 0:
+                        if args.dry_run:
+                            cleanup.stats[f"{timeline_key} (timeline)"] = count_to_remove
+                            print(f"  🔍 DRY RUN: Would remove {count_to_remove:,} entries from {timeline_key} (total: {total_size:,})")
+                        else:
+                            removed = cleanup.redis_client.zremrangebyscore(timeline_key, "-inf", cutoff_timestamp)
+                            if removed > 0:
+                                cleanup.stats[f"{timeline_key} (timeline)"] = removed
+                                print(f"  ✓ Removed {removed:,} entries from {timeline_key}")
+                except Exception as e:
+                    print(f"⚠ Error cleaning timeline {timeline_key}: {e}")
+            
+            cleanup.print_stats()
+            if args.dry_run:
+                print("\n💡 This was a dry run. Use without --dry-run to actually delete keys.")
+            else:
+                print("\n✓ Timeline cleanup complete.")
+            return 0
 
         # Find keys to delete
         keys_to_delete = cleanup.find_keys_to_delete(
