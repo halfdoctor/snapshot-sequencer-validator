@@ -6,17 +6,34 @@ Cleans up old Redis keys from epochs older than (current_epoch - keep_epochs).
 Safely removes keys that are no longer needed.
 
 Usage:
-    python3 cleanup_old_redis_keys.py [--dry-run] [--keep-epochs 60] [--protocol PROTOCOL] [--market MARKET] [--port 6380]
+    python3 cleanup_old_redis_keys.py [--dry-run] [--keep-epochs 60] [--keep-hours HOURS] 
+                                      [--aggressive-timeline] [--protocol PROTOCOL] 
+                                      [--market MARKET] [--port 6380]
+                                      [--discover] [--cleanup-streams] [--cleanup-queues]
+                                      [--all-markets]
 
 Examples:
+    # Discovery mode: scan all keys and see what exists (no cleanup)
+    python3 cleanup_old_redis_keys.py --discover
+
     # Dry run (see what would be deleted)
-    python3 cleanup_old_redis_keys.py --dry-run
+    python3 cleanup_old_redis_keys.py --dry-run --protocol 0x1234... --market 0x5678...
 
     # Actually delete old keys (keep last 60 epochs)
-    python3 cleanup_old_redis_keys.py --keep-epochs 60
+    python3 cleanup_old_redis_keys.py --keep-epochs 60 --protocol 0x1234... --market 0x5678...
 
-    # Keep more epochs (e.g., 100)
-    python3 cleanup_old_redis_keys.py --keep-epochs 100
+    # Clean up streams and queues (for memory pressure)
+    python3 cleanup_old_redis_keys.py --cleanup-streams --cleanup-queues --dry-run
+
+    # Aggressive cleanup for memory pressure (keep only last 24 hours of timeline data)
+    python3 cleanup_old_redis_keys.py --keep-hours 24 --aggressive-timeline --protocol 0x1234... --market 0x5678...
+
+    # Very aggressive cleanup (keep only last 6 hours)
+    python3 cleanup_old_redis_keys.py --keep-hours 6 --aggressive-timeline --keep-epochs 30 --protocol 0x1234... --market 0x5678...
+
+    # Clean up ALL markets (after refactoring with multiple markets support)
+    python3 cleanup_old_redis_keys.py --all-markets --keep-epochs 60 --dry-run
+    python3 cleanup_old_redis_keys.py --all-markets --keep-hours 24 --cleanup-streams --cleanup-queues
 """
 
 import argparse
@@ -34,6 +51,7 @@ class RedisCleanup:
         self.protocol = protocol
         self.market = market
         self.stats = defaultdict(int)
+        self.discovered_keys = defaultdict(list)  # For discovery mode
 
     def get_current_epoch(self) -> int:
         """Get current epoch from Redis using consistent method for both dry-run and live mode."""
@@ -130,12 +148,25 @@ class RedisCleanup:
             return int(match.group(1))
         return None
 
-    def find_keys_to_delete(self, current_epoch: int, keep_epochs: int) -> List[str]:
-        """Find all keys that should be deleted."""
+    def find_keys_to_delete(self, current_epoch: int, keep_epochs: int, dry_run: bool = True, 
+                           keep_hours: int = None, aggressive_timeline: bool = False) -> List[str]:
+        """Find all keys that should be deleted.
+        
+        Args:
+            current_epoch: Current epoch number
+            keep_epochs: Number of epochs to keep (for epoch-based keys)
+            dry_run: If True, don't actually delete anything
+            keep_hours: If set, keep only last N hours (overrides keep_epochs for timeline)
+            aggressive_timeline: If True, clean timeline entries based on epoch IDs in entries
+        """
         cutoff_epoch = current_epoch - keep_epochs
         keys_to_delete = []
 
         print(f"\n🔍 Scanning for keys older than epoch {cutoff_epoch} (current: {current_epoch}, keeping: {keep_epochs})...")
+        if keep_hours:
+            print(f"   Timeline cleanup: keeping last {keep_hours} hours")
+        if aggressive_timeline:
+            print(f"   Aggressive timeline cleanup: enabled")
 
         # Key patterns to clean up
         patterns = []
@@ -187,7 +218,10 @@ class RedisCleanup:
 
         # Clean up timeline keys older than cutoff (by score/timestamp)
         # Timeline zsets use Unix timestamps as scores, not epoch numbers
-        cutoff_timestamp = int(time.time()) - (keep_epochs * 60)  # Keep last N epochs (assuming ~1 epoch per minute)
+        if keep_hours:
+            cutoff_timestamp = int(time.time()) - (keep_hours * 3600)  # Keep last N hours
+        else:
+            cutoff_timestamp = int(time.time()) - (keep_epochs * 60)  # Keep last N epochs (assuming ~1 epoch per minute)
         
         if self.protocol and self.market:
             timeline_keys = [
@@ -211,14 +245,35 @@ class RedisCleanup:
                     if not self.redis_client.exists(timeline_key):
                         continue
                     
-                    # Remove entries older than cutoff timestamp
-                    # Timeline zsets use Unix timestamps as scores
-                    removed = self.redis_client.zremrangebyscore(
-                        timeline_key, "-inf", cutoff_timestamp
-                    )
-                    if removed > 0:
-                        self.stats[f"{timeline_key} (timeline)"] = removed
-                        print(f"  ✓ Removed {removed} entries from {timeline_key} (cutoff: {cutoff_timestamp})")
+                    total_size = self.redis_client.zcard(timeline_key)
+                    if total_size == 0:
+                        continue
+                    
+                    # Count entries that would be removed
+                    count_to_remove = self.redis_client.zcount(timeline_key, "-inf", cutoff_timestamp)
+                    
+                    if count_to_remove > 0:
+                        if dry_run:
+                            self.stats[f"{timeline_key} (timeline)"] = count_to_remove
+                            print(f"  🔍 DRY RUN: Would remove {count_to_remove:,} entries from {timeline_key} (total: {total_size:,}, cutoff: {cutoff_timestamp})")
+                        else:
+                            # For very large deletions, use batch processing
+                            if count_to_remove > 100000:
+                                print(f"  ⚠ Large deletion detected ({count_to_remove:,} entries), using batch processing...")
+                                removed = self._cleanup_timeline_batched(timeline_key, cutoff_timestamp, cutoff_epoch if aggressive_timeline else None)
+                            else:
+                                # Remove entries older than cutoff timestamp
+                                removed = self.redis_client.zremrangebyscore(
+                                    timeline_key, "-inf", cutoff_timestamp
+                                )
+                            
+                            if removed > 0:
+                                self.stats[f"{timeline_key} (timeline)"] = removed
+                                print(f"  ✓ Removed {removed:,} entries from {timeline_key}")
+                            
+                            # If aggressive mode, also clean by epoch ID extracted from entries
+                            if aggressive_timeline and removed > 0:
+                                self._cleanup_timeline_by_epoch(timeline_key, cutoff_epoch, dry_run)
                 except Exception as e:
                     if "no such key" not in str(e).lower():
                         print(f"⚠ Error cleaning timeline {timeline_key}: {e}")
@@ -236,10 +291,14 @@ class RedisCleanup:
                             epochs_to_remove.append(epoch_str)
                     
                     if epochs_to_remove:
-                        removed = self.redis_client.srem(active_epochs_key, *epochs_to_remove)
-                        if removed > 0:
-                            self.stats[f"{active_epochs_key} (set)"] = removed
-                            print(f"  ✓ Removed {removed} old epochs from {active_epochs_key}")
+                        if dry_run:
+                            self.stats[f"{active_epochs_key} (set)"] = len(epochs_to_remove)
+                            print(f"  🔍 DRY RUN: Would remove {len(epochs_to_remove)} old epochs from {active_epochs_key}")
+                        else:
+                            removed = self.redis_client.srem(active_epochs_key, *epochs_to_remove)
+                            if removed > 0:
+                                self.stats[f"{active_epochs_key} (set)"] = removed
+                                print(f"  ✓ Removed {removed} old epochs from {active_epochs_key}")
             except Exception as e:
                 print(f"⚠ Error pruning {active_epochs_key}: {e}")
         
@@ -255,8 +314,170 @@ class RedisCleanup:
             except Exception as e:
                 if "no such key" not in str(e).lower():
                     print(f"⚠ Error checking {aggregation_queue_key}: {e}")
+        
+        # Clean up submission metadata keys (these have TTL but might accumulate)
+        if self.protocol and self.market:
+            metadata_pattern = f"{self.protocol}:{self.market}:metrics:submissions:metadata:*"
+            try:
+                metadata_keys_scanned = 0
+                metadata_keys_to_delete = []
+                for key in self.redis_client.scan_iter(match=metadata_pattern, count=100):
+                    metadata_keys_scanned += 1
+                    # Extract epoch from metadata key or check TTL
+                    # Metadata keys have 24h TTL, but if they're old, delete them
+                    ttl = self.redis_client.ttl(key)
+                    if ttl == -1:  # No TTL set (shouldn't happen but check anyway)
+                        # Try to extract epoch from key and check if old
+                        epoch_num = self._extract_epoch_from_key(key)
+                        if epoch_num is not None and epoch_num < cutoff_epoch:
+                            metadata_keys_to_delete.append(key)
+                    elif ttl == -2:  # Key doesn't exist (shouldn't happen in scan)
+                        continue
+                    
+                    # Limit scan to avoid blocking
+                    if metadata_keys_scanned >= 100000:
+                        break
+                
+                if metadata_keys_to_delete:
+                    if dry_run:
+                        self.stats[f"{metadata_pattern} (metadata)"] = len(metadata_keys_to_delete)
+                        print(f"  🔍 DRY RUN: Would remove {len(metadata_keys_to_delete):,} submission metadata keys")
+                    else:
+                        # Delete in batches
+                        batch_size = 1000
+                        total_deleted = 0
+                        for i in range(0, len(metadata_keys_to_delete), batch_size):
+                            batch = metadata_keys_to_delete[i:i + batch_size]
+                            deleted = self.redis_client.delete(*batch)
+                            total_deleted += deleted
+                        self.stats[f"{metadata_pattern} (metadata)"] = total_deleted
+                        print(f"  ✓ Removed {total_deleted:,} submission metadata keys")
+            except Exception as e:
+                print(f"⚠ Error cleaning submission metadata keys: {e}")
 
         return keys_to_delete
+
+    def _cleanup_timeline_batched(self, timeline_key: str, cutoff_timestamp: int, cutoff_epoch: int = None) -> int:
+        """Clean up timeline entries in batches to avoid blocking Redis."""
+        total_removed = 0
+        batch_size = 10000  # Process 10K entries at a time
+        
+        # Get range of entries to remove
+        entries = self.redis_client.zrangebyscore(timeline_key, "-inf", cutoff_timestamp, withscores=True, start=0, num=batch_size)
+        
+        while entries:
+            # Extract member names (not scores) for deletion
+            members_to_remove = [member for member, score in entries]
+            
+            # Also filter by epoch if cutoff_epoch is provided
+            if cutoff_epoch:
+                filtered_members = []
+                for member in members_to_remove:
+                    epoch_num = self._extract_epoch_from_timeline_entry(member)
+                    if epoch_num is None or epoch_num < cutoff_epoch:
+                        filtered_members.append(member)
+                members_to_remove = filtered_members
+            
+            if members_to_remove:
+                removed = self.redis_client.zrem(timeline_key, *members_to_remove)
+                total_removed += removed
+                print(f"    Batch: removed {removed:,} entries (total so far: {total_removed:,})")
+            
+            # Get next batch
+            entries = self.redis_client.zrangebyscore(timeline_key, "-inf", cutoff_timestamp, withscores=True, start=0, num=batch_size)
+        
+        return total_removed
+    
+    def _cleanup_timeline_by_epoch(self, timeline_key: str, cutoff_epoch: int, dry_run: bool):
+        """Clean up timeline entries by extracting epoch IDs from entry values."""
+        try:
+            # Sample entries to check if they contain epoch IDs
+            sample = self.redis_client.zrange(timeline_key, 0, 100, withscores=False)
+            if not sample:
+                return
+            
+            # Check if entries contain epoch IDs (format: received:{epochId}:... or {epochId}-...)
+            entries_with_epochs = []
+            for entry in sample:
+                epoch_num = self._extract_epoch_from_timeline_entry(entry)
+                if epoch_num is not None:
+                    entries_with_epochs.append((entry, epoch_num))
+            
+            if not entries_with_epochs:
+                return  # Entries don't contain epoch IDs, skip
+            
+            # Scan all entries and collect those with old epochs
+            members_to_remove = []
+            cursor = 0
+            batch_size = 1000
+            
+            while True:
+                entries = self.redis_client.zscan(timeline_key, cursor, count=batch_size)
+                cursor = entries[0]
+                members = entries[1]
+                
+                for member, score in members:
+                    epoch_num = self._extract_epoch_from_timeline_entry(member)
+                    if epoch_num is not None and epoch_num < cutoff_epoch:
+                        members_to_remove.append(member)
+                
+                if cursor == 0:
+                    break
+                
+                # Process in batches to avoid memory issues
+                if len(members_to_remove) >= 10000:
+                    if dry_run:
+                        self.stats[f"{timeline_key} (timeline-epoch)"] = len(members_to_remove)
+                        print(f"  🔍 DRY RUN: Would remove {len(members_to_remove):,} entries by epoch from {timeline_key}")
+                    else:
+                        removed = self.redis_client.zrem(timeline_key, *members_to_remove[:10000])
+                        print(f"  ✓ Removed {removed:,} entries by epoch from {timeline_key}")
+                    members_to_remove = members_to_remove[10000:]
+            
+            # Remove remaining entries
+            if members_to_remove:
+                if dry_run:
+                    self.stats[f"{timeline_key} (timeline-epoch)"] = len(members_to_remove)
+                    print(f"  🔍 DRY RUN: Would remove {len(members_to_remove):,} entries by epoch from {timeline_key}")
+                else:
+                    removed = self.redis_client.zrem(timeline_key, *members_to_remove)
+                    print(f"  ✓ Removed {removed:,} entries by epoch from {timeline_key}")
+        except Exception as e:
+            print(f"⚠ Error in epoch-based timeline cleanup for {timeline_key}: {e}")
+    
+    def _extract_epoch_from_timeline_entry(self, entry: str) -> int:
+        """Extract epoch number from timeline entry value.
+        
+        Supports formats:
+        - received:{epochId}:{slotId}:{projectId}:{timestamp}:{peerId}
+        - {epochId}-{projectId}-{timestamp}
+        - open:{epochId}
+        - closed:{epochId}
+        """
+        # Try format: received:{epochId}:...
+        match = re.search(r'received:(\d+):', entry)
+        if match:
+            return int(match.group(1))
+        
+        # Try format: {epochId}-{projectId}-...
+        match = re.search(r'^(\d+)-', entry)
+        if match:
+            return int(match.group(1))
+        
+        # Try format: open:{epochId} or closed:{epochId}
+        match = re.search(r'(?:open|closed):(\d+)', entry)
+        if match:
+            return int(match.group(1))
+        
+        # Try to extract any number that looks like an epoch ID
+        match = re.search(r':(\d+):', entry)
+        if match:
+            epoch_candidate = int(match.group(1))
+            # Sanity check: epoch IDs are typically large numbers (> 1000000)
+            if epoch_candidate > 1000000:
+                return epoch_candidate
+        
+        return None
 
     def _extract_epoch_from_key(self, key: str) -> int:
         """Extract epoch number from a Redis key."""
@@ -354,6 +575,199 @@ class RedisCleanup:
         else:
             return 'other'
 
+    def discover_all_keys(self, pattern="*", max_keys=100000):
+        """Discover and categorize all keys in Redis."""
+        print(f"\n🔍 Discovering all keys (pattern: {pattern}, max: {max_keys:,})...")
+        
+        key_types = defaultdict(int)
+        key_patterns = defaultdict(list)
+        streams = []
+        queues = []
+        unknown_keys = []
+        
+        cursor = 0
+        scanned = 0
+        
+        while scanned < max_keys:
+            cursor, keys = self.redis_client.scan(cursor, match=pattern, count=1000)
+            scanned += len(keys)
+            
+            for key in keys:
+                try:
+                    key_type = self.redis_client.type(key)
+                    key_types[key_type] += 1
+                    
+                    # Categorize key
+                    if key_type == 'stream':
+                        streams.append(key)
+                        length = self.redis_client.xlen(key)
+                        key_patterns['streams'].append((key, length))
+                    elif key_type == 'list':
+                        queues.append(key)
+                        length = self.redis_client.llen(key)
+                        key_patterns['queues'].append((key, length))
+                    elif key_type == 'zset':
+                        length = self.redis_client.zcard(key)
+                        if 'timeline' in key.lower():
+                            key_patterns['timelines'].append((key, length))
+                        else:
+                            key_patterns['zsets'].append((key, length))
+                    elif key_type == 'set':
+                        length = self.redis_client.scard(key)
+                        key_patterns['sets'].append((key, length))
+                    elif key_type == 'hash':
+                        length = self.redis_client.hlen(key)
+                        key_patterns['hashes'].append((key, length))
+                    elif key_type == 'string':
+                        key_patterns['strings'].append((key, 1))
+                    else:
+                        unknown_keys.append((key, key_type))
+                    
+                    # Extract protocol:market patterns
+                    if ':' in key and len(key.split(':')) >= 2:
+                        parts = key.split(':')
+                        if len(parts) >= 2:
+                            proto_market = f"{parts[0]}:{parts[1]}"
+                            self.discovered_keys[proto_market].append(key)
+                
+                except Exception as e:
+                    print(f"  ⚠ Error inspecting key {key}: {e}")
+            
+            if cursor == 0:
+                break
+        
+        print(f"\n📊 Discovery Results:")
+        print(f"  Total keys scanned: {scanned:,}")
+        print(f"\n  Key types:")
+        for ktype, count in sorted(key_types.items(), key=lambda x: x[1], reverse=True):
+            print(f"    {ktype}: {count:,}")
+        
+        print(f"\n  Large streams (>1000 entries):")
+        for key, length in sorted(key_patterns.get('streams', []), key=lambda x: x[1], reverse=True)[:10]:
+            if length > 1000:
+                print(f"    {key}: {length:,} entries")
+        
+        print(f"\n  Large queues (>1000 items):")
+        for key, length in sorted(key_patterns.get('queues', []), key=lambda x: x[1], reverse=True)[:10]:
+            if length > 1000:
+                print(f"    {key}: {length:,} items")
+        
+        print(f"\n  Large timelines (>10000 entries):")
+        for key, length in sorted(key_patterns.get('timelines', []), key=lambda x: x[1], reverse=True)[:10]:
+            if length > 10000:
+                print(f"    {key}: {length:,} entries")
+        
+        print(f"\n  Protocol:Market combinations found:")
+        for proto_market, keys in sorted(self.discovered_keys.items(), key=lambda x: len(x[1]), reverse=True)[:10]:
+            print(f"    {proto_market}: {len(keys):,} keys")
+        
+        return {
+            'key_types': key_types,
+            'streams': streams,
+            'queues': queues,
+            'patterns': key_patterns,
+            'unknown': unknown_keys
+        }
+
+    def cleanup_streams(self, cutoff_timestamp: int, dry_run: bool = True, max_length: int = 10000):
+        """Clean up Redis streams by trimming old entries."""
+        print(f"\n🔍 Cleaning up streams (cutoff: {cutoff_timestamp}, max_length: {max_length})...")
+        
+        # Find all streams
+        streams = []
+        cursor = 0
+        while True:
+            cursor, keys = self.redis_client.scan(cursor, match="*:*:stream:*", count=1000)
+            for key in keys:
+                if self.redis_client.type(key) == 'stream':
+                    streams.append(key)
+            if cursor == 0:
+                break
+        
+        # Also check for non-namespaced streams
+        cursor = 0
+        while True:
+            cursor, keys = self.redis_client.scan(cursor, match="stream:*", count=1000)
+            for key in keys:
+                if self.redis_client.type(key) == 'stream' and key not in streams:
+                    streams.append(key)
+            if cursor == 0:
+                break
+        
+        total_trimmed = 0
+        for stream_key in streams:
+            try:
+                length = self.redis_client.xlen(stream_key)
+                if length <= max_length:
+                    continue
+                
+                if dry_run:
+                    would_trim = length - max_length
+                    self.stats[f"{stream_key} (stream)"] = would_trim
+                    print(f"  🔍 DRY RUN: Would trim {would_trim:,} entries from {stream_key} (current: {length:,})")
+                else:
+                    # Trim stream to max_length using MINID (more efficient than MAXLEN for time-based)
+                    trimmed = self.redis_client.xtrim(stream_key, maxlen=max_length, approximate=True)
+                    if trimmed > 0:
+                        self.stats[f"{stream_key} (stream)"] = trimmed
+                        total_trimmed += trimmed
+                        print(f"  ✓ Trimmed {trimmed:,} entries from {stream_key}")
+            except Exception as e:
+                print(f"  ⚠ Error cleaning stream {stream_key}: {e}")
+        
+        return total_trimmed
+
+    def cleanup_queues(self, max_length: int = 1000, dry_run: bool = True):
+        """Clean up Redis LIST queues that exceed max_length."""
+        print(f"\n🔍 Cleaning up queues (max_length: {max_length})...")
+        
+        # Find all queues (LISTs)
+        queues = []
+        cursor = 0
+        while True:
+            cursor, keys = self.redis_client.scan(cursor, match="*:*:queue*", count=1000)
+            for key in keys:
+                if self.redis_client.type(key) == 'list':
+                    queues.append(key)
+            if cursor == 0:
+                break
+        
+        # Also check for non-namespaced queues
+        cursor = 0
+        while True:
+            cursor, keys = self.redis_client.scan(cursor, match="*queue*", count=1000)
+            for key in keys:
+                if self.redis_client.type(key) == 'list' and key not in queues:
+                    queues.append(key)
+            if cursor == 0:
+                break
+        
+        total_trimmed = 0
+        for queue_key in queues:
+            try:
+                length = self.redis_client.llen(queue_key)
+                if length <= max_length:
+                    continue
+                
+                if dry_run:
+                    would_trim = length - max_length
+                    self.stats[f"{queue_key} (queue)"] = would_trim
+                    print(f"  🔍 DRY RUN: Would trim {would_trim:,} items from {queue_key} (current: {length:,})")
+                else:
+                    # Trim queue from the left (oldest items)
+                    trimmed = self.redis_client.ltrim(queue_key, -max_length, -1)
+                    if trimmed:
+                        # LTRIM doesn't return count, so calculate it
+                        new_length = self.redis_client.llen(queue_key)
+                        trimmed_count = length - new_length
+                        self.stats[f"{queue_key} (queue)"] = trimmed_count
+                        total_trimmed += trimmed_count
+                        print(f"  ✓ Trimmed {trimmed_count:,} items from {queue_key} (now: {new_length:,})")
+            except Exception as e:
+                print(f"  ⚠ Error cleaning queue {queue_key}: {e}")
+        
+        return total_trimmed
+
     def print_stats(self):
         """Print cleanup statistics."""
         print("\n" + "="*60)
@@ -361,8 +775,8 @@ class RedisCleanup:
         print("="*60)
         total = sum(self.stats.values())
         for pattern, count in sorted(self.stats.items(), key=lambda x: x[1], reverse=True):
-            print(f"  {pattern}: {count} keys")
-        print(f"\n  Total: {total} keys")
+            print(f"  {pattern}: {count:,} keys/entries")
+        print(f"\n  Total: {total:,} keys/entries")
         print("="*60)
 
 
@@ -376,6 +790,22 @@ def main():
                         help='Show what would be deleted without actually deleting')
     parser.add_argument('--keep-epochs', type=int, default=60,
                         help='Number of recent epochs to keep (default: 60)')
+    parser.add_argument('--keep-hours', type=int, default=None,
+                        help='Number of recent hours to keep for timeline keys (overrides --keep-epochs for timelines)')
+    parser.add_argument('--aggressive-timeline', action='store_true',
+                        help='Enable aggressive timeline cleanup by extracting epoch IDs from entries')
+    parser.add_argument('--discover', action='store_true',
+                        help='Discovery mode: scan all keys and show what exists (no cleanup)')
+    parser.add_argument('--cleanup-streams', action='store_true',
+                        help='Clean up Redis streams (trim to max length)')
+    parser.add_argument('--cleanup-queues', action='store_true',
+                        help='Clean up Redis LIST queues (trim to max length)')
+    parser.add_argument('--stream-max-length', type=int, default=10000,
+                        help='Maximum length for streams after cleanup (default: 10000)')
+    parser.add_argument('--queue-max-length', type=int, default=1000,
+                        help='Maximum length for queues after cleanup (default: 1000)')
+    parser.add_argument('--all-markets', action='store_true',
+                        help='Clean up keys for all protocol:market combinations found (ignores --protocol and --market)')
     parser.add_argument('--protocol', type=str,
                         help='Protocol state address (e.g., 0x1234...)')
     parser.add_argument('--market', type=str,
@@ -394,13 +824,21 @@ def main():
     print("="*60)
     print(f"Host: {args.host}:{args.port}")
     print(f"DB: {args.db}")
-    print(f"Keep epochs: {args.keep_epochs}")
-    print(f"Protocol: {args.protocol or 'auto-detect'}")
-    print(f"Market: {args.market or 'auto-detect'}")
-    if args.dry_run:
-        print("Mode: DRY RUN (no keys will be deleted)")
+    
+    if args.discover:
+        print("Mode: DISCOVERY (scanning all keys, no cleanup)")
     else:
-        print("Mode: LIVE (keys will be deleted)")
+        print(f"Keep epochs: {args.keep_epochs}")
+        if args.keep_hours:
+            print(f"Keep hours: {args.keep_hours}")
+        print(f"Protocol: {args.protocol or 'auto-detect'}")
+        print(f"Market: {args.market or 'auto-detect'}")
+        if args.all_markets:
+            print("⚠ All markets mode: will clean up keys for all protocol:market combinations")
+        if args.dry_run:
+            print("Mode: DRY RUN (no keys will be deleted)")
+        else:
+            print("Mode: LIVE (keys will be deleted)")
     print("="*60)
 
     try:
@@ -412,6 +850,84 @@ def main():
             market=args.market
         )
 
+        # Discovery mode
+        if args.discover:
+            discovery_results = cleanup.discover_all_keys()
+            print("\n💡 Discovery complete. Use cleanup options to clean up keys.")
+            return 0
+
+        # Cleanup streams if requested
+        if args.cleanup_streams:
+            cutoff_timestamp = int(time.time()) - (args.keep_hours * 3600 if args.keep_hours else args.keep_epochs * 60)
+            cleanup.cleanup_streams(cutoff_timestamp, dry_run=args.dry_run, max_length=args.stream_max_length)
+
+        # Cleanup queues if requested
+        if args.cleanup_queues:
+            cleanup.cleanup_queues(max_length=args.queue_max_length, dry_run=args.dry_run)
+
+        # Handle all-markets mode
+        if args.all_markets:
+            # Discover all protocol:market combinations
+            discovery_results = cleanup.discover_all_keys(max_keys=10000)
+            proto_markets = list(cleanup.discovered_keys.keys())
+            
+            if not proto_markets:
+                print("\n⚠ No protocol:market combinations found. Try --discover first.")
+                return 1
+            
+            print(f"\n🔍 Found {len(proto_markets)} protocol:market combinations:")
+            for pm in proto_markets[:20]:  # Show first 20
+                print(f"  - {pm}: {len(cleanup.discovered_keys[pm])} keys")
+            if len(proto_markets) > 20:
+                print(f"  ... and {len(proto_markets) - 20} more")
+            
+            if args.dry_run:
+                print("\n💡 DRY RUN: Would clean up keys for all markets above")
+            else:
+                confirm = input("\n⚠ Proceed with cleanup for ALL markets? (yes/no): ")
+                if confirm.lower() != 'yes':
+                    print("Aborted.")
+                    return 1
+            
+            # Clean up each protocol:market combination
+            total_deleted = 0
+            total_failed = 0
+            
+            for proto_market in proto_markets:
+                parts = proto_market.split(':')
+                if len(parts) >= 2:
+                    cleanup.protocol = parts[0]
+                    cleanup.market = parts[1]
+                    print(f"\n{'='*60}")
+                    print(f"Cleaning up: {proto_market}")
+                    print(f"{'='*60}")
+                    
+                    try:
+                        current_epoch = cleanup.get_current_epoch()
+                        keys_to_delete = cleanup.find_keys_to_delete(
+                            current_epoch,
+                            args.keep_epochs,
+                            dry_run=args.dry_run,
+                            keep_hours=args.keep_hours,
+                            aggressive_timeline=args.aggressive_timeline
+                        )
+                        deleted, failed = cleanup.delete_keys(keys_to_delete, dry_run=args.dry_run)
+                        total_deleted += deleted
+                        total_failed += failed
+                    except Exception as e:
+                        print(f"⚠ Error cleaning {proto_market}: {e}")
+                        total_failed += 1
+            
+            cleanup.print_stats()
+            print(f"\n✓ Cleanup complete: {total_deleted:,} deleted, {total_failed} failed")
+            return 0
+
+        # Single protocol:market cleanup (original behavior)
+        if not args.protocol or not args.market:
+            print("\n❌ Error: --protocol and --market are required (or use --all-markets)")
+            print("💡 Tip: Use --discover to see what protocol:market combinations exist")
+            return 1
+
         # Get current epoch
         try:
             current_epoch = cleanup.get_current_epoch()
@@ -422,7 +938,13 @@ def main():
             return 1
 
         # Find keys to delete
-        keys_to_delete = cleanup.find_keys_to_delete(current_epoch, args.keep_epochs)
+        keys_to_delete = cleanup.find_keys_to_delete(
+            current_epoch, 
+            args.keep_epochs, 
+            dry_run=args.dry_run,
+            keep_hours=args.keep_hours,
+            aggressive_timeline=args.aggressive_timeline
+        )
 
         # Delete keys
         deleted, failed = cleanup.delete_keys(keys_to_delete, dry_run=args.dry_run)
@@ -433,7 +955,7 @@ def main():
         if args.dry_run:
             print("\n💡 This was a dry run. Use without --dry-run to actually delete keys.")
         else:
-            print(f"\n✓ Cleanup complete: {deleted} deleted, {failed} failed")
+            print(f"\n✓ Cleanup complete: {deleted:,} deleted, {failed} failed")
 
         return 0
 
