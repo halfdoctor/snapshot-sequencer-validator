@@ -2,8 +2,16 @@
 """
 Redis Key Cleanup Script for DSV Node
 
-Cleans up old Redis keys from epochs older than (current_epoch - keep_epochs).
-Safely removes keys that are no longer needed.
+PURPOSE:
+Cleans up old Redis keys to prevent memory bloat. The script operates in two modes:
+1. Epoch-based cleanup: Requires protocol/market to determine current epoch, then removes keys older than (current_epoch - keep_epochs)
+2. Time-based cleanup: Uses --keep-hours to remove keys older than N hours (works without protocol/market for timelines/queues/streams)
+
+WHY PROTOCOL/MARKET IS NEEDED:
+- Epoch-based keys are namespaced: {protocol}:{market}:epoch:{epochId}:...
+- To know what's "old", we need to know the current epoch
+- Current epoch is stored in Redis keys that require protocol/market to access
+- Queue/stream/timeline cleanup can work without protocol/market (they're time-based, not epoch-based)
 
 Usage:
     python3 cleanup_old_redis_keys.py [--dry-run] [--keep-epochs 60] [--keep-hours HOURS] 
@@ -13,27 +21,24 @@ Usage:
                                       [--all-markets]
 
 Examples:
-    # Discovery mode: scan all keys and see what exists (no cleanup)
+    # Discovery mode: scan all keys and see what exists (no cleanup, no protocol/market needed)
     python3 cleanup_old_redis_keys.py --discover
 
-    # Dry run (see what would be deleted)
-    python3 cleanup_old_redis_keys.py --dry-run --protocol 0x1234... --market 0x5678...
+    # Clean queues/streams (no protocol/market needed - time-based cleanup)
+    python3 cleanup_old_redis_keys.py --cleanup-queues --queue-max-length 1000 --dry-run
+    python3 cleanup_old_redis_keys.py --cleanup-queues --queue-max-length 1000
 
-    # Actually delete old keys (keep last 60 epochs)
+    # Clean non-namespaced timelines (no protocol/market needed - time-based cleanup)
+    python3 cleanup_old_redis_keys.py --keep-hours 24 --dry-run
+    python3 cleanup_old_redis_keys.py --keep-hours 24
+
+    # Clean ALL markets automatically (discovers all protocol:market combinations, no protocol/market needed)
+    python3 cleanup_old_redis_keys.py --all-markets --keep-hours 24 --cleanup-queues --dry-run
+    python3 cleanup_old_redis_keys.py --all-markets --keep-hours 24 --cleanup-queues
+
+    # Clean specific protocol/market (epoch-based cleanup - requires protocol/market)
+    python3 cleanup_old_redis_keys.py --keep-epochs 60 --protocol 0x1234... --market 0x5678... --dry-run
     python3 cleanup_old_redis_keys.py --keep-epochs 60 --protocol 0x1234... --market 0x5678...
-
-    # Clean up streams and queues (for memory pressure)
-    python3 cleanup_old_redis_keys.py --cleanup-streams --cleanup-queues --dry-run
-
-    # Aggressive cleanup for memory pressure (keep only last 24 hours of timeline data)
-    python3 cleanup_old_redis_keys.py --keep-hours 24 --aggressive-timeline --protocol 0x1234... --market 0x5678...
-
-    # Very aggressive cleanup (keep only last 6 hours)
-    python3 cleanup_old_redis_keys.py --keep-hours 6 --aggressive-timeline --keep-epochs 30 --protocol 0x1234... --market 0x5678...
-
-    # Clean up ALL markets (after refactoring with multiple markets support)
-    python3 cleanup_old_redis_keys.py --all-markets --keep-epochs 60 --dry-run
-    python3 cleanup_old_redis_keys.py --all-markets --keep-hours 24 --cleanup-streams --cleanup-queues
 """
 
 import argparse
@@ -273,9 +278,12 @@ class RedisCleanup:
                             self.stats[f"{timeline_key} (timeline)"] = removed
                             print(f"  ✓ Removed {removed:,} entries from {timeline_key}")
                         
-                        # If aggressive mode, also clean by epoch ID extracted from entries
-                        if aggressive_timeline and removed > 0:
-                            self._cleanup_timeline_by_epoch(timeline_key, cutoff_epoch, dry_run)
+                        # Aggressive epoch-based cleanup is redundant after timestamp cleanup
+                        # Timestamp-based cleanup already removed old entries efficiently
+                        # Only use epoch-based cleanup if timestamp cleanup didn't work (very rare edge case)
+                        # if aggressive_timeline and removed == 0 and count_to_remove > 0:
+                        #     # Only if timestamp cleanup failed but entries exist
+                        #     self._cleanup_timeline_by_epoch(timeline_key, cutoff_epoch, dry_run)
             except Exception as e:
                 if "no such key" not in str(e).lower():
                     print(f"⚠ Error cleaning timeline {timeline_key}: {e}")
