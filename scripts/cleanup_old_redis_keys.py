@@ -223,60 +223,62 @@ class RedisCleanup:
         else:
             cutoff_timestamp = int(time.time()) - (keep_epochs * 60)  # Keep last N epochs (assuming ~1 epoch per minute)
         
+        # Always include non-namespaced timeline keys
+        timeline_keys = [
+            "metrics:epochs:timeline",
+            "metrics:batches:timeline",
+            "metrics:submissions:timeline",
+            "metrics:validations:timeline",
+        ]
+        
         if self.protocol and self.market:
-            timeline_keys = [
+            # Add namespaced timeline keys
+            timeline_keys.extend([
                 f"{self.protocol}:{self.market}:metrics:epochs:timeline",
                 f"{self.protocol}:{self.market}:metrics:batches:timeline",
                 f"{self.protocol}:{self.market}:metrics:submissions:timeline",
                 f"{self.protocol}:{self.market}:metrics:validations:timeline",
-            ]
-            
-            # Also check non-namespaced timeline keys
-            timeline_keys.extend([
-                "metrics:epochs:timeline",
-                "metrics:batches:timeline",
-                "metrics:submissions:timeline",
-                "metrics:validations:timeline",
             ])
-
-            for timeline_key in timeline_keys:
-                try:
-                    # Check if key exists first
-                    if not self.redis_client.exists(timeline_key):
-                        continue
-                    
-                    total_size = self.redis_client.zcard(timeline_key)
-                    if total_size == 0:
-                        continue
-                    
-                    # Count entries that would be removed
-                    count_to_remove = self.redis_client.zcount(timeline_key, "-inf", cutoff_timestamp)
-                    
-                    if count_to_remove > 0:
-                        if dry_run:
-                            self.stats[f"{timeline_key} (timeline)"] = count_to_remove
-                            print(f"  🔍 DRY RUN: Would remove {count_to_remove:,} entries from {timeline_key} (total: {total_size:,}, cutoff: {cutoff_timestamp})")
+        
+        # Process all timeline keys (both namespaced and non-namespaced)
+        for timeline_key in timeline_keys:
+            try:
+                # Check if key exists first
+                if not self.redis_client.exists(timeline_key):
+                    continue
+                
+                total_size = self.redis_client.zcard(timeline_key)
+                if total_size == 0:
+                    continue
+                
+                # Count entries that would be removed
+                count_to_remove = self.redis_client.zcount(timeline_key, "-inf", cutoff_timestamp)
+                
+                if count_to_remove > 0:
+                    if dry_run:
+                        self.stats[f"{timeline_key} (timeline)"] = count_to_remove
+                        print(f"  🔍 DRY RUN: Would remove {count_to_remove:,} entries from {timeline_key} (total: {total_size:,}, cutoff: {cutoff_timestamp})")
+                    else:
+                        # For very large deletions, use batch processing
+                        if count_to_remove > 100000:
+                            print(f"  ⚠ Large deletion detected ({count_to_remove:,} entries), using batch processing...")
+                            removed = self._cleanup_timeline_batched(timeline_key, cutoff_timestamp, cutoff_epoch if aggressive_timeline else None)
                         else:
-                            # For very large deletions, use batch processing
-                            if count_to_remove > 100000:
-                                print(f"  ⚠ Large deletion detected ({count_to_remove:,} entries), using batch processing...")
-                                removed = self._cleanup_timeline_batched(timeline_key, cutoff_timestamp, cutoff_epoch if aggressive_timeline else None)
-                            else:
-                                # Remove entries older than cutoff timestamp
-                                removed = self.redis_client.zremrangebyscore(
-                                    timeline_key, "-inf", cutoff_timestamp
-                                )
-                            
-                            if removed > 0:
-                                self.stats[f"{timeline_key} (timeline)"] = removed
-                                print(f"  ✓ Removed {removed:,} entries from {timeline_key}")
-                            
-                            # If aggressive mode, also clean by epoch ID extracted from entries
-                            if aggressive_timeline and removed > 0:
-                                self._cleanup_timeline_by_epoch(timeline_key, cutoff_epoch, dry_run)
-                except Exception as e:
-                    if "no such key" not in str(e).lower():
-                        print(f"⚠ Error cleaning timeline {timeline_key}: {e}")
+                            # Remove entries older than cutoff timestamp
+                            removed = self.redis_client.zremrangebyscore(
+                                timeline_key, "-inf", cutoff_timestamp
+                            )
+                        
+                        if removed > 0:
+                            self.stats[f"{timeline_key} (timeline)"] = removed
+                            print(f"  ✓ Removed {removed:,} entries from {timeline_key}")
+                        
+                        # If aggressive mode, also clean by epoch ID extracted from entries
+                        if aggressive_timeline and removed > 0:
+                            self._cleanup_timeline_by_epoch(timeline_key, cutoff_epoch, dry_run)
+            except Exception as e:
+                if "no such key" not in str(e).lower():
+                    print(f"⚠ Error cleaning timeline {timeline_key}: {e}")
         
         # Prune epochs:active SET to remove old epochs
         if self.protocol and self.market:
@@ -923,23 +925,32 @@ def main():
             return 0
 
         # Single protocol:market cleanup (original behavior)
-        if not args.protocol or not args.market:
-            print("\n❌ Error: --protocol and --market are required (or use --all-markets)")
+        # Allow timeline cleanup without protocol/market if using --keep-hours
+        if (not args.protocol or not args.market) and not args.keep_hours:
+            print("\n❌ Error: --protocol and --market are required (or use --all-markets or --keep-hours)")
             print("💡 Tip: Use --discover to see what protocol:market combinations exist")
+            print("💡 Tip: Use --keep-hours to clean non-namespaced timelines without protocol/market")
             return 1
 
-        # Get current epoch
-        try:
-            current_epoch = cleanup.get_current_epoch()
-            print(f"\n✓ Current epoch: {current_epoch}")
-        except ValueError as e:
-            print(f"\n❌ Error: {e}")
-            print("\nPlease specify --protocol and --market if auto-detection fails.")
-            return 1
+        # Get current epoch (only needed for epoch-based cleanup)
+        current_epoch = None
+        if args.protocol and args.market:
+            try:
+                current_epoch = cleanup.get_current_epoch()
+                print(f"\n✓ Current epoch: {current_epoch}")
+            except ValueError as e:
+                print(f"\n❌ Error: {e}")
+                print("\nPlease specify --protocol and --market if auto-detection fails.")
+                return 1
+        elif args.keep_hours:
+            # For timeline-only cleanup, we don't need current epoch
+            print(f"\n💡 Timeline-only cleanup mode (using --keep-hours)")
+            # Set a dummy epoch for the function call
+            current_epoch = 0
 
         # Find keys to delete
         keys_to_delete = cleanup.find_keys_to_delete(
-            current_epoch, 
+            current_epoch or 0, 
             args.keep_epochs, 
             dry_run=args.dry_run,
             keep_hours=args.keep_hours,

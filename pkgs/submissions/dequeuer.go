@@ -308,15 +308,7 @@ func (d *Dequeuer) ProcessSubmission(submission *SnapshotSubmission, submissionI
 	pipe.HIncrBy(context.Background(), fmt.Sprintf("metrics:hourly:%s:validations", hour), "total", 1)
 	pipe.Expire(context.Background(), fmt.Sprintf("metrics:hourly:%s:validations", hour), 2*time.Hour)
 
-	// 5. Add to submissions timeline
-	timestamp = time.Now().Unix()
-	// Note: We don't have access to namespaced keyBuilder here, so we use the non-namespaced timeline key
-	pipe.ZAdd(context.Background(), redislib.MetricsSubmissionsTimeline(), redis.Z{
-		Score:  float64(timestamp),
-		Member: fmt.Sprintf("validated:%s:%d", submissionID, timestamp),
-	})
-
-	// 6. Publish state change event
+	// 5. Publish state change event
 	pipe.Publish(context.Background(), "state:change", fmt.Sprintf("submission:validated:%s", submissionID))
 
 	// Execute pipeline (ignore errors - monitoring is non-critical)
