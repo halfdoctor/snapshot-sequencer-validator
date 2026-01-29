@@ -38,15 +38,12 @@ type WindowConfig struct {
 //   - Note: Validator vote commit/reveal is a separate workflow and doesn't affect this timing
 //
 // Case 2: Snapshot Commit/Reveal windows disabled (both zero)
-//   - Level 1 finalization triggers before P1 window closes to allow time for:
-//     a) Level 1 local finalization to complete
-//     b) Level 2 network-wide aggregation to complete
-//     c) Priority 1 validator to commit on-chain during P1 window
-//   - If P1 submission window < 25s: (PreSubmissionWindow + P1SubmissionWindow) - 2/3 of that window
-//   - If P1 submission window >= 25s: same total window minus 3/4 (more buffer for aggregation)
+//   - The returned duration is how long the window stays OPEN for snapshot submissions.
+//   - The remainder of (PreSubmissionWindow + P1SubmissionWindow) is for validator votes and on-chain commit.
+//   - If P1 submission window < 25s: keep 2/3 of the total open for submissions (wait = 2/3 * total).
+//   - If P1 submission window >= 25s: keep 3/4 open for submissions (wait = 3/4 * total).
 //
-// After Level 1 finalization completes, validators commit their finalizations on-chain during
-// their priority windows (P1, P2, P3, etc.) as defined in the contract.
+// After this submission period, Level 1 finalization runs; then validators commit on-chain during P1, P2, etc.
 func (wc *WindowConfig) LocalFinalizationWindow(fallbackDelay time.Duration) time.Duration {
 	// Check if snapshot commit/reveal windows are enabled (non-zero)
 	hasSnapshotCommitReveal := wc.SnapshotCommitWindow.Uint64() > 0 ||
@@ -59,12 +56,12 @@ func (wc *WindowConfig) LocalFinalizationWindow(fallbackDelay time.Duration) tim
 		totalSeconds.Add(wc.SnapshotCommitWindow, wc.SnapshotRevealWindow)
 		return time.Duration(totalSeconds.Uint64()) * time.Second
 	} else {
-		// Case 2: Snapshot Commit/Reveal disabled - trigger before P1 window closure
-		// P1 window = PreSubmissionWindow + P1SubmissionWindow
-		// Level 1 finalization must complete before P1 window opens for on-chain submission
-		// Use 2/3 if P1 submission window < 25s, else 3/4 (more time for aggregation in longer windows)
-		p1WindowSeconds := new(big.Int)
-		p1WindowSeconds.Add(wc.PreSubmissionWindow, wc.P1SubmissionWindow)
+		// Case 2: Snapshot Commit/Reveal disabled - fraction of total is submission period
+		// Total P1 window = PreSubmissionWindow + P1SubmissionWindow. We keep that fraction open for
+		// snapshot submissions; the remainder is for validator votes and on-chain commit.
+		// P1 < 25s: 2/3 open for submissions; P1 >= 25s: 3/4 open for submissions.
+		totalSeconds := new(big.Int)
+		totalSeconds.Add(wc.PreSubmissionWindow, wc.P1SubmissionWindow)
 
 		const p1WindowThresholdSec = 25
 		var num, denom int64
@@ -73,10 +70,9 @@ func (wc *WindowConfig) LocalFinalizationWindow(fallbackDelay time.Duration) tim
 		} else {
 			num, denom = 3, 4
 		}
-		bufferSeconds := new(big.Int).Mul(p1WindowSeconds, big.NewInt(num))
-		bufferSeconds.Div(bufferSeconds, big.NewInt(denom))
-		p1WindowSeconds.Sub(p1WindowSeconds, bufferSeconds)
-		return time.Duration(p1WindowSeconds.Uint64()) * time.Second
+		submissionPeriodSeconds := new(big.Int).Mul(totalSeconds, big.NewInt(num))
+		submissionPeriodSeconds.Div(submissionPeriodSeconds, big.NewInt(denom))
+		return time.Duration(submissionPeriodSeconds.Uint64()) * time.Second
 	}
 }
 
@@ -85,7 +81,7 @@ func (wc *WindowConfig) LocalFinalizationWindow(fallbackDelay time.Duration) tim
 // Formula: preSubmissionWindow + p1SubmissionWindow + (pNSubmissionWindow * maxPriority)
 //
 // Note: This is NOT used for triggering Level 1 finalization. Level 1 finalization triggers
-// when LocalFinalizationWindow() expires (at P1 window closure).
+// when LocalFinalizationWindow() expires (end of submission period; remainder is for votes and commit).
 func (wc *WindowConfig) TotalSubmissionPeriod(maxPriority int) time.Duration {
 	if maxPriority < 1 {
 		maxPriority = 1
@@ -179,6 +175,15 @@ func (f *WindowConfigFetcher) FetchWindowConfig(ctx context.Context, dataMarketA
 	}).Info("✅ Fetched window config from contract")
 
 	return config, nil
+}
+
+// InvalidateCache removes cached window config for a data market so the next fetch will read from contract.
+// Call this when SubmissionWindowConfigUpdated is received for that data market.
+func (f *WindowConfigFetcher) InvalidateCache(dataMarketAddr string) {
+	f.cacheMutex.Lock()
+	defer f.cacheMutex.Unlock()
+	delete(f.cache, dataMarketAddr)
+	log.WithField("data_market", dataMarketAddr).Info("Invalidated window config cache (SubmissionWindowConfigUpdated)")
 }
 
 // fetchFromContract calls getDataMarketSubmissionWindowConfig on ProtocolState contract

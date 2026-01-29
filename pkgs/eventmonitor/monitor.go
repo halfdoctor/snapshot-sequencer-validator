@@ -21,7 +21,7 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
-// EventMonitor watches for EpochReleased and PrioritiesAssigned events and manages submission windows
+// EventMonitor watches for EpochReleased, PrioritiesAssigned, and SubmissionWindowConfigUpdated events and manages submission windows
 type EventMonitor struct {
 	rpcHelper    *rpchelper.RPCHelper
 	redisClient  *redis.Client
@@ -47,6 +47,10 @@ type EventMonitor struct {
 	vpaEventChan          chan *PrioritiesAssignedEvent
 	prioritiesAssignedSig common.Hash // Cache VPA event signature
 	lastProcessedVPABlock uint64      // Separate block tracking for VPA contract
+
+	// SubmissionWindowConfigUpdated (DataMarket): invalidate window config cache
+	submissionWindowConfigUpdatedSig common.Hash // DataMarket event: config updated
+	lastProcessedWindowConfigBlock   uint64      // Block tracking for DataMarket config events
 
 	// Configuration
 	pollInterval         time.Duration
@@ -329,6 +333,14 @@ func NewEventMonitor(cfg *Config) (*EventMonitor, error) {
 		log.Info("Window config fetcher disabled - PROTOCOL_STATE_CONTRACT not configured, using fallback duration")
 	}
 
+	// SubmissionWindowConfigUpdated is emitted by DataMarket contracts (not ProtocolState).
+	// Event signature: SubmissionWindowConfigUpdated(uint256,uint256,uint256,uint256,uint256,uint256,uint256)
+	submissionWindowConfigUpdatedSig := common.Hash{}
+	if windowConfigFetcher != nil {
+		submissionWindowConfigUpdatedSig = crypto.Keccak256Hash([]byte("SubmissionWindowConfigUpdated(uint256,uint256,uint256,uint256,uint256,uint256,uint256)"))
+		log.Infof("✅ Will listen for SubmissionWindowConfigUpdated on data markets to invalidate window config cache")
+	}
+
 	return &EventMonitor{
 		rpcHelper:    cfg.RPCHelper,
 		redisClient:  cfg.RedisClient,
@@ -342,6 +354,9 @@ func NewEventMonitor(cfg *Config) (*EventMonitor, error) {
 		vpaEnabled:            vpaEnabled,
 		prioritiesAssignedSig: prioritiesAssignedSig,
 		lastProcessedVPABlock: startBlock, // Start from same block as main monitoring
+
+		submissionWindowConfigUpdatedSig: submissionWindowConfigUpdatedSig,
+		lastProcessedWindowConfigBlock:   startBlock,
 
 		// Window management
 		windowManager:       windowManager,
@@ -424,6 +439,11 @@ func (m *EventMonitor) checkForNewEvents() {
 	if m.vpaEnabled {
 		m.checkForPrioritiesAssignedEvents(currentBlock)
 	}
+
+	// Check for SubmissionWindowConfigUpdated on data markets (invalidate window config cache)
+	if m.windowConfigFetcher != nil && len(m.dataMarkets) > 0 {
+		m.checkForSubmissionWindowConfigUpdatedEvents(currentBlock)
+	}
 }
 
 // checkForEpochReleasedEvents queries for new EpochReleased events from protocol state contract
@@ -504,6 +524,49 @@ func (m *EventMonitor) checkForPrioritiesAssignedEvents(currentBlock uint64) {
 	}
 
 	m.lastProcessedVPABlock = toBlock
+}
+
+// checkForSubmissionWindowConfigUpdatedEvents queries DataMarket contracts for SubmissionWindowConfigUpdated
+// and invalidates the window config cache so the next EpochReleased uses fresh config.
+func (m *EventMonitor) checkForSubmissionWindowConfigUpdatedEvents(currentBlock uint64) {
+	if m.windowConfigFetcher == nil || len(m.dataMarkets) == 0 || m.submissionWindowConfigUpdatedSig == (common.Hash{}) {
+		return
+	}
+	if m.lastProcessedWindowConfigBlock >= currentBlock {
+		return
+	}
+
+	toBlock := m.lastProcessedWindowConfigBlock + 1000
+	if toBlock > currentBlock {
+		toBlock = currentBlock
+	}
+
+	addresses := make([]common.Address, 0, len(m.dataMarkets))
+	for _, addr := range m.dataMarkets {
+		addresses = append(addresses, common.HexToAddress(addr))
+	}
+
+	query := ethereum.FilterQuery{
+		FromBlock: big.NewInt(int64(m.lastProcessedWindowConfigBlock + 1)),
+		ToBlock:   big.NewInt(int64(toBlock)),
+		Addresses: addresses,
+		Topics:    [][]common.Hash{{m.submissionWindowConfigUpdatedSig}},
+	}
+
+	logs, err := m.rpcHelper.FilterLogs(m.ctx, query)
+	if err != nil {
+		log.Errorf("Failed to filter SubmissionWindowConfigUpdated logs: %v", err)
+		return
+	}
+
+	for _, vLog := range logs {
+		dataMarketAddr := vLog.Address.Hex()
+		if m.isValidDataMarket(dataMarketAddr) {
+			m.windowConfigFetcher.InvalidateCache(dataMarketAddr)
+		}
+	}
+
+	m.lastProcessedWindowConfigBlock = toBlock
 }
 
 // parseEpochReleasedEvent parses the log into an EpochReleasedEvent
@@ -737,11 +800,11 @@ func (m *EventMonitor) handleEpochReleased(event *EpochReleasedEvent) {
 				logFields["snapshot_reveal_window"] = config.SnapshotRevealWindow.Uint64()
 				log.WithFields(logFields).Info("✅ Using on-chain window config: Level 1 finalization triggers when snapshot reveal closes")
 			} else {
-				frac := "2/3rds"
+				frac := "2/3"
 				if config.P1SubmissionWindow.Uint64() >= 25 {
-					frac = "3/4ths"
+					frac = "3/4"
 				}
-				log.WithFields(logFields).Infof("✅ Using on-chain window config: Level 1 finalization triggers %s before P1 window closure", frac)
+				log.WithFields(logFields).Infof("✅ Using on-chain window config: %s of P1 window open for snapshot submissions, remainder for validator votes and on-chain commit", frac)
 			}
 		}
 	} else {
@@ -948,7 +1011,7 @@ func (m *EventMonitor) handleEpochReleased(event *EpochReleasedEvent) {
 	// Window closes when Level 1 finalization should begin
 	// Duration varies by contract configuration:
 	//   - New contracts with snapshot commit/reveal enabled: snapshotCommitWindow + snapshotRevealWindow (snapshot reveal closes)
-	//   - New contracts without snapshot commit/reveal: (PreSubmissionWindow + P1SubmissionWindow) - 2/3 or 3/4 of that window (3/4 if P1 window >= 25s)
+	//   - New contracts without snapshot commit/reveal: 2/3 or 3/4 of (PreSubmissionWindow + P1SubmissionWindow) open for submissions (3/4 if P1 >= 25s); remainder for votes and commit
 	// When window closes, triggerFinalization() is called to begin Level 1 local finalization
 	// Note: Validator vote commit/reveal is a separate workflow and doesn't affect this timing
 	if err := m.windowManager.StartSubmissionWindow(
@@ -978,11 +1041,11 @@ func (m *EventMonitor) handleEpochReleased(event *EpochReleasedEvent) {
 		if hasSnapshotCommitReveal {
 			log.Infof("📋 Level 1 finalization will trigger when snapshot reveal window closes (in %v)", windowDuration)
 		} else {
-			frac := "2/3rds"
+			frac := "2/3"
 			if windowConfig.P1SubmissionWindow.Uint64() >= 25 {
-				frac = "3/4ths"
+				frac = "3/4"
 			}
-			log.Infof("📋 Level 1 finalization will trigger %s before P1 window closure (in %v)", frac, windowDuration)
+			log.Infof("📋 %s of P1 window open for snapshot submissions (in %v); then finalization and on-chain commit", frac, windowDuration)
 		}
 	}
 }
