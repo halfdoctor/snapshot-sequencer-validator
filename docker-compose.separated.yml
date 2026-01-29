@@ -415,6 +415,8 @@ services:
       # RabbitMQ Configuration
       - RABBITMQ_HOST=rabbitmq
       - RABBITMQ_PORT=5672
+      # HTTP server (health + API); default 8080
+      - RELAYER_PORT=${RELAYER_PORT:-8080}
     depends_on:
       redis:
         condition: service_healthy
@@ -426,13 +428,13 @@ services:
     profiles:
       - vpa
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      test: ["CMD-SHELL", "curl -f http://localhost:${RELAYER_PORT:-8080}/health"]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 40s
     ports:
-      - "8080:8080"
+      - "${RELAYER_PORT:-8080}:${RELAYER_PORT:-8080}"
 
   # Monitor API - REST API for pipeline monitoring
   monitor-api:
