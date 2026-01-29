@@ -42,8 +42,8 @@ type WindowConfig struct {
 //     a) Level 1 local finalization to complete
 //     b) Level 2 network-wide aggregation to complete
 //     c) Priority 1 validator to commit on-chain during P1 window
-//   - Formula: (PreSubmissionWindow + P1SubmissionWindow) - 10 seconds
-//   - The 10-second buffer ensures finalization completes before P1 window opens
+//   - If P1 submission window < 25s: (PreSubmissionWindow + P1SubmissionWindow) - 2/3 of that window
+//   - If P1 submission window >= 25s: same total window minus 3/4 (more buffer for aggregation)
 //
 // After Level 1 finalization completes, validators commit their finalizations on-chain during
 // their priority windows (P1, P2, P3, etc.) as defined in the contract.
@@ -59,15 +59,22 @@ func (wc *WindowConfig) LocalFinalizationWindow(fallbackDelay time.Duration) tim
 		totalSeconds.Add(wc.SnapshotCommitWindow, wc.SnapshotRevealWindow)
 		return time.Duration(totalSeconds.Uint64()) * time.Second
 	} else {
-		// Case 2: Snapshot Commit/Reveal disabled - trigger 2/3rds before P1 window closure
+		// Case 2: Snapshot Commit/Reveal disabled - trigger before P1 window closure
 		// P1 window = PreSubmissionWindow + P1SubmissionWindow
 		// Level 1 finalization must complete before P1 window opens for on-chain submission
+		// Use 2/3 if P1 submission window < 25s, else 3/4 (more time for aggregation in longer windows)
 		p1WindowSeconds := new(big.Int)
 		p1WindowSeconds.Add(wc.PreSubmissionWindow, wc.P1SubmissionWindow)
 
-		// Subtract 2/3 of the P1 window to allow for Level 1 finalization and Level 2 aggregation
-		bufferSeconds := new(big.Int).Mul(p1WindowSeconds, big.NewInt(2))
-		bufferSeconds.Div(bufferSeconds, big.NewInt(3))
+		const p1WindowThresholdSec = 25
+		var num, denom int64
+		if wc.P1SubmissionWindow.Uint64() < p1WindowThresholdSec {
+			num, denom = 2, 3
+		} else {
+			num, denom = 3, 4
+		}
+		bufferSeconds := new(big.Int).Mul(p1WindowSeconds, big.NewInt(num))
+		bufferSeconds.Div(bufferSeconds, big.NewInt(denom))
 		p1WindowSeconds.Sub(p1WindowSeconds, bufferSeconds)
 		return time.Duration(p1WindowSeconds.Uint64()) * time.Second
 	}

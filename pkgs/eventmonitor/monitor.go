@@ -695,6 +695,9 @@ func (m *EventMonitor) handleEpochReleased(event *EpochReleasedEvent) {
 	var windowConfig *WindowConfig
 	var useFallback bool
 
+	// TODO: Dynamic update of submission window config. Fallback (windowDuration) is set once at
+	// startup from env; contract config is fetched per-epoch with cache TTL. Neither supports
+	// hot reload (e.g. env change or contract config update) without restart.
 	// Always try to fetch window config from contract
 	if m.windowConfigFetcher != nil {
 		log.WithFields(log.Fields{
@@ -734,7 +737,11 @@ func (m *EventMonitor) handleEpochReleased(event *EpochReleasedEvent) {
 				logFields["snapshot_reveal_window"] = config.SnapshotRevealWindow.Uint64()
 				log.WithFields(logFields).Info("✅ Using on-chain window config: Level 1 finalization triggers when snapshot reveal closes")
 			} else {
-				log.WithFields(logFields).Info("✅ Using on-chain window config: Level 1 finalization triggers 2/3rds before P1 window closure")
+				frac := "2/3rds"
+				if config.P1SubmissionWindow.Uint64() >= 25 {
+					frac = "3/4ths"
+				}
+				log.WithFields(logFields).Infof("✅ Using on-chain window config: Level 1 finalization triggers %s before P1 window closure", frac)
 			}
 		}
 	} else {
@@ -941,7 +948,7 @@ func (m *EventMonitor) handleEpochReleased(event *EpochReleasedEvent) {
 	// Window closes when Level 1 finalization should begin
 	// Duration varies by contract configuration:
 	//   - New contracts with snapshot commit/reveal enabled: snapshotCommitWindow + snapshotRevealWindow (snapshot reveal closes)
-	//   - New contracts without snapshot commit/reveal: (PreSubmissionWindow + P1SubmissionWindow) - 2/3 of the P1 window
+	//   - New contracts without snapshot commit/reveal: (PreSubmissionWindow + P1SubmissionWindow) - 2/3 or 3/4 of that window (3/4 if P1 window >= 25s)
 	// When window closes, triggerFinalization() is called to begin Level 1 local finalization
 	// Note: Validator vote commit/reveal is a separate workflow and doesn't affect this timing
 	if err := m.windowManager.StartSubmissionWindow(
@@ -971,7 +978,11 @@ func (m *EventMonitor) handleEpochReleased(event *EpochReleasedEvent) {
 		if hasSnapshotCommitReveal {
 			log.Infof("📋 Level 1 finalization will trigger when snapshot reveal window closes (in %v)", windowDuration)
 		} else {
-			log.Infof("📋 Level 1 finalization will trigger 2/3rds before P1 window closure (in %v)", windowDuration)
+			frac := "2/3rds"
+			if windowConfig.P1SubmissionWindow.Uint64() >= 25 {
+				frac = "3/4ths"
+			}
+			log.Infof("📋 Level 1 finalization will trigger %s before P1 window closure (in %v)", frac, windowDuration)
 		}
 	}
 }
