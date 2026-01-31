@@ -5,11 +5,16 @@ import (
 	"encoding/json"
 	"fmt"
 	"math/big"
+	"time"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/powerloom/snapshot-sequencer-validator/pkgs/protocolstate"
 	"github.com/redis/go-redis/v9"
 	log "github.com/sirupsen/logrus"
 )
+
+// Type alias for cleaner API
+type SlotManager = protocolstate.SlotManager
 
 // SlotInfo represents the cached slot information from protocol-state-cacher
 // This structure matches the data stored by protocol-state-cacher in Redis
@@ -28,18 +33,21 @@ type SlotInfo struct {
 
 // SlotValidator validates snapshotter addresses against cached slot info from smart contracts
 type SlotValidator struct {
-	redisClient            *redis.Client
-	protocolStateAddr      common.Address
-	snapshotterStateAddr   common.Address
+	redisClient          *redis.Client
+	protocolStateAddr    common.Address
+	snapshotterStateAddr common.Address
+	slotManager          *SlotManager // Optional: for on-demand slot fetching
 }
 
 // NewSlotValidator creates a new slot validator
 // protocolStateAddr and snapshotterStateAddr are used for namespaced Redis keys
-func NewSlotValidator(redisClient *redis.Client, protocolStateAddr, snapshotterStateAddr common.Address) *SlotValidator {
+// slotManager is optional - if provided, enables on-demand slot fetching when cache misses occur
+func NewSlotValidator(redisClient *redis.Client, protocolStateAddr, snapshotterStateAddr common.Address, slotManager *SlotManager) *SlotValidator {
 	return &SlotValidator{
 		redisClient:          redisClient,
 		protocolStateAddr:    protocolStateAddr,
 		snapshotterStateAddr: snapshotterStateAddr,
+		slotManager:          slotManager,
 	}
 }
 
@@ -51,6 +59,8 @@ func NewSlotValidator(redisClient *redis.Client, protocolStateAddr, snapshotterS
 // 2. The signer is the authorized snapshotter for this slot
 //
 // Redis key format (namespaced): {protocolState}:{snapshotterState}:SlotInfo.{slotID}
+//
+// If SlotManager is available, automatically fetches missing slots from contract on cache miss
 func (sv *SlotValidator) ValidateSnapshotterForSlot(slotID uint64, signerAddr common.Address) error {
 	ctx := context.Background()
 
@@ -58,6 +68,25 @@ func (sv *SlotValidator) ValidateSnapshotterForSlot(slotID uint64, signerAddr co
 	// Use namespaced key format: {protocolState}:{snapshotterState}:SlotInfo.{slotID}
 	slotKey := fmt.Sprintf("%s:%s:SlotInfo.%d", sv.protocolStateAddr.Hex(), sv.snapshotterStateAddr.Hex(), slotID)
 	slotData, err := sv.redisClient.Get(ctx, slotKey).Result()
+	
+	// On cache miss, try on-demand fetch if SlotManager is available
+	if err == redis.Nil && sv.slotManager != nil {
+		log.Infof("Slot %d not in cache - attempting on-demand fetch from contract", slotID)
+		
+		// Create context with timeout for contract call
+		fetchCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		defer cancel()
+		
+		if fetchErr := sv.slotManager.FetchSlot(fetchCtx, slotID); fetchErr != nil {
+			return fmt.Errorf("slot %d not found in cache and on-demand fetch failed: %w", slotID, fetchErr)
+		}
+		
+		log.Infof("✅ Successfully fetched slot %d on-demand", slotID)
+		
+		// Retry cache read after successful fetch
+		slotData, err = sv.redisClient.Get(ctx, slotKey).Result()
+	}
+	
 	if err == redis.Nil {
 		return fmt.Errorf("slot %d not found in protocol state cache - may not be registered", slotID)
 	} else if err != nil {

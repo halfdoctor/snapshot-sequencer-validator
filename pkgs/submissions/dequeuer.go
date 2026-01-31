@@ -49,7 +49,8 @@ type DequeuerStats struct {
 
 // NewDequeuer creates a new submission dequeuer
 // snapshotterStateAddr must be provided if enableSlotValidation is true
-func NewDequeuer(redisClient *redis.Client, keyBuilder *redislib.KeyBuilder, sequencerID string, chainID int64, protocolStateContract string, snapshotterStateAddr common.Address, enableSlotValidation bool, spamComponents *spam.SpamComponents) (*Dequeuer, error) {
+// slotManager is optional - if provided, enables on-demand slot fetching during validation
+func NewDequeuer(redisClient *redis.Client, keyBuilder *redislib.KeyBuilder, sequencerID string, chainID int64, protocolStateContract string, snapshotterStateAddr common.Address, enableSlotValidation bool, spamComponents *spam.SpamComponents, slotManager *SlotManager) (*Dequeuer, error) {
 	if enableSlotValidation && snapshotterStateAddr == (common.Address{}) {
 		return nil, fmt.Errorf("snapshotterStateAddr is required when slot validation is enabled")
 	}
@@ -59,7 +60,7 @@ func NewDequeuer(redisClient *redis.Client, keyBuilder *redislib.KeyBuilder, seq
 	}
 
 	protocolStateAddr := common.HexToAddress(protocolStateContract)
-	slotValidator := NewSlotValidator(redisClient, protocolStateAddr, snapshotterStateAddr)
+	slotValidator := NewSlotValidator(redisClient, protocolStateAddr, snapshotterStateAddr, slotManager)
 
 	d := &Dequeuer{
 		redisClient:           redisClient,

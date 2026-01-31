@@ -125,6 +125,7 @@ type UnifiedSequencer struct {
 	batchGen     *consensus.DummyBatchGenerator
 	eventMonitor *eventmonitor.EventMonitor
 	p2pConsensus *consensus.P2PConsensus // P2P consensus handler
+	cacher       *protocolstate.Cacher   // Protocol state cacher for accessing SlotManager
 
 	// Configuration
 	config           *config.Settings
@@ -588,6 +589,9 @@ func main() {
 			log.Fatalf("Failed to create protocol state cacher: %v", err)
 		}
 
+		// Store cacher reference for accessing SlotManager
+		sequencer.cacher = cacher
+
 		// Perform initial cold sync synchronously
 		log.Info("🔄 Starting protocol state cacher cold sync...")
 		if err := cacher.WaitForColdSync(context.Background()); err != nil {
@@ -621,7 +625,14 @@ func main() {
 
 	// Initialize components based on flags
 	if enableDequeuer && redisClient != nil {
-		dequeuer, err := submissions.NewDequeuer(redisClient, keyBuilder, sequencerID, cfg.ChainID, cfg.ProtocolStateContract, snapshotterStateAddr, cfg.EnableSlotValidation, spamComponents)
+		// Get SlotManager from cacher if available (for on-demand slot fetching)
+		var slotManager *protocolstate.SlotManager
+		if sequencer.cacher != nil {
+			slotManager = sequencer.cacher.GetSlotManager()
+			log.Debug("SlotManager available for on-demand slot fetching")
+		}
+
+		dequeuer, err := submissions.NewDequeuer(redisClient, keyBuilder, sequencerID, cfg.ChainID, cfg.ProtocolStateContract, snapshotterStateAddr, cfg.EnableSlotValidation, spamComponents, slotManager)
 		if err != nil {
 			log.Fatalf("Failed to create dequeuer: %v", err)
 		}

@@ -308,3 +308,10 @@ func (c *Cacher) getTotalNodeCount(ctx context.Context) (uint64, error) {
 
 	return nodeCount.Uint64(), nil
 }
+
+// GetSlotManager returns the SlotManager for on-demand slot fetching
+// This allows other components (e.g., Dequeuer) to access the SlotManager
+// for fetching missing slots from the contract when Redis cache misses occur
+func (c *Cacher) GetSlotManager() *SlotManager {
+	return c.slotManager
+}
