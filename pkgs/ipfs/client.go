@@ -238,20 +238,27 @@ func (c *Client) pinCID(ctx context.Context, cidStr string) error {
 	// Remove /ipfs/ prefix if present
 	cidStr = strings.TrimPrefix(cidStr, "/ipfs/")
 
-	// Build pin endpoint URL
+	// Build pin endpoint URL with query parameters
+	// Some IPFS implementations expect "ipfs-path" parameter instead of "arg"
 	pinEndpoint := strings.TrimSuffix(c.apiURL, "/") + "/api/v0/pin/add"
+	
+	// Build URL with query parameters
+	u, err := url.Parse(pinEndpoint)
+	if err != nil {
+		return fmt.Errorf("failed to parse pin endpoint URL: %w", err)
+	}
+	
+	q := u.Query()
+	// Try both parameter names for compatibility with different IPFS implementations
+	q.Set("arg", cidStr)
+	q.Set("ipfs-path", cidStr)
+	q.Set("recursive", "false")
+	u.RawQuery = q.Encode()
 
-	// Create form data
-	formData := url.Values{}
-	formData.Set("arg", cidStr)
-	formData.Set("recursive", "false")
-
-	req, err := http.NewRequestWithContext(ctx, "POST", pinEndpoint, strings.NewReader(formData.Encode()))
+	req, err := http.NewRequestWithContext(ctx, "POST", u.String(), nil)
 	if err != nil {
 		return fmt.Errorf("failed to create pin request: %w", err)
 	}
-
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
