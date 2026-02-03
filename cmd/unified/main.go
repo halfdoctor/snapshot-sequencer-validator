@@ -796,6 +796,15 @@ func (s *UnifiedSequencer) Start() {
 		}()
 	}
 
+	// Start monitoring timeline cleanup (removes old entries from simulation/heartbeat timelines)
+	if s.redisClient != nil && s.keyBuilder != nil {
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+			s.cleanupMonitoringTimelines()
+		}()
+	}
+
 	log.Infof("[%s] ✅ All enabled components started successfully", componentPrefix)
 }
 
@@ -1204,6 +1213,23 @@ func (s *UnifiedSequencer) runDequeuerWorker(workerID int) {
 				log.Debugf("Worker %d: Processing P2P batch with %d submissions for epoch %d",
 					workerID, len(p2pSubmission.Submissions), p2pSubmission.EpochID)
 
+				// Detect heartbeat BEFORE data market validation
+				// Heartbeats are epoch 0 messages with empty CID (not EIP-712 signed, peer ID only)
+				if p2pSubmission.EpochID == 0 {
+					isHeartbeat := false
+					if len(p2pSubmission.Submissions) == 0 {
+						isHeartbeat = true
+					} else if len(p2pSubmission.Submissions) == 1 && p2pSubmission.Submissions[0].Request.SnapshotCid == "" {
+						isHeartbeat = true
+					}
+
+					if isHeartbeat {
+						s.cacheHeartbeat(peerID)
+						log.Debugf("Worker %d: Cached heartbeat from peer %s (epoch=0, batch)", workerID, peerID[:min(16, len(peerID))])
+						continue // Skip further processing of this heartbeat
+					}
+				}
+
 				// Process each submission in the batch
 				for _, submission := range p2pSubmission.Submissions {
 					// Validate data market address - reject if not configured
@@ -1249,6 +1275,12 @@ func (s *UnifiedSequencer) runDequeuerWorker(workerID int) {
 					log.Warnf("Worker %d: Failed to unmarshal as P2P batch submission: %v", workerID, unmarshalErr)
 					log.Debugf("Worker %d: Raw submission data (first 500 bytes): %s", workerID, string(submissionData[:min(500, len(submissionData))]))
 				} else if p2pSubmission.Submissions == nil {
+					// Check if this is a heartbeat (epoch 0 with nil submissions = discovery heartbeat)
+					if p2pSubmission.EpochID == 0 {
+						s.cacheHeartbeat(peerID)
+						log.Debugf("Worker %d: Cached heartbeat from peer %s (epoch=0, nil submissions)", workerID, peerID[:min(16, len(peerID))])
+						continue // Skip further processing
+					}
 					log.Debugf("Worker %d: P2P batch submission has nil Submissions array, trying single submission format", workerID)
 				}
 
@@ -1302,6 +1334,91 @@ func (s *UnifiedSequencer) runDequeuerWorker(workerID int) {
 				}
 			}
 		}
+	}
+}
+
+// cacheHeartbeat stores heartbeat messages (epoch 0 with empty CID) in Redis for monitoring.
+// Heartbeats are P2P mesh maintenance messages from local-collector - NOT EIP-712 signed.
+// Only peer ID is available (no snapshotter address). To correlate peer ID with snapshotter,
+// use simulation or submission data from other endpoints.
+func (s *UnifiedSequencer) cacheHeartbeat(peerID string) {
+	if s.redisClient == nil || s.keyBuilder == nil {
+		return // Redis not available
+	}
+
+	timestamp := time.Now().Unix()
+	entityID := fmt.Sprintf("hb:%s:%d", peerID, timestamp)
+
+	pipe := s.redisClient.Pipeline()
+
+	// Add to heartbeats timeline (ZSET sorted by timestamp)
+	pipe.ZAdd(s.ctx, s.keyBuilder.HeartbeatsTimeline(), redis.Z{
+		Score:  float64(timestamp),
+		Member: entityID,
+	})
+
+	// Add to peer index with 24h TTL (ZSET to track heartbeat frequency per peer)
+	peerKey := s.keyBuilder.HeartbeatsByPeer(peerID)
+	pipe.ZAdd(s.ctx, peerKey, redis.Z{
+		Score:  float64(timestamp),
+		Member: entityID,
+	})
+	pipe.Expire(s.ctx, peerKey, 24*time.Hour)
+
+	// Execute pipeline (ignore errors - heartbeat caching is non-critical)
+	pipe.Exec(s.ctx)
+}
+
+// cleanupMonitoringTimelines periodically removes old entries from simulation and heartbeat timelines.
+// This prevents unbounded growth of ZSET keys that don't have TTLs.
+// Retention periods: simulations=7 days (matches metadata TTL), heartbeats=24 hours (matches per-peer TTL)
+func (s *UnifiedSequencer) cleanupMonitoringTimelines() {
+	if s.redisClient == nil || s.keyBuilder == nil {
+		return
+	}
+
+	// Run initial cleanup immediately at startup
+	log.Info("Running initial monitoring timeline cleanup...")
+	s.doTimelineCleanup()
+
+	ticker := time.NewTicker(1 * time.Hour) // Run cleanup every hour
+	defer ticker.Stop()
+
+	log.Info("Started monitoring timeline cleanup goroutine (hourly)")
+
+	for {
+		select {
+		case <-s.ctx.Done():
+			log.Info("Stopping monitoring timeline cleanup")
+			return
+		case <-ticker.C:
+			s.doTimelineCleanup()
+		}
+	}
+}
+
+// doTimelineCleanup removes entries older than retention period from monitoring timelines
+func (s *UnifiedSequencer) doTimelineCleanup() {
+	ctx := context.Background()
+
+	// Simulation timeline: keep 7 days (matches metadata TTL)
+	simulationCutoff := time.Now().Add(-7 * 24 * time.Hour).Unix()
+	simRemoved, err := s.redisClient.ZRemRangeByScore(ctx, s.keyBuilder.SimulationsTimeline(),
+		"-inf", fmt.Sprintf("%d", simulationCutoff)).Result()
+	if err != nil {
+		log.Warnf("Failed to cleanup simulations timeline: %v", err)
+	} else if simRemoved > 0 {
+		log.Infof("Cleaned up %d old entries from simulations timeline (older than 7 days)", simRemoved)
+	}
+
+	// Heartbeat timeline: keep 24 hours (matches per-peer TTL)
+	heartbeatCutoff := time.Now().Add(-24 * time.Hour).Unix()
+	hbRemoved, err := s.redisClient.ZRemRangeByScore(ctx, s.keyBuilder.HeartbeatsTimeline(),
+		"-inf", fmt.Sprintf("%d", heartbeatCutoff)).Result()
+	if err != nil {
+		log.Warnf("Failed to cleanup heartbeats timeline: %v", err)
+	} else if hbRemoved > 0 {
+		log.Infof("Cleaned up %d old entries from heartbeats timeline (older than 24 hours)", hbRemoved)
 	}
 }
 

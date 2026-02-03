@@ -49,6 +49,57 @@ http://localhost:9091/swagger/index.html
 | `/api/v1/stats/daily` | Daily aggregated statistics | protocol, market |
 | `/api/v1/stats/hourly` | Hourly performance metrics | protocol, market |
 
+### Simulation and Heartbeat Tracking
+
+The monitoring system tracks simulation messages and heartbeat messages from snapshotters and local-collectors.
+
+**Key Distinction:**
+- **Simulation Messages**: Epoch 0 with real CID, EIP-712 signed - sent by snapshotters at startup to verify connectivity
+- **Heartbeat Messages**: Epoch 0 with empty CID, NOT EIP-712 signed - sent by local-collectors for P2P mesh maintenance
+
+#### Simulation Endpoints
+| Endpoint | Purpose |
+|----------|---------|
+| `/api/v1/simulations/recent` | Recent simulation messages (has snapshotter address from EIP-712 signature) |
+| `/api/v1/simulations/peer/:peerID` | Simulations from a specific peer |
+| `/api/v1/simulations/snapshotter/:address` | Simulations from a specific snapshotter address |
+
+#### Heartbeat Endpoints
+| Endpoint | Purpose |
+|----------|---------|
+| `/api/v1/heartbeats/recent` | Recent heartbeat messages (peer ID only, no snapshotter address) |
+| `/api/v1/heartbeats/peer/:peerID` | Heartbeats from a specific peer |
+
+**Important Note:** Heartbeat messages are NOT EIP-712 signed, so only peer ID is available. To correlate peer ID with snapshotter address, use simulation or submission data.
+
+#### Correlating Peer IDs with Snapshotter Addresses
+
+Since heartbeats don't contain EIP-712 signatures, use this workflow to correlate peer IDs:
+
+```bash
+# Step 1: Get simulations to find peer ID -> snapshotter address mapping
+curl "http://localhost:9091/api/v1/simulations/recent" | jq '.simulations[] | {peer_id, snapshotter_address}'
+
+# Alternative: Find peer ID from epoch submissions (also EIP-712 signed)
+curl "http://localhost:9091/api/v1/epochs/12345/submissions" | jq '.submissions[] | {peer_id, snapshotter}'
+
+# Step 2: Query heartbeats for the discovered peer ID
+curl "http://localhost:9091/api/v1/heartbeats/peer/12D3KooWxyz..."
+```
+
+**Example Monitoring Workflow:**
+
+```bash
+# Check if a peer is actively sending heartbeats
+curl "http://localhost:9091/api/v1/heartbeats/peer/12D3KooWExample" | jq '.count, .heartbeats[0:3]'
+
+# Find all peers that have sent simulations (and their snapshotter addresses)
+curl "http://localhost:9091/api/v1/simulations/recent?minutes=60" | jq '.simulations | group_by(.peer_id) | .[] | {peer_id: .[0].peer_id, snapshotter: .[0].snapshotter_address, count: length}'
+
+# Check heartbeat frequency for a known peer
+curl "http://localhost:9091/api/v1/heartbeats/peer/12D3KooWExample?limit=50" | jq '.heartbeats | [.[0].timestamp, .[-1].timestamp] | "\(.[0]) to \(.[1])"'
+```
+
 ### Using Query Parameters
 
 All endpoints support protocol/market filtering for multi-market environments:

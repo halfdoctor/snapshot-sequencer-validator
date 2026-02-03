@@ -390,6 +390,24 @@ func (kb *KeyBuilder) SimulationsBySnapshotter(address string) string {
 	return fmt.Sprintf("%s:%s:simulations:snapshotter:%s", kb.ProtocolState, kb.DataMarket, checksumAddress(address))
 }
 
+// Heartbeat Message Keys (namespaced)
+// Heartbeats are epoch 0 messages with empty CID from local-collector for P2P mesh maintenance
+// NOTE: Heartbeats are NOT EIP-712 signed, so only peer ID is available (no snapshotter address)
+// To correlate peer ID with snapshotter address, use simulation or submission data from other endpoints
+
+// HeartbeatsTimeline returns the ZSET key for heartbeat events ordered by timestamp
+// Format: {protocol}:{market}:heartbeats:timeline
+func (kb *KeyBuilder) HeartbeatsTimeline() string {
+	return fmt.Sprintf("%s:%s:heartbeats:timeline", kb.ProtocolState, kb.DataMarket)
+}
+
+// HeartbeatsByPeer returns the ZSET key for heartbeats from a specific peer
+// Format: {protocol}:{market}:heartbeats:peer:{peerID}
+// Members: heartbeat entity IDs with timestamp scores
+func (kb *KeyBuilder) HeartbeatsByPeer(peerID string) string {
+	return fmt.Sprintf("%s:%s:heartbeats:peer:%s", kb.ProtocolState, kb.DataMarket, peerID)
+}
+
 // Monitoring Keys (not namespaced)
 
 // PipelineHealth returns the key for component health status

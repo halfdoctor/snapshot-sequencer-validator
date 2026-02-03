@@ -352,6 +352,14 @@ func (d *Dequeuer) validateSubmission(submission *SnapshotSubmission) error {
 		// 3. Cache peer ID -> snapshotter address mapping for heartbeats
 		// 4. Enable banning peers with invalid/missing EIP-712 signatures
 		// See: snapshotter-lite-local-collector/pkgs/service/msg_server.go publishHeartbeats()
+		//
+		// CURRENT IMPLEMENTATION (peer-ID-only tracking):
+		// Heartbeats are detected and cached by peer ID in cmd/unified/main.go cacheHeartbeat()
+		// This allows tracking peer activity without snapshotter address correlation.
+		// To correlate peer ID with snapshotter address, use:
+		//   - /api/v1/simulations/recent (simulation messages have EIP-712 signatures)
+		//   - /api/v1/epochs/{epochID}/submissions (regular submissions have EIP-712 signatures)
+		// Then query /api/v1/heartbeats/peer/{peerID} for heartbeat activity.
 		return fmt.Errorf("epoch 0 heartbeat: skipping")
 	}
 

@@ -190,6 +190,24 @@ type SimulationsResponse struct {
 	Timestamp   time.Time        `json:"timestamp"`
 }
 
+// HeartbeatInfo represents a single heartbeat message from a peer
+// Heartbeats are epoch 0 messages with empty CID for P2P mesh maintenance
+// NOTE: Heartbeats are NOT EIP-712 signed, so only peer ID is available (no snapshotter address)
+type HeartbeatInfo struct {
+	EntityID  string `json:"entity_id"` // Format: hb:{peerID}:{timestamp}
+	PeerID    string `json:"peer_id"`   // libp2p peer ID of the sender
+	Timestamp int64  `json:"timestamp"` // Unix timestamp when received
+	Time      string `json:"time"`      // RFC3339 formatted time
+}
+
+// HeartbeatsResponse is the response structure for heartbeat listing endpoints
+type HeartbeatsResponse struct {
+	Count      int             `json:"count"`
+	Minutes    int             `json:"minutes,omitempty"` // For recent query
+	Heartbeats []HeartbeatInfo `json:"heartbeats"`
+	Timestamp  time.Time       `json:"timestamp"`
+}
+
 func NewMonitorAPI(redisClient *redis.Client, protocol, market string) *MonitorAPI {
 	// Get protocol state contract and first data market for VPA endpoints
 	protocolState := getEnv("PROTOCOL_STATE_CONTRACT", "")
@@ -3301,6 +3319,154 @@ func (m *MonitorAPI) metadataToSimulationInfo(entityID string, metadata map[stri
 	return sim
 }
 
+// HeartbeatsRecent returns recent heartbeat messages from peers
+// Heartbeats are epoch 0 messages with empty CID for P2P mesh maintenance
+// NOTE: Heartbeats are NOT EIP-712 signed, so only peer ID is available (no snapshotter address)
+// @Summary Get recent heartbeat messages
+// @Description Returns heartbeat messages received within the specified time window. Heartbeats are NOT EIP-712 signed - only peer ID is available.
+// @Tags Heartbeats
+// @Produce json
+// @Param limit query int false "Maximum number of heartbeats to return" default(100)
+// @Param minutes query int false "Time window in minutes" default(60)
+// @Param protocol query string false "Protocol state contract address"
+// @Param market query string false "Data market address"
+// @Success 200 {object} HeartbeatsResponse "Recent heartbeat messages"
+// @Router /heartbeats/recent [get]
+func (m *MonitorAPI) HeartbeatsRecent(c *gin.Context) {
+	limitStr := c.DefaultQuery("limit", "100")
+	minutesStr := c.DefaultQuery("minutes", "60")
+	protocol := c.Query("protocol")
+	market := c.Query("market")
+
+	limit, _ := strconv.Atoi(limitStr)
+	if limit <= 0 || limit > 1000 {
+		limit = 100
+	}
+
+	minutes, _ := strconv.Atoi(minutesStr)
+	if minutes <= 0 || minutes > 1440 { // Max 24 hours
+		minutes = 60
+	}
+
+	kb := m.keyBuilder
+	if protocol != "" || market != "" {
+		if protocol == "" {
+			protocol = m.keyBuilder.ProtocolState
+		}
+		if market == "" {
+			market = m.keyBuilder.DataMarket
+		}
+		kb = keys.NewKeyBuilder(protocol, market)
+	}
+
+	// Query heartbeats timeline within time window
+	minTime := time.Now().Add(-time.Duration(minutes) * time.Minute).Unix()
+	maxTime := time.Now().Unix()
+
+	results, err := m.redis.ZRevRangeByScoreWithScores(m.ctx, kb.HeartbeatsTimeline(), &redis.ZRangeBy{
+		Min:   fmt.Sprintf("%d", minTime),
+		Max:   fmt.Sprintf("%d", maxTime),
+		Count: int64(limit),
+	}).Result()
+	if err != nil {
+		log.WithError(err).Error("Failed to query heartbeats timeline")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to query heartbeats"})
+		return
+	}
+
+	heartbeats := make([]HeartbeatInfo, 0, len(results))
+	for _, result := range results {
+		entityID := result.Member.(string)
+		timestamp := int64(result.Score)
+		heartbeats = append(heartbeats, m.parseHeartbeatFromEntityID(entityID, timestamp))
+	}
+
+	c.JSON(http.StatusOK, HeartbeatsResponse{
+		Count:      len(heartbeats),
+		Minutes:    minutes,
+		Heartbeats: heartbeats,
+		Timestamp:  time.Now(),
+	})
+}
+
+// HeartbeatsByPeer returns heartbeat messages from a specific peer
+// @Summary Get heartbeats from a specific peer
+// @Description Returns all heartbeat messages from the specified peer ID. Heartbeats are NOT EIP-712 signed.
+// @Tags Heartbeats
+// @Produce json
+// @Param peerID path string true "libp2p Peer ID"
+// @Param limit query int false "Maximum number of heartbeats to return" default(100)
+// @Param protocol query string false "Protocol state contract address"
+// @Param market query string false "Data market address"
+// @Success 200 {object} HeartbeatsResponse "Heartbeats from the specified peer"
+// @Router /heartbeats/peer/{peerID} [get]
+func (m *MonitorAPI) HeartbeatsByPeer(c *gin.Context) {
+	peerID := c.Param("peerID")
+	limitStr := c.DefaultQuery("limit", "100")
+	protocol := c.Query("protocol")
+	market := c.Query("market")
+
+	if peerID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "peerID is required"})
+		return
+	}
+
+	limit, _ := strconv.Atoi(limitStr)
+	if limit <= 0 || limit > 1000 {
+		limit = 100
+	}
+
+	kb := m.keyBuilder
+	if protocol != "" || market != "" {
+		if protocol == "" {
+			protocol = m.keyBuilder.ProtocolState
+		}
+		if market == "" {
+			market = m.keyBuilder.DataMarket
+		}
+		kb = keys.NewKeyBuilder(protocol, market)
+	}
+
+	// Get heartbeat entity IDs for this peer (sorted by timestamp descending)
+	peerKey := kb.HeartbeatsByPeer(peerID)
+	results, err := m.redis.ZRevRangeWithScores(m.ctx, peerKey, 0, int64(limit-1)).Result()
+	if err != nil {
+		log.WithError(err).WithField("peer_id", peerID).Error("Failed to query peer heartbeats")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to query peer heartbeats"})
+		return
+	}
+
+	heartbeats := make([]HeartbeatInfo, 0, len(results))
+	for _, result := range results {
+		entityID := result.Member.(string)
+		timestamp := int64(result.Score)
+		heartbeats = append(heartbeats, m.parseHeartbeatFromEntityID(entityID, timestamp))
+	}
+
+	c.JSON(http.StatusOK, HeartbeatsResponse{
+		Count:      len(heartbeats),
+		Heartbeats: heartbeats,
+		Timestamp:  time.Now(),
+	})
+}
+
+// Helper function to parse heartbeat info from entity ID format: hb:{peerID}:{timestamp}
+func (m *MonitorAPI) parseHeartbeatFromEntityID(entityID string, timestamp int64) HeartbeatInfo {
+	hb := HeartbeatInfo{
+		EntityID:  entityID,
+		Timestamp: timestamp,
+		Time:      time.Unix(timestamp, 0).Format(time.RFC3339),
+	}
+
+	// Try to parse entity ID: hb:{peerID}:{timestamp}
+	parts := strings.Split(entityID, ":")
+	if len(parts) >= 2 && parts[0] == "hb" {
+		hb.PeerID = parts[1]
+	}
+
+	return hb
+}
+
 func main() {
 	// Configure logger
 	log.SetFormatter(&logrus.JSONFormatter{})
@@ -3410,6 +3576,11 @@ func main() {
 		v1.GET("/simulations/recent", api.SimulationsRecent)
 		v1.GET("/simulations/peer/:peerID", api.SimulationsByPeer)
 		v1.GET("/simulations/snapshotter/:address", api.SimulationsBySnapshotter)
+
+		// Heartbeat endpoints - for epoch 0 mesh maintenance messages (peer ID only, no snapshotter address)
+		// NOTE: Heartbeats are NOT EIP-712 signed. Use simulation/submission data to correlate peer ID with snapshotter.
+		v1.GET("/heartbeats/recent", api.HeartbeatsRecent)
+		v1.GET("/heartbeats/peer/:peerID", api.HeartbeatsByPeer)
 	}
 
 	// Swagger documentation

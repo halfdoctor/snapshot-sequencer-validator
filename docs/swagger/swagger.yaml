@@ -126,6 +126,35 @@ definitions:
           type: string
         type: array
     type: object
+  main.HeartbeatInfo:
+    properties:
+      entity_id:
+        description: 'Format: hb:{peerID}:{timestamp}'
+        type: string
+      peer_id:
+        description: libp2p peer ID of the sender
+        type: string
+      time:
+        description: RFC3339 formatted time
+        type: string
+      timestamp:
+        description: Unix timestamp when received
+        type: integer
+    type: object
+  main.HeartbeatsResponse:
+    properties:
+      count:
+        type: integer
+      heartbeats:
+        items:
+          $ref: '#/definitions/main.HeartbeatInfo'
+        type: array
+      minutes:
+        description: For recent query
+        type: integer
+      timestamp:
+        type: string
+    type: object
   main.HourlyStats:
     properties:
       hours:
@@ -480,6 +509,72 @@ paths:
       summary: Health check
       tags:
       - health
+  /heartbeats/peer/{peerID}:
+    get:
+      description: Returns all heartbeat messages from the specified peer ID. Heartbeats
+        are NOT EIP-712 signed.
+      parameters:
+      - description: libp2p Peer ID
+        in: path
+        name: peerID
+        required: true
+        type: string
+      - default: 100
+        description: Maximum number of heartbeats to return
+        in: query
+        name: limit
+        type: integer
+      - description: Protocol state contract address
+        in: query
+        name: protocol
+        type: string
+      - description: Data market address
+        in: query
+        name: market
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: Heartbeats from the specified peer
+          schema:
+            $ref: '#/definitions/main.HeartbeatsResponse'
+      summary: Get heartbeats from a specific peer
+      tags:
+      - Heartbeats
+  /heartbeats/recent:
+    get:
+      description: Returns heartbeat messages received within the specified time window.
+        Heartbeats are NOT EIP-712 signed - only peer ID is available.
+      parameters:
+      - default: 100
+        description: Maximum number of heartbeats to return
+        in: query
+        name: limit
+        type: integer
+      - default: 60
+        description: Time window in minutes
+        in: query
+        name: minutes
+        type: integer
+      - description: Protocol state contract address
+        in: query
+        name: protocol
+        type: string
+      - description: Data market address
+        in: query
+        name: market
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: Recent heartbeat messages
+          schema:
+            $ref: '#/definitions/main.HeartbeatsResponse'
+      summary: Get recent heartbeat messages
+      tags:
+      - Heartbeats
   /pipeline/overview:
     get:
       description: Get pipeline metrics from pre-aggregated data
