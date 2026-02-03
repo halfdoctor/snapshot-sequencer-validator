@@ -359,6 +359,37 @@ func (kb *KeyBuilder) MetricsCurrentEpoch() string {
 	return fmt.Sprintf("%s:%s:metrics:current_epoch", kb.ProtocolState, kb.DataMarket)
 }
 
+// Simulation Message Keys (namespaced)
+// Used for caching epoch 0 simulation messages from snapshotters at startup
+// These messages contain real CIDs and EIP-712 signatures (unlike heartbeats which have empty CIDs)
+
+// SimulationsTimeline returns the ZSET key for simulation events ordered by timestamp
+// Format: {protocol}:{market}:simulations:timeline
+func (kb *KeyBuilder) SimulationsTimeline() string {
+	return fmt.Sprintf("%s:%s:simulations:timeline", kb.ProtocolState, kb.DataMarket)
+}
+
+// SimulationMetadata returns the HASH key for detailed simulation metadata
+// Format: {protocol}:{market}:simulations:metadata:{entityID}
+// Fields: peer_id, snapshotter_address, slot_id, project_id, snapshot_cid, data_market, timestamp
+func (kb *KeyBuilder) SimulationMetadata(entityID string) string {
+	return fmt.Sprintf("%s:%s:simulations:metadata:%s", kb.ProtocolState, kb.DataMarket, entityID)
+}
+
+// SimulationsByPeer returns the SET key for tracking simulations per peer ID
+// Format: {protocol}:{market}:simulations:peer:{peerID}
+// Members: simulation entity IDs
+func (kb *KeyBuilder) SimulationsByPeer(peerID string) string {
+	return fmt.Sprintf("%s:%s:simulations:peer:%s", kb.ProtocolState, kb.DataMarket, peerID)
+}
+
+// SimulationsBySnapshotter returns the SET key for tracking simulations per snapshotter address
+// Format: {protocol}:{market}:simulations:snapshotter:{address}
+// Members: simulation entity IDs
+func (kb *KeyBuilder) SimulationsBySnapshotter(address string) string {
+	return fmt.Sprintf("%s:%s:simulations:snapshotter:%s", kb.ProtocolState, kb.DataMarket, checksumAddress(address))
+}
+
 // Monitoring Keys (not namespaced)
 
 // PipelineHealth returns the key for component health status

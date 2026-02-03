@@ -168,6 +168,28 @@ type VPAStatsResponse struct {
 	Timestamp time.Time              `json:"timestamp"`
 }
 
+// SimulationInfo represents a single simulation message from a snapshotter
+// Simulation messages are epoch 0 messages with real CIDs sent at snapshotter startup
+type SimulationInfo struct {
+	EntityID           string `json:"entity_id"`           // Format: sim:{slotID}:{projectID}:{timestamp}:{peerID}
+	PeerID             string `json:"peer_id"`             // libp2p peer ID of the sender
+	SnapshotterAddress string `json:"snapshotter_address"` // EIP-712 recovered address from signature
+	SlotID             string `json:"slot_id"`             // Slot ID from the submission
+	ProjectID          string `json:"project_id"`          // Project ID from the submission
+	SnapshotCID        string `json:"snapshot_cid"`        // Real CID of the computed snapshot
+	DataMarket         string `json:"data_market"`         // Data market address
+	Timestamp          int64  `json:"timestamp"`           // Unix timestamp when received
+	Time               string `json:"time"`                // RFC3339 formatted time
+}
+
+// SimulationsResponse is the response structure for simulation listing endpoints
+type SimulationsResponse struct {
+	Count       int              `json:"count"`
+	Minutes     int              `json:"minutes,omitempty"` // For recent query
+	Simulations []SimulationInfo `json:"simulations"`
+	Timestamp   time.Time        `json:"timestamp"`
+}
+
 func NewMonitorAPI(redisClient *redis.Client, protocol, market string) *MonitorAPI {
 	// Get protocol state contract and first data market for VPA endpoints
 	protocolState := getEnv("PROTOCOL_STATE_CONTRACT", "")
@@ -3003,6 +3025,282 @@ func (m *MonitorAPI) PeerSpamEpochs(c *gin.Context) {
 	})
 }
 
+// @Summary List recent simulation messages
+// @Description Get recent simulation messages (epoch 0 with real CIDs) from snapshotters. Simulations are sent at startup to verify connectivity and contain EIP-712 signatures.
+// @Tags simulations
+// @Produce json
+// @Param limit query int false "Maximum number of simulations to return (default: 50, max: 500)"
+// @Param minutes query int false "Time window in minutes (default: 60)"
+// @Param protocol query string false "Protocol state identifier"
+// @Param market query string false "Data market address"
+// @Success 200 {object} SimulationsResponse "List of recent simulation messages"
+// @Router /simulations/recent [get]
+func (m *MonitorAPI) SimulationsRecent(c *gin.Context) {
+	protocol := c.Query("protocol")
+	market := c.Query("market")
+	limitStr := c.DefaultQuery("limit", "50")
+	minutesStr := c.DefaultQuery("minutes", "60")
+
+	kb := m.keyBuilder
+	if protocol != "" || market != "" {
+		if protocol == "" {
+			protocol = m.keyBuilder.ProtocolState
+		}
+		if market == "" {
+			market = m.keyBuilder.DataMarket
+		}
+		kb = keys.NewKeyBuilder(protocol, market)
+	}
+
+	limit, _ := strconv.Atoi(limitStr)
+	if limit <= 0 || limit > 500 {
+		limit = 50
+	}
+
+	minutes, _ := strconv.Atoi(minutesStr)
+	if minutes <= 0 {
+		minutes = 60
+	}
+
+	// Calculate time window
+	cutoffTime := time.Now().Add(-time.Duration(minutes) * time.Minute).Unix()
+
+	// Get simulation entity IDs from timeline (ZSET)
+	timelineKey := kb.SimulationsTimeline()
+	entityIDs, err := m.redis.ZRangeByScoreWithScores(m.ctx, timelineKey, &redis.ZRangeBy{
+		Min:   fmt.Sprintf("%d", cutoffTime),
+		Max:   "+inf",
+		Count: int64(limit),
+	}).Result()
+
+	if err != nil {
+		log.WithError(err).Error("Failed to query simulations timeline")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to query simulations"})
+		return
+	}
+
+	simulations := make([]SimulationInfo, 0, len(entityIDs))
+	for _, z := range entityIDs {
+		entityID := z.Member.(string)
+		timestamp := int64(z.Score)
+
+		// Get metadata for this simulation
+		metadataKey := kb.SimulationMetadata(entityID)
+		metadataJSON, err := m.redis.Get(m.ctx, metadataKey).Result()
+		if err != nil {
+			// Metadata might have expired, create partial record from entity ID
+			sim := m.parseSimulationFromEntityID(entityID, timestamp)
+			simulations = append(simulations, sim)
+			continue
+		}
+
+		var metadata map[string]interface{}
+		if err := json.Unmarshal([]byte(metadataJSON), &metadata); err != nil {
+			sim := m.parseSimulationFromEntityID(entityID, timestamp)
+			simulations = append(simulations, sim)
+			continue
+		}
+
+		sim := m.metadataToSimulationInfo(entityID, metadata)
+		simulations = append(simulations, sim)
+	}
+
+	c.JSON(http.StatusOK, SimulationsResponse{
+		Count:       len(simulations),
+		Minutes:     minutes,
+		Simulations: simulations,
+		Timestamp:   time.Now(),
+	})
+}
+
+// @Summary Get simulations by peer ID
+// @Description Get all simulation messages from a specific peer (libp2p ID)
+// @Tags simulations
+// @Produce json
+// @Param peerID path string true "Peer ID (libp2p)"
+// @Param protocol query string false "Protocol state identifier"
+// @Param market query string false "Data market address"
+// @Success 200 {object} SimulationsResponse "Simulations from the specified peer"
+// @Router /simulations/peer/{peerID} [get]
+func (m *MonitorAPI) SimulationsByPeer(c *gin.Context) {
+	peerID := c.Param("peerID")
+	protocol := c.Query("protocol")
+	market := c.Query("market")
+
+	if peerID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "peerID is required"})
+		return
+	}
+
+	kb := m.keyBuilder
+	if protocol != "" || market != "" {
+		if protocol == "" {
+			protocol = m.keyBuilder.ProtocolState
+		}
+		if market == "" {
+			market = m.keyBuilder.DataMarket
+		}
+		kb = keys.NewKeyBuilder(protocol, market)
+	}
+
+	// Get simulation entity IDs for this peer
+	peerKey := kb.SimulationsByPeer(peerID)
+	entityIDs, err := m.redis.SMembers(m.ctx, peerKey).Result()
+	if err != nil {
+		log.WithError(err).WithField("peer_id", peerID).Error("Failed to query peer simulations")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to query peer simulations"})
+		return
+	}
+
+	simulations := make([]SimulationInfo, 0, len(entityIDs))
+	for _, entityID := range entityIDs {
+		// Get metadata
+		metadataKey := kb.SimulationMetadata(entityID)
+		metadataJSON, err := m.redis.Get(m.ctx, metadataKey).Result()
+		if err != nil {
+			// Try to get timestamp from timeline
+			timestamp, _ := m.redis.ZScore(m.ctx, kb.SimulationsTimeline(), entityID).Result()
+			sim := m.parseSimulationFromEntityID(entityID, int64(timestamp))
+			simulations = append(simulations, sim)
+			continue
+		}
+
+		var metadata map[string]interface{}
+		if err := json.Unmarshal([]byte(metadataJSON), &metadata); err != nil {
+			continue
+		}
+
+		sim := m.metadataToSimulationInfo(entityID, metadata)
+		simulations = append(simulations, sim)
+	}
+
+	c.JSON(http.StatusOK, SimulationsResponse{
+		Count:       len(simulations),
+		Simulations: simulations,
+		Timestamp:   time.Now(),
+	})
+}
+
+// @Summary Get simulations by snapshotter address
+// @Description Get all simulation messages from a specific snapshotter (EIP-712 recovered address)
+// @Tags simulations
+// @Produce json
+// @Param address path string true "Snapshotter address (Ethereum address)"
+// @Param protocol query string false "Protocol state identifier"
+// @Param market query string false "Data market address"
+// @Success 200 {object} SimulationsResponse "Simulations from the specified snapshotter"
+// @Router /simulations/snapshotter/{address} [get]
+func (m *MonitorAPI) SimulationsBySnapshotter(c *gin.Context) {
+	address := c.Param("address")
+	protocol := c.Query("protocol")
+	market := c.Query("market")
+
+	if address == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "address is required"})
+		return
+	}
+
+	kb := m.keyBuilder
+	if protocol != "" || market != "" {
+		if protocol == "" {
+			protocol = m.keyBuilder.ProtocolState
+		}
+		if market == "" {
+			market = m.keyBuilder.DataMarket
+		}
+		kb = keys.NewKeyBuilder(protocol, market)
+	}
+
+	// Get simulation entity IDs for this snapshotter
+	snapshotterKey := kb.SimulationsBySnapshotter(address)
+	entityIDs, err := m.redis.SMembers(m.ctx, snapshotterKey).Result()
+	if err != nil {
+		log.WithError(err).WithField("address", address).Error("Failed to query snapshotter simulations")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to query snapshotter simulations"})
+		return
+	}
+
+	simulations := make([]SimulationInfo, 0, len(entityIDs))
+	for _, entityID := range entityIDs {
+		// Get metadata
+		metadataKey := kb.SimulationMetadata(entityID)
+		metadataJSON, err := m.redis.Get(m.ctx, metadataKey).Result()
+		if err != nil {
+			// Try to get timestamp from timeline
+			timestamp, _ := m.redis.ZScore(m.ctx, kb.SimulationsTimeline(), entityID).Result()
+			sim := m.parseSimulationFromEntityID(entityID, int64(timestamp))
+			simulations = append(simulations, sim)
+			continue
+		}
+
+		var metadata map[string]interface{}
+		if err := json.Unmarshal([]byte(metadataJSON), &metadata); err != nil {
+			continue
+		}
+
+		sim := m.metadataToSimulationInfo(entityID, metadata)
+		simulations = append(simulations, sim)
+	}
+
+	c.JSON(http.StatusOK, SimulationsResponse{
+		Count:       len(simulations),
+		Simulations: simulations,
+		Timestamp:   time.Now(),
+	})
+}
+
+// Helper function to parse simulation info from entity ID format: sim:{slotID}:{projectID}:{timestamp}:{peerID}
+func (m *MonitorAPI) parseSimulationFromEntityID(entityID string, timestamp int64) SimulationInfo {
+	sim := SimulationInfo{
+		EntityID:  entityID,
+		Timestamp: timestamp,
+		Time:      time.Unix(timestamp, 0).Format(time.RFC3339),
+	}
+
+	// Try to parse entity ID: sim:{slotID}:{projectID}:{timestamp}:{peerID}
+	parts := strings.Split(entityID, ":")
+	if len(parts) >= 5 && parts[0] == "sim" {
+		sim.SlotID = parts[1]
+		sim.ProjectID = parts[2]
+		// parts[3] is timestamp
+		sim.PeerID = parts[4]
+	}
+
+	return sim
+}
+
+// Helper function to convert metadata map to SimulationInfo
+func (m *MonitorAPI) metadataToSimulationInfo(entityID string, metadata map[string]interface{}) SimulationInfo {
+	sim := SimulationInfo{
+		EntityID: entityID,
+	}
+
+	if v, ok := metadata["peer_id"].(string); ok {
+		sim.PeerID = v
+	}
+	if v, ok := metadata["snapshotter_address"].(string); ok {
+		sim.SnapshotterAddress = v
+	}
+	if v, ok := metadata["slot_id"].(float64); ok {
+		sim.SlotID = fmt.Sprintf("%.0f", v)
+	}
+	if v, ok := metadata["project_id"].(string); ok {
+		sim.ProjectID = v
+	}
+	if v, ok := metadata["snapshot_cid"].(string); ok {
+		sim.SnapshotCID = v
+	}
+	if v, ok := metadata["data_market"].(string); ok {
+		sim.DataMarket = v
+	}
+	if v, ok := metadata["timestamp"].(float64); ok {
+		sim.Timestamp = int64(v)
+		sim.Time = time.Unix(int64(v), 0).Format(time.RFC3339)
+	}
+
+	return sim
+}
+
 func main() {
 	// Configure logger
 	log.SetFormatter(&logrus.JSONFormatter{})
@@ -3107,6 +3405,11 @@ func main() {
 		v1.GET("/spam/windows/:windowID", api.SpamWindowDetails)
 		v1.GET("/spam/epochs", api.SpamEpochs)
 		v1.GET("/spam/stats", api.SpamStats)
+
+		// Simulation endpoints - for epoch 0 messages with real CIDs from snapshotters at startup
+		v1.GET("/simulations/recent", api.SimulationsRecent)
+		v1.GET("/simulations/peer/:peerID", api.SimulationsByPeer)
+		v1.GET("/simulations/snapshotter/:address", api.SimulationsBySnapshotter)
 	}
 
 	// Swagger documentation

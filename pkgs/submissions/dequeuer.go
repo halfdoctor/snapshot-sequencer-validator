@@ -149,6 +149,27 @@ func (d *Dequeuer) ProcessSubmission(submission *SnapshotSubmission, submissionI
 		return "", fmt.Errorf("signature verification failed: %w", err)
 	}
 
+	// Detect and cache simulation messages (epoch 0 with real CID)
+	// Simulation messages are sent by snapshotters at startup to verify connectivity
+	// Unlike heartbeats (epoch 0 + empty CID), simulations contain real data and are EIP-712 signed
+	if submission.Request.EpochId == 0 && submission.Request.SnapshotCid != "" {
+		log.Infof("📡 Detected simulation message from peer %s, snapshotter %s (epoch=0, cid=%s)",
+			peerID, snapshotterAddr.Hex(), submission.Request.SnapshotCid)
+
+		// Cache the simulation for monitoring purposes
+		if err := d.CacheSimulation(peerID, snapshotterAddr, submission); err != nil {
+			log.Warnf("Failed to cache simulation message: %v", err)
+			// Don't fail the submission - caching is non-critical
+		}
+
+		// Update stats for simulation
+		d.updateStats(true, time.Since(startTime))
+
+		// Return early - simulation messages don't need further processing (slot validation, spam tracking, etc.)
+		// They're just for startup connectivity verification
+		return snapshotterAddr.Hex(), nil
+	}
+
 	// Spam protection: Check flagged snapshotter address (if enabled)
 	if d.enableSpamProtection && d.flagging != nil && snapshotterAddr != (common.Address{}) {
 		flagged, err := d.flagging.IsSnapshotterFlagged(ctx, snapshotterAddr.Hex())
@@ -324,6 +345,13 @@ func (d *Dequeuer) validateSubmission(submission *SnapshotSubmission) error {
 	// Epoch 0 heartbeat handling: Skip validation for epoch 0 with empty CID
 	// These are P2P mesh maintenance messages from Go local collector, not actual submissions
 	if submission.Request.EpochId == 0 && submission.Request.SnapshotCid == "" {
+		// TODO: [SIGNED-HEARTBEATS] Currently heartbeat messages (epoch 0 + empty CID) are not EIP-712 signed,
+		// so we cannot extract the snapshotter address. To enable peer banning based on heartbeat authenticity:
+		// 1. Modify local-collector to EIP-712 sign heartbeat messages with snapshotter private key
+		// 2. Verify signature here and extract snapshotter address
+		// 3. Cache peer ID -> snapshotter address mapping for heartbeats
+		// 4. Enable banning peers with invalid/missing EIP-712 signatures
+		// See: snapshotter-lite-local-collector/pkgs/service/msg_server.go publishHeartbeats()
 		return fmt.Errorf("epoch 0 heartbeat: skipping")
 	}
 
@@ -552,4 +580,73 @@ func (d *Dequeuer) GetProcessedCount(epochID uint64) int {
 		}
 	}
 	return count
+}
+
+// CacheSimulation stores simulation message data (epoch 0 with real CID) in Redis for monitoring.
+// Simulation messages are sent by snapshotters at startup to verify connectivity and are EIP-712 signed,
+// allowing us to extract the snapshotter address and map it to the peer ID.
+// This data is useful for:
+// 1. Verifying snapshotter identity at startup
+// 2. Mapping peer IDs to snapshotter addresses
+// 3. Monitoring which snapshotters have connected and when
+func (d *Dequeuer) CacheSimulation(peerID string, snapshotterAddr common.Address, submission *SnapshotSubmission) error {
+	ctx := context.Background()
+	timestamp := time.Now().Unix()
+
+	// Create entity ID for the simulation
+	entityID := fmt.Sprintf("sim:%d:%s:%d:%s",
+		submission.Request.SlotId,
+		submission.Request.ProjectId,
+		timestamp,
+		peerID)
+
+	// Create metadata for the simulation
+	metadata := map[string]interface{}{
+		"peer_id":             peerID,
+		"snapshotter_address": snapshotterAddr.Hex(),
+		"slot_id":             submission.Request.SlotId,
+		"project_id":          submission.Request.ProjectId,
+		"snapshot_cid":        submission.Request.SnapshotCid,
+		"data_market":         submission.DataMarket,
+		"timestamp":           timestamp,
+		"entity_id":           entityID,
+	}
+
+	metadataJSON, err := json.Marshal(metadata)
+	if err != nil {
+		return fmt.Errorf("failed to marshal simulation metadata: %w", err)
+	}
+
+	// Pipeline for atomic writes
+	pipe := d.redisClient.Pipeline()
+
+	// 1. Add to simulations timeline (ZSET sorted by timestamp)
+	pipe.ZAdd(ctx, d.keyBuilder.SimulationsTimeline(), redis.Z{
+		Score:  float64(timestamp),
+		Member: entityID,
+	})
+
+	// 2. Store simulation metadata (HASH with 7-day TTL)
+	pipe.SetEx(ctx, d.keyBuilder.SimulationMetadata(entityID), metadataJSON, 7*24*time.Hour)
+
+	// 3. Index by peer ID (SET with 7-day TTL)
+	peerKey := d.keyBuilder.SimulationsByPeer(peerID)
+	pipe.SAdd(ctx, peerKey, entityID)
+	pipe.Expire(ctx, peerKey, 7*24*time.Hour)
+
+	// 4. Index by snapshotter address (SET with 7-day TTL)
+	snapshotterKey := d.keyBuilder.SimulationsBySnapshotter(snapshotterAddr.Hex())
+	pipe.SAdd(ctx, snapshotterKey, entityID)
+	pipe.Expire(ctx, snapshotterKey, 7*24*time.Hour)
+
+	// Execute pipeline
+	if _, err := pipe.Exec(ctx); err != nil {
+		return fmt.Errorf("failed to cache simulation: %w", err)
+	}
+
+	log.Infof("📡 Cached simulation message: peer=%s, snapshotter=%s, slot=%d, project=%s, cid=%s",
+		peerID, snapshotterAddr.Hex(), submission.Request.SlotId,
+		submission.Request.ProjectId, submission.Request.SnapshotCid)
+
+	return nil
 }
