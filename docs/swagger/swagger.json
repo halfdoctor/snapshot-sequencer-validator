@@ -612,7 +612,7 @@
         },
         "/simulations/slot/{slotID}": {
             "get": {
-                "description": "Get all simulation messages for a specific slot ID",
+                "description": "Get simulation messages for a specific slot ID",
                 "produces": [
                     "application/json"
                 ],
@@ -627,6 +627,13 @@
                         "name": "slotID",
                         "in": "path",
                         "required": true
+                    },
+                    {
+                        "type": "integer",
+                        "default": 10,
+                        "description": "Maximum number of simulations to return",
+                        "name": "limit",
+                        "in": "query"
                     },
                     {
                         "type": "string",

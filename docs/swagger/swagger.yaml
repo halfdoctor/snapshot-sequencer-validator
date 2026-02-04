@@ -683,13 +683,18 @@ paths:
       - simulations
   /simulations/slot/{slotID}:
     get:
-      description: Get all simulation messages for a specific slot ID
+      description: Get simulation messages for a specific slot ID
       parameters:
       - description: Slot ID
         in: path
         name: slotID
         required: true
         type: string
+      - default: 10
+        description: Maximum number of simulations to return
+        in: query
+        name: limit
+        type: integer
       - description: Protocol state identifier
         in: query
         name: protocol
