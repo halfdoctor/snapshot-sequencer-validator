@@ -610,6 +610,47 @@
                 }
             }
         },
+        "/simulations/slot/{slotID}": {
+            "get": {
+                "description": "Get all simulation messages for a specific slot ID",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "simulations"
+                ],
+                "summary": "Get simulations by slot ID",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Slot ID",
+                        "name": "slotID",
+                        "in": "path",
+                        "required": true
+                    },
+                    {
+                        "type": "string",
+                        "description": "Protocol state identifier",
+                        "name": "protocol",
+                        "in": "query"
+                    },
+                    {
+                        "type": "string",
+                        "description": "Data market address",
+                        "name": "market",
+                        "in": "query"
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "Simulations from the specified slot ID",
+                        "schema": {
+                            "$ref": "#/definitions/main.SimulationsResponse"
+                        }
+                    }
+                }
+            }
+        },
         "/simulations/snapshotter/{address}": {
             "get": {
                 "description": "Get all simulation messages from a specific snapshotter (EIP-712 recovered address)",
