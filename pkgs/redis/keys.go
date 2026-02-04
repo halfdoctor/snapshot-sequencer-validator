@@ -390,6 +390,13 @@ func (kb *KeyBuilder) SimulationsBySnapshotter(address string) string {
 	return fmt.Sprintf("%s:%s:simulations:snapshotter:%s", kb.ProtocolState, kb.DataMarket, checksumAddress(address))
 }
 
+// SimulationsBySlot returns the SET key for tracking simulations per slot ID
+// Format: {protocol}:{market}:simulations:slot:{slotID}
+// Members: simulation entity IDs
+func (kb *KeyBuilder) SimulationsBySlot(slotID string) string {
+	return fmt.Sprintf("%s:%s:simulations:slot:%s", kb.ProtocolState, kb.DataMarket, slotID)
+}
+
 // Heartbeat Message Keys (namespaced)
 // Heartbeats are epoch 0 messages with empty CID from local-collector for P2P mesh maintenance
 // NOTE: Heartbeats are NOT EIP-712 signed, so only peer ID is available (no snapshotter address)

@@ -709,6 +709,33 @@ paths:
       summary: Get simulations by snapshotter address
       tags:
       - simulations
+  /simulations/slot/{slotID}:
+    get:
+      description: Get all simulation messages for a specific slot ID
+      parameters:
+      - description: Slot ID
+        in: path
+        name: slotID
+        required: true
+        type: string
+      - description: Protocol state identifier
+        in: query
+        name: protocol
+        type: string
+      - description: Data market address
+        in: query
+        name: market
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: Simulations from the specified slot ID
+          schema:
+            $ref: '#/definitions/main.SimulationsResponse'
+      summary: Get simulations by slot ID
+      tags:
+      - simulations
   /spam/epochs:
     get:
       description: Get list of epochs that have spam tracking data. Queries epochs

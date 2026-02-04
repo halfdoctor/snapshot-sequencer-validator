@@ -647,6 +647,11 @@ func (d *Dequeuer) CacheSimulation(peerID string, snapshotterAddr common.Address
 	pipe.SAdd(ctx, snapshotterKey, entityID)
 	pipe.Expire(ctx, snapshotterKey, 7*24*time.Hour)
 
+	// 5. Index by slot ID (SET with 7-day TTL)
+	slotKey := d.keyBuilder.SimulationsBySlot(fmt.Sprintf("%d", submission.Request.SlotId))
+	pipe.SAdd(ctx, slotKey, entityID)
+	pipe.Expire(ctx, slotKey, 7*24*time.Hour)
+
 	// Execute pipeline
 	if _, err := pipe.Exec(ctx); err != nil {
 		return fmt.Errorf("failed to cache simulation: %w", err)

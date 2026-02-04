@@ -3267,6 +3267,74 @@ func (m *MonitorAPI) SimulationsBySnapshotter(c *gin.Context) {
 	})
 }
 
+// @Summary Get simulations by slot ID
+// @Description Get all simulation messages for a specific slot ID
+// @Tags simulations
+// @Produce json
+// @Param slotID path string true "Slot ID"
+// @Param protocol query string false "Protocol state identifier"
+// @Param market query string false "Data market address"
+// @Success 200 {object} SimulationsResponse "Simulations from the specified slot ID"
+// @Router /simulations/slot/{slotID} [get]
+func (m *MonitorAPI) SimulationsBySlot(c *gin.Context) {
+	slotID := c.Param("slotID")
+	protocol := c.Query("protocol")
+	market := c.Query("market")
+
+	if slotID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "slotID is required"})
+		return
+	}
+
+	kb := m.keyBuilder
+	if protocol != "" || market != "" {
+		if protocol == "" {
+			protocol = m.keyBuilder.ProtocolState
+		}
+		if market == "" {
+			market = m.keyBuilder.DataMarket
+		}
+		kb = keys.NewKeyBuilder(protocol, market)
+	}
+
+	// Get simulation entity IDs for this slot ID
+	slotKey := kb.SimulationsBySlot(slotID)
+	entityIDs, err := m.redis.SMembers(m.ctx, slotKey).Result()
+	if err != nil {
+		log.WithError(err).WithField("slotID", slotID).Error("Failed to query slot simulations")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to query slot simulations"})
+		return
+	}
+
+	simulations := make([]SimulationInfo, 0, len(entityIDs))
+	for _, entityID := range entityIDs {
+		// Get metadata
+		metadataKey := kb.SimulationMetadata(entityID)
+		metadataJSON, err := m.redis.Get(m.ctx, metadataKey).Result()
+		if err != nil {
+			// Try to get timestamp from timeline
+			timestamp, _ := m.redis.ZScore(m.ctx, kb.SimulationsTimeline(), entityID).Result()
+			sim := m.parseSimulationFromEntityID(entityID, int64(timestamp))
+			simulations = append(simulations, sim)
+			continue
+		}
+
+		var metadata map[string]interface{}
+		if err := json.Unmarshal([]byte(metadataJSON), &metadata); err != nil {
+			continue
+		}
+
+		sim := m.metadataToSimulationInfo(entityID, metadata)
+		simulations = append(simulations, sim)
+	}
+
+	c.JSON(http.StatusOK, SimulationsResponse{
+		Count:       len(simulations),
+		Simulations: simulations,
+		Timestamp:   time.Now(),
+	})
+}
+
 // Helper function to parse simulation info from entity ID format: sim:{slotID}:{projectID}:{timestamp}:{peerID}
 func (m *MonitorAPI) parseSimulationFromEntityID(entityID string, timestamp int64) SimulationInfo {
 	sim := SimulationInfo{
@@ -3576,6 +3644,7 @@ func main() {
 		v1.GET("/simulations/recent", api.SimulationsRecent)
 		v1.GET("/simulations/peer/:peerID", api.SimulationsByPeer)
 		v1.GET("/simulations/snapshotter/:address", api.SimulationsBySnapshotter)
+		v1.GET("/simulations/slot/:slotID", api.SimulationsBySlot)
 
 		// Heartbeat endpoints - for epoch 0 mesh maintenance messages (peer ID only, no snapshotter address)
 		// NOTE: Heartbeats are NOT EIP-712 signed. Use simulation/submission data to correlate peer ID with snapshotter.
