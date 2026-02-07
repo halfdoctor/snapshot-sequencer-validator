@@ -3,6 +3,7 @@ package protocolstate
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
@@ -21,8 +22,12 @@ type Config struct {
 	SnapshotterStateContract string
 	ContractABIPath          string
 	RedisClient              *redis.Client
-	SlotSyncInterval         time.Duration // Fallback cold sync interval
+	SlotSyncInterval         time.Duration // Interval for periodic node count check (was full cold sync)
 	SlotSyncBatchSize        int
+
+	// Smart sync configuration
+	EventGapThresholdBlocks uint64 // Block gap that triggers full cold sync on startup (default: 5000)
+	ForceFullColdSync       bool   // Escape hatch to force old hourly full-sync behavior
 }
 
 // Cacher is the main protocol state cacher component
@@ -121,65 +126,143 @@ func NewCacher(cfg *Config) (*Cacher, error) {
 	return cacher, nil
 }
 
-// Start starts the cacher component background services
-// Note: Cold sync should be performed synchronously via WaitForColdSync() before calling Start()
+// Start starts the cacher background services. Event processing is handled by
+// the BlockPoller consumer; slot freshness is guaranteed by demand-driven
+// re-fetch on address mismatch. The only periodic task is the escape-hatch
+// full cold sync when ForceFullColdSync is set.
 func (c *Cacher) Start(ctx context.Context) {
 	log.Info("🚀 Starting protocol state cacher background services...")
 
-	// Start event-driven updates
-	go func() {
-		if err := c.eventProcessor.WatchEvents(); err != nil {
-			log.Errorf("Event processor error: %v", err)
-		}
-	}()
-
-	// Start periodic fallback cold sync
-	go c.periodicColdSync(ctx)
+	if c.config.ForceFullColdSync {
+		go c.periodicColdSync(ctx)
+	}
 
 	log.Info("✅ Protocol state cacher background services started")
 }
 
-// WaitForColdSync checks if cold sync is needed and waits for it to complete
-// Returns error if cold sync fails or context is cancelled
+// GetEventProcessor returns the event processor for BlockPoller registration.
+func (c *Cacher) GetEventProcessor() *EventProcessor {
+	return c.eventProcessor
+}
+
+// RedisKeyPrefix returns the prefix used for this cacher's Redis keys,
+// suitable for registering BlockPoller consumers.
+func (c *Cacher) RedisKeyPrefix() string {
+	return fmt.Sprintf("%s:%s", c.protocolStateAddr.Hex(), c.snapshotterStateAddr.Hex())
+}
+
+// WaitForColdSync performs smart startup sync decision:
+//   - If InitialComplete not set: full cold sync (first ever startup)
+//   - If InitialComplete set and ForceFullColdSync: full cold sync
+//   - If InitialComplete set and block gap is small: skip (BlockPoller will catch up)
+//   - If InitialComplete set and block gap is large or unknown: full cold sync
 func (c *Cacher) WaitForColdSync(ctx context.Context) error {
-	// Check if cold sync is needed
-	needsSync, err := c.needsColdSync(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to check cold sync status: %w", err)
+	if c.config.ForceFullColdSync {
+		log.Info("FORCE_FULL_COLD_SYNC=true - performing full cold sync")
+		return c.performFullColdSync(ctx)
 	}
 
-	if !needsSync {
-		lastSync, _ := c.getLastSyncTimestamp(ctx)
-		log.Infof("✅ Cold sync up to date (last sync: %s)", lastSync.Format(time.RFC3339))
+	initialComplete := c.isInitialComplete(ctx)
+
+	if !initialComplete {
+		log.Info("First startup detected (InitialComplete not set) - performing full cold sync")
+		if err := c.performFullColdSync(ctx); err != nil {
+			return err
+		}
+		c.setInitialComplete(ctx)
 		return nil
 	}
 
-	log.Info("⏳ Cold sync required - waiting for completion...")
+	// InitialComplete is set - check if we can skip cold sync
+	lastBlock, err := c.getPersistedSlotConsumerBlock(ctx)
+	if err != nil {
+		log.Warnf("Cannot read persisted slot consumer block (%v) - performing full cold sync", err)
+		return c.performFullColdSync(ctx)
+	}
 
-	// Perform synchronous cold sync
+	// Get current block to measure gap
+	currentBlock, err := c.config.RPCHelper.BlockNumber(ctx)
+	if err != nil {
+		log.Warnf("Cannot get current block (%v) - performing full cold sync", err)
+		return c.performFullColdSync(ctx)
+	}
+
+	threshold := c.config.EventGapThresholdBlocks
+	if threshold == 0 {
+		threshold = 5000
+	}
+
+	gap := uint64(0)
+	if currentBlock > lastBlock {
+		gap = currentBlock - lastBlock
+	}
+
+	if gap > threshold {
+		log.Warnf("Block gap too large (%d > threshold %d) - performing full cold sync", gap, threshold)
+		return c.performFullColdSync(ctx)
+	}
+
+	log.Infof("Smart startup: gap=%d blocks (threshold=%d), skipping cold sync - BlockPoller will catch up", gap, threshold)
+	return nil
+}
+
+// performFullColdSync executes a full cold sync and updates timestamps.
+func (c *Cacher) performFullColdSync(ctx context.Context) error {
+	log.Info("⏳ Cold sync required - waiting for completion...")
 	if err := c.coldSyncSync(ctx); err != nil {
 		return fmt.Errorf("cold sync failed: %w", err)
 	}
-
 	log.Info("✅ Cold sync completed successfully")
 	return nil
 }
 
-// needsColdSync checks if cold sync is needed based on last sync timestamp
+// isInitialComplete checks if the persistent InitialComplete flag is set.
+func (c *Cacher) isInitialComplete(ctx context.Context) bool {
+	key := fmt.Sprintf("%s:%s:ColdSync.InitialComplete",
+		c.protocolStateAddr.Hex(), c.snapshotterStateAddr.Hex())
+	val, err := c.config.RedisClient.Get(ctx, key).Result()
+	return err == nil && val == "true"
+}
+
+// setInitialComplete sets the persistent InitialComplete flag (no TTL).
+func (c *Cacher) setInitialComplete(ctx context.Context) {
+	key := fmt.Sprintf("%s:%s:ColdSync.InitialComplete",
+		c.protocolStateAddr.Hex(), c.snapshotterStateAddr.Hex())
+	if err := c.config.RedisClient.Set(ctx, key, "true", 0).Err(); err != nil {
+		log.Warnf("Failed to set InitialComplete flag: %v", err)
+	} else {
+		log.Info("Set ColdSync.InitialComplete persistent flag")
+	}
+}
+
+// getPersistedSlotConsumerBlock reads the BlockPoller's persisted block counter
+// for the slot event consumer.
+func (c *Cacher) getPersistedSlotConsumerBlock(ctx context.Context) (uint64, error) {
+	prefix := fmt.Sprintf("%s:%s", c.protocolStateAddr.Hex(), c.snapshotterStateAddr.Hex())
+	key := fmt.Sprintf("%s:BlockPoller.SlotEvents.LastBlock", prefix)
+	val, err := c.config.RedisClient.Get(ctx, key).Result()
+	if err != nil {
+		return 0, err
+	}
+	block, err := strconv.ParseUint(val, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid persisted block value: %w", err)
+	}
+	return block, nil
+}
+
+// needsColdSync checks if cold sync is needed based on last sync timestamp.
+// Kept for backward compatibility with WaitForColdSyncCompletion.
 func (c *Cacher) needsColdSync(ctx context.Context) (bool, error) {
 	lastSync, err := c.getLastSyncTimestamp(ctx)
 	if err != nil {
-		// No timestamp found = first time setup
 		return true, nil
 	}
-
-	// Check if last sync is older than the sync interval
 	age := time.Since(lastSync)
 	if age > c.config.SlotSyncInterval {
 		log.Warnf("Last cold sync was %v ago (threshold: %v) - sync required", age, c.config.SlotSyncInterval)
 		return true, nil
 	}
-
 	return false, nil
 }
 
@@ -276,7 +359,7 @@ func (c *Cacher) coldSyncSync(ctx context.Context) error {
 	return nil
 }
 
-// periodicColdSync performs periodic fallback cold sync
+// periodicColdSync performs periodic fallback cold sync (only used with ForceFullColdSync).
 func (c *Cacher) periodicColdSync(ctx context.Context) {
 	ticker := time.NewTicker(c.config.SlotSyncInterval)
 	defer ticker.Stop()
@@ -293,6 +376,7 @@ func (c *Cacher) periodicColdSync(ctx context.Context) {
 		}
 	}
 }
+
 
 // getTotalNodeCount gets the total node count from SnapshotterState contract
 func (c *Cacher) getTotalNodeCount(ctx context.Context) (uint64, error) {

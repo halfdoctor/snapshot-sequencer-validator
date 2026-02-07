@@ -146,8 +146,12 @@ type Settings struct {
 
 	// Protocol State Cacher Configuration
 	EnableProtocolStateCacher bool
-	SlotSyncInterval          time.Duration // Fallback cold sync interval
-	SlotSyncBatchSize         int           // Batch size for slot fetching // Validate snapshotter addresses against protocol state cache (requires protocol-state-cacher)
+	SlotSyncInterval          time.Duration // Interval for periodic node count check
+	SlotSyncBatchSize         int           // Batch size for slot fetching
+
+	// Smart Sync Configuration
+	EventGapThresholdBlocks uint64 // Block gap beyond which a full cold sync is triggered on startup (default: 5000)
+	ForceFullColdSync       bool   // If true, fallback to old hourly full cold sync behavior
 
 	// IPFS Configuration
 	IPFSAPI string // IPFS API endpoint (e.g., "/ip4/127.0.0.1/tcp/5001")
@@ -309,6 +313,10 @@ func LoadConfig() error {
 		EnableProtocolStateCacher: getBoolEnv("ENABLE_PROTOCOL_STATE_CACHER", false),
 		SlotSyncInterval:          time.Duration(getEnvAsInt("SLOT_SYNC_INTERVAL_SECONDS", 3600)) * time.Second,
 		SlotSyncBatchSize:         getEnvAsInt("SLOT_SYNC_BATCH_SIZE", 20),
+
+		// Smart Sync Configuration
+		EventGapThresholdBlocks: uint64(getEnvAsInt("EVENT_GAP_THRESHOLD_BLOCKS", 5000)),
+		ForceFullColdSync:       getBoolEnv("FORCE_FULL_COLD_SYNC", false),
 
 		// API Configuration
 		APIHost:      getEnv("API_HOST", "0.0.0.0"),

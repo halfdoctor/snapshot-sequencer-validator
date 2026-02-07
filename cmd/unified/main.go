@@ -26,6 +26,7 @@ import (
 	"github.com/multiformats/go-multiaddr"
 	rpchelper "github.com/powerloom/go-rpc-helper"
 	"github.com/powerloom/snapshot-sequencer-validator/config"
+	"github.com/powerloom/snapshot-sequencer-validator/pkgs/blockpoller"
 	"github.com/powerloom/snapshot-sequencer-validator/pkgs/consensus"
 	"github.com/powerloom/snapshot-sequencer-validator/pkgs/deduplication"
 	"github.com/powerloom/snapshot-sequencer-validator/pkgs/eventmonitor"
@@ -124,8 +125,9 @@ type UnifiedSequencer struct {
 	dequeuer     *submissions.Dequeuer
 	batchGen     *consensus.DummyBatchGenerator
 	eventMonitor *eventmonitor.EventMonitor
-	p2pConsensus *consensus.P2PConsensus // P2P consensus handler
-	cacher       *protocolstate.Cacher   // Protocol state cacher for accessing SlotManager
+	p2pConsensus *consensus.P2PConsensus   // P2P consensus handler
+	cacher       *protocolstate.Cacher     // Protocol state cacher for accessing SlotManager
+	blockPoll    *blockpoller.BlockPoller  // Shared block poller for all event consumers
 
 	// Configuration
 	config           *config.Settings
@@ -544,26 +546,51 @@ func main() {
 		}
 	}
 
-	// Initialize protocol state cacher if enabled (runs the cacher service)
-	if cfg.EnableProtocolStateCacher && redisClient != nil {
-		// Initialize RPC Helper for cacher
+	// --- Shared RPC Helper ---
+	// Create a single RPC helper shared by cacher, event monitor, and BlockPoller.
+	var sharedRPCHelper *rpchelper.RPCHelper
+	needsRPC := (cfg.EnableProtocolStateCacher || enableEventMonitor) && redisClient != nil
+	if needsRPC {
 		rpcConfig := cfg.ToRPCConfig()
 		if rpcConfig == nil || len(rpcConfig.Nodes) == 0 {
-			log.Fatal("POWERLOOM_RPC_NODES must be configured for protocol state cacher")
+			log.Fatal("POWERLOOM_RPC_NODES must be configured for protocol state cacher / event monitor")
 		}
-
-		rpcHelper := rpchelper.NewRPCHelper(rpcConfig)
-		if err := rpcHelper.Initialize(context.Background()); err != nil {
-			log.Fatalf("Failed to initialize RPC helper for protocol state cacher: %v", err)
+		if rpcConfig.RequestTimeout == 0 {
+			rpcConfig.RequestTimeout = 30 * time.Second
 		}
+		if rpcConfig.MaxRetries == 0 {
+			rpcConfig.MaxRetries = 3
+		}
+		sharedRPCHelper = rpchelper.NewRPCHelper(rpcConfig)
+		if err := sharedRPCHelper.Initialize(context.Background()); err != nil {
+			log.Fatalf("Failed to initialize shared RPC helper: %v", err)
+		}
+		log.Info("✅ Shared RPC helper initialized")
+	}
 
-		// Get SnapshotterState address from ProtocolState contract
+	// --- BlockPoller ---
+	// Create single BlockPoller when either cacher or event monitor is enabled.
+	if needsRPC {
+		bp, err := blockpoller.New(&blockpoller.Config{
+			RPCHelper:     sharedRPCHelper,
+			RedisClient:   redisClient,
+			PollInterval:  1 * time.Second,
+			MaxBlockRange: 1000,
+		})
+		if err != nil {
+			log.Fatalf("Failed to create BlockPoller: %v", err)
+		}
+		sequencer.blockPoll = bp
+		log.Info("✅ BlockPoller created (1s interval)")
+	}
+
+	// --- Protocol State Cacher ---
+	if cfg.EnableProtocolStateCacher && redisClient != nil {
 		var err error
 		if snapshotterStateAddr == (common.Address{}) {
-			// Only fetch if not already fetched above
 			snapshotterStateAddr, err = protocolstate.GetSnapshotterStateAddress(
 				context.Background(),
-				rpcHelper,
+				sharedRPCHelper,
 				cfg.ProtocolStateContract,
 				cfg.ContractABIPath,
 			)
@@ -573,38 +600,53 @@ func main() {
 		}
 		log.Infof("✅ SnapshotterState contract address: %s", snapshotterStateAddr.Hex())
 
-		// Initialize cacher
 		cacherCfg := &protocolstate.Config{
-			RPCHelper:                rpcHelper,
+			RPCHelper:                sharedRPCHelper,
 			ProtocolStateContract:    cfg.ProtocolStateContract,
 			SnapshotterStateContract: snapshotterStateAddr.Hex(),
 			ContractABIPath:          cfg.ContractABIPath,
 			RedisClient:              redisClient,
 			SlotSyncInterval:         cfg.SlotSyncInterval,
 			SlotSyncBatchSize:        cfg.SlotSyncBatchSize,
+			EventGapThresholdBlocks:  cfg.EventGapThresholdBlocks,
+			ForceFullColdSync:        cfg.ForceFullColdSync,
 		}
 
 		cacher, err := protocolstate.NewCacher(cacherCfg)
 		if err != nil {
 			log.Fatalf("Failed to create protocol state cacher: %v", err)
 		}
-
-		// Store cacher reference for accessing SlotManager
 		sequencer.cacher = cacher
 
-		// Perform initial cold sync synchronously
 		log.Info("🔄 Starting protocol state cacher cold sync...")
 		if err := cacher.WaitForColdSync(context.Background()); err != nil {
 			log.Fatalf("Cold sync failed: %v", err)
 		}
 
-		// Start cacher background services (event processor, periodic sync)
+		// Register slot event processor as BlockPoller consumer
+		ep := cacher.GetEventProcessor()
+		snapshotterChangedSig, nodeMintedSig, nodeBurnedSig := ep.EventSignatures()
+		slotQueries := []blockpoller.FilterQuery{
+			{Addresses: []common.Address{ep.ContractAddress()}, Topics: [][]common.Hash{{snapshotterChangedSig}}},
+			{Addresses: []common.Address{ep.ContractAddress()}, Topics: [][]common.Hash{{nodeMintedSig}}},
+			{Addresses: []common.Address{ep.ContractAddress()}, Topics: [][]common.Hash{{nodeBurnedSig}}},
+		}
+		slotConsumer := sequencer.blockPoll.RegisterConsumer(
+			"SlotEvents", slotQueries, ep.HandleBlockPollerLogs, 1,
+			cacher.RedisKeyPrefix(),
+		)
+
+		// Initialize consumer start block if no persisted value
+		if currentBlock, err := sharedRPCHelper.BlockNumber(context.Background()); err == nil && currentBlock > 0 {
+			sequencer.blockPoll.InitializeConsumerBlock(slotConsumer, currentBlock-1)
+		}
+
 		sequencer.wg.Add(1)
 		go func() {
 			defer sequencer.wg.Done()
 			cacher.Start(sequencer.ctx)
 		}()
-		log.Info("✅ Protocol state cacher component started")
+		log.Info("✅ Protocol state cacher started")
 	}
 
 	// Initialize spam protection components (if enabled)
@@ -657,32 +699,12 @@ func main() {
 	}
 
 	if enableEventMonitor && redisClient != nil {
-		// Initialize RPC Helper with Powerloom chain config
-		rpcConfig := cfg.ToRPCConfig()
-		if rpcConfig == nil || len(rpcConfig.Nodes) == 0 {
-			log.Fatal("POWERLOOM_RPC_NODES must be configured for event monitoring")
-		}
-
-		// Set default timeouts if not configured
-		if rpcConfig.RequestTimeout == 0 {
-			rpcConfig.RequestTimeout = 30 * time.Second
-		}
-		if rpcConfig.MaxRetries == 0 {
-			rpcConfig.MaxRetries = 3
-		}
-
-		rpcHelper := rpchelper.NewRPCHelper(rpcConfig)
-		if err := rpcHelper.Initialize(context.Background()); err != nil {
-			log.Fatalf("Failed to initialize RPC helper: %v", err)
-		}
-
-		// Create event monitor config
 		monitorCfg := &eventmonitor.Config{
-			RPCHelper:             rpcHelper,
+			RPCHelper:             sharedRPCHelper,
 			ContractAddress:       cfg.ProtocolStateContract,
 			ContractABIPath:       cfg.ContractABIPath,
 			RedisClient:           redisClient,
-			WindowDuration:        cfg.Level1FinalizationDelay, // Fallback delay when commit/reveal disabled
+			WindowDuration:        cfg.Level1FinalizationDelay,
 			StartBlock:            cfg.EventStartBlock,
 			PollInterval:          cfg.EventPollInterval,
 			DataMarkets:           cfg.DataMarketAddresses,
@@ -692,12 +714,12 @@ func main() {
 			// VPA Configuration
 			VPAContractAddress:  cfg.VPAContractAddress,
 			VPAValidatorAddress: cfg.VPAValidatorAddress,
-			VPARPCURL:           strings.Join(cfg.RPCNodes, ","), // Use RPCNodes from config
+			VPARPCURL:           strings.Join(cfg.RPCNodes, ","),
 			ProtocolState:       cfg.ProtocolStateContract,
 
 			// Window Config Configuration
-			WindowConfigCacheTTL: 5 * time.Minute, // Default cache TTL
-			EstimatedMaxPriority: 10,              // Default safe upper bound for total window calculation
+			WindowConfigCacheTTL: 5 * time.Minute,
+			EstimatedMaxPriority: 10,
 
 			// Spam protection components
 			SpamComponents: spamComponents,
@@ -707,8 +729,29 @@ func main() {
 		sequencer.eventMonitor, err = eventmonitor.NewEventMonitor(monitorCfg)
 		if err != nil {
 			log.Errorf("Failed to create event monitor: %v", err)
-			// Don't fail completely, just disable event monitor
 			sequencer.enableEventMonitor = false
+		} else if sequencer.blockPoll != nil {
+			// Register event monitor as BlockPoller consumer
+			bpQueries := sequencer.eventMonitor.GetBlockPollerQueries()
+			pollerQueries := make([]blockpoller.FilterQuery, 0, len(bpQueries))
+			for _, q := range bpQueries {
+				pollerQueries = append(pollerQueries, blockpoller.FilterQuery{
+					Addresses: q.Addresses,
+					Topics:    q.Topics,
+				})
+			}
+
+			redisPrefix := cfg.ProtocolStateContract
+			emConsumer := sequencer.blockPoll.RegisterConsumer(
+				"EventMonitor", pollerQueries, sequencer.eventMonitor.HandleBlockPollerLogs, 1,
+				redisPrefix,
+			)
+
+			// Initialize consumer start block if no persisted value
+			if currentBlock, err := sharedRPCHelper.BlockNumber(context.Background()); err == nil && currentBlock > 0 {
+				sequencer.blockPoll.InitializeConsumerBlock(emConsumer, currentBlock-1)
+			}
+			log.Info("✅ Event monitor registered as BlockPoller consumer")
 		}
 	}
 
@@ -722,6 +765,9 @@ func main() {
 
 	componentPrefix := strings.ToUpper(sequencer.primaryComponent)
 	log.Infof("[%s] Shutting down %s component", componentPrefix, componentPrefix)
+	if sequencer.blockPoll != nil {
+		sequencer.blockPoll.Stop()
+	}
 	cancel()
 	sequencer.wg.Wait()
 }
@@ -786,13 +832,26 @@ func (s *UnifiedSequencer) Start() {
 		}()
 	}
 
-	// Start event monitor component
+	// Start BlockPoller (shared by cacher + event monitor)
+	if s.blockPoll != nil {
+		log.Infof("[%s] Starting BlockPoller...", componentPrefix)
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+			s.blockPoll.Start()
+		}()
+	}
+
+	// Start event monitor component (log dispatch handled by BlockPoller)
 	if s.enableEventMonitor && s.eventMonitor != nil {
 		log.Infof("[%s] Starting Event Monitor component...", componentPrefix)
 		s.wg.Add(1)
 		go func() {
 			defer s.wg.Done()
-			s.runEventMonitor()
+			if err := s.eventMonitor.Start(); err != nil {
+				log.Errorf("Event monitor startup error: %v", err)
+			}
+			<-s.ctx.Done()
 		}()
 	}
 
@@ -2167,17 +2226,3 @@ func (s *UnifiedSequencer) isValidDataMarket(dataMarketAddr string) bool {
 	return false
 }
 
-func (s *UnifiedSequencer) runEventMonitor() {
-	log.Info("🔍 Starting event monitor for EpochReleased events")
-
-	// Start monitoring - this will handle submission windows
-	if err := s.eventMonitor.Start(); err != nil {
-		log.Errorf("Event monitor failed: %v", err)
-		return
-	}
-
-	// Wait for context cancellation
-	<-s.ctx.Done()
-	s.eventMonitor.Stop()
-	log.Info("Event monitor stopped")
-}

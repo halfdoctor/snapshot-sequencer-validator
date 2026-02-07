@@ -10,7 +10,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
@@ -382,23 +381,163 @@ func NewEventMonitor(cfg *Config) (*EventMonitor, error) {
 	}, nil
 }
 
-// Start begins monitoring for events
+// Start launches the event processing goroutines. Log dispatch is handled
+// by the BlockPoller via HandleBlockPollerLogs; this method only starts the
+// channel consumers that act on parsed events.
 func (m *EventMonitor) Start() error {
 	log.Info("🚀 Starting event monitor...")
 
-	// Start event processor
 	go m.processEvents()
 
-	// Start VPA event processor if enabled
 	if m.vpaEnabled {
 		go m.processVPAEvents()
 		log.Info("✅ VPA event processor started")
 	}
 
-	// Start block poller
-	go m.pollBlocks()
-
 	return nil
+}
+
+// GetBlockPollerQueries returns the FilterQuery configurations that the
+// BlockPoller should run for this consumer. Callers use this to register
+// the event monitor as a BlockPoller consumer.
+func (m *EventMonitor) GetBlockPollerQueries() []struct {
+	Addresses []common.Address
+	Topics    [][]common.Hash
+} {
+	queries := make([]struct {
+		Addresses []common.Address
+		Topics    [][]common.Hash
+	}, 0, 3)
+
+	// EpochReleased from ProtocolState
+	queries = append(queries, struct {
+		Addresses []common.Address
+		Topics    [][]common.Hash
+	}{
+		Addresses: []common.Address{m.contractAddr},
+		Topics:    [][]common.Hash{{m.epochReleasedSig}},
+	})
+
+	// PrioritiesAssigned from VPA contract
+	if m.vpaEnabled && m.vpaContractAddr != (common.Address{}) {
+		queries = append(queries, struct {
+			Addresses []common.Address
+			Topics    [][]common.Hash
+		}{
+			Addresses: []common.Address{m.vpaContractAddr},
+			Topics:    [][]common.Hash{{m.prioritiesAssignedSig}},
+		})
+	}
+
+	// SubmissionWindowConfigUpdated from DataMarket contracts
+	if m.windowConfigFetcher != nil && len(m.dataMarkets) > 0 && m.submissionWindowConfigUpdatedSig != (common.Hash{}) {
+		addresses := make([]common.Address, 0, len(m.dataMarkets))
+		for _, addr := range m.dataMarkets {
+			addresses = append(addresses, common.HexToAddress(addr))
+		}
+		queries = append(queries, struct {
+			Addresses []common.Address
+			Topics    [][]common.Hash
+		}{
+			Addresses: addresses,
+			Topics:    [][]common.Hash{{m.submissionWindowConfigUpdatedSig}},
+		})
+	}
+
+	return queries
+}
+
+// HandleBlockPollerLogs processes logs received from the BlockPoller.
+// It dispatches each log to the appropriate handler based on event signature,
+// applying stale epoch filtering for time-sensitive events.
+func (m *EventMonitor) HandleBlockPollerLogs(logs []types.Log, currentBlock uint64) {
+	for _, vLog := range logs {
+		if len(vLog.Topics) == 0 {
+			continue
+		}
+		sig := vLog.Topics[0]
+
+		switch sig {
+		case m.epochReleasedSig:
+			event := m.parseEpochReleasedEvent(vLog)
+			if event == nil {
+				continue
+			}
+			if !m.isValidDataMarket(event.DataMarketAddress.Hex()) {
+				continue
+			}
+			// Stale epoch filtering: skip submission pipeline if epoch is too old
+			eventAge := currentBlock - event.BlockNumber
+			staleThreshold := m.getStaleEpochThreshold(event.DataMarketAddress.Hex())
+			if eventAge > staleThreshold {
+				log.Infof("Stale epoch %s for market %s (age=%d blocks, threshold=%d) - recording only",
+					event.EpochID, event.DataMarketAddress.Hex(), eventAge, staleThreshold)
+				m.recordStaleEpoch(event)
+				continue
+			}
+			m.eventChan <- event
+
+		case m.prioritiesAssignedSig:
+			if !m.vpaEnabled {
+				continue
+			}
+			event := m.parsePrioritiesAssignedEvent(vLog)
+			if event == nil {
+				continue
+			}
+			if !m.isValidDataMarket(event.DataMarket.Hex()) {
+				continue
+			}
+			// Stale priority filtering: skip if epoch too old
+			eventAge := currentBlock - event.BlockNumber
+			staleThreshold := m.getStaleEpochThreshold(event.DataMarket.Hex())
+			if eventAge > staleThreshold {
+				log.Debugf("Stale priorities for epoch %s (age=%d blocks) - skipping", event.EpochID, eventAge)
+				continue
+			}
+			m.vpaEventChan <- event
+
+		case m.submissionWindowConfigUpdatedSig:
+			dataMarketAddr := vLog.Address.Hex()
+			if m.windowConfigFetcher != nil && m.isValidDataMarket(dataMarketAddr) {
+				m.windowConfigFetcher.InvalidateCache(dataMarketAddr)
+			}
+		}
+	}
+}
+
+// getStaleEpochThreshold returns the block age beyond which an EpochReleased event
+// should be considered stale for a given data market. It uses the P1 submission window
+// from the cached window config (1 block ~= 1 second on the anchor chain).
+func (m *EventMonitor) getStaleEpochThreshold(dataMarketAddr string) uint64 {
+	if m.windowConfigFetcher != nil {
+		config, err := m.windowConfigFetcher.FetchWindowConfig(m.ctx, dataMarketAddr)
+		if err == nil && config != nil && config.P1SubmissionWindow != nil {
+			p1 := config.P1SubmissionWindow.Uint64()
+			if p1 > 0 {
+				return p1
+			}
+		}
+	}
+	// Fallback: use window duration converted to ~blocks (1 block/sec)
+	return uint64(m.windowDuration.Seconds())
+}
+
+// recordStaleEpoch logs a stale epoch event to Redis timeline for monitoring
+// without triggering the submission pipeline.
+func (m *EventMonitor) recordStaleEpoch(event *EpochReleasedEvent) {
+	dataMarketAddr := event.DataMarketAddress.Hex()
+	kb := m.windowManager.getKeyBuilder(dataMarketAddr)
+	timestamp := time.Now().Unix()
+
+	pipe := m.redisClient.Pipeline()
+	pipe.ZAdd(m.ctx, kb.MetricsEpochsTimeline(), redis.Z{
+		Score:  float64(timestamp),
+		Member: fmt.Sprintf("stale:%s", event.EpochID.String()),
+	})
+	if _, err := pipe.Exec(m.ctx); err != nil {
+		log.Debugf("Failed to record stale epoch %s: %v", event.EpochID, err)
+	}
 }
 
 // Stop gracefully shuts down the monitor
@@ -408,166 +547,6 @@ func (m *EventMonitor) Stop() {
 	m.windowManager.Shutdown()
 }
 
-// pollBlocks continuously polls for new blocks and events
-func (m *EventMonitor) pollBlocks() {
-	ticker := time.NewTicker(m.pollInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-m.ctx.Done():
-			return
-		case <-ticker.C:
-			m.checkForNewEvents()
-		}
-	}
-}
-
-// checkForNewEvents queries for new EpochReleased and PrioritiesAssigned events
-func (m *EventMonitor) checkForNewEvents() {
-	// Get current block
-	currentBlock, err := m.rpcHelper.BlockNumber(m.ctx)
-	if err != nil {
-		log.Errorf("Failed to get current block: %v", err)
-		return
-	}
-
-	// Check for legacy EpochReleased events
-	m.checkForEpochReleasedEvents(currentBlock)
-
-	// Check for VPA PrioritiesAssigned events if enabled
-	if m.vpaEnabled {
-		m.checkForPrioritiesAssignedEvents(currentBlock)
-	}
-
-	// Check for SubmissionWindowConfigUpdated on data markets (invalidate window config cache)
-	if m.windowConfigFetcher != nil && len(m.dataMarkets) > 0 {
-		m.checkForSubmissionWindowConfigUpdatedEvents(currentBlock)
-	}
-}
-
-// checkForEpochReleasedEvents queries for new EpochReleased events from protocol state contract
-func (m *EventMonitor) checkForEpochReleasedEvents(currentBlock uint64) {
-	// Don't scan if we're already up to date
-	if m.lastProcessedBlock >= currentBlock {
-		return
-	}
-
-	// Limit scan range to avoid overwhelming the node
-	toBlock := m.lastProcessedBlock + 1000
-	if toBlock > currentBlock {
-		toBlock = currentBlock
-	}
-
-	// Use cached event signature (computed once at startup)
-	query := ethereum.FilterQuery{
-		FromBlock: big.NewInt(int64(m.lastProcessedBlock + 1)),
-		ToBlock:   big.NewInt(int64(toBlock)),
-		Addresses: []common.Address{m.contractAddr},
-		Topics:    [][]common.Hash{{m.epochReleasedSig}},
-	}
-
-	logs, err := m.rpcHelper.FilterLogs(m.ctx, query)
-	if err != nil {
-		log.Errorf("Failed to filter EpochReleased logs: %v", err)
-		return
-	}
-
-	for _, vLog := range logs {
-		event := m.parseEpochReleasedEvent(vLog)
-		if event != nil {
-			// Only process events for configured data markets
-			if m.isValidDataMarket(event.DataMarketAddress.Hex()) {
-				m.eventChan <- event
-			}
-		}
-	}
-
-	m.lastProcessedBlock = toBlock
-}
-
-// checkForPrioritiesAssignedEvents queries for new PrioritiesAssigned events from VPA contract
-func (m *EventMonitor) checkForPrioritiesAssignedEvents(currentBlock uint64) {
-	// Don't scan if we're already up to date
-	if m.lastProcessedVPABlock >= currentBlock {
-		return
-	}
-
-	// Limit scan range to avoid overwhelming the node
-	toBlock := m.lastProcessedVPABlock + 1000
-	if toBlock > currentBlock {
-		toBlock = currentBlock
-	}
-
-	// Use cached VPA event signature
-	query := ethereum.FilterQuery{
-		FromBlock: big.NewInt(int64(m.lastProcessedVPABlock + 1)),
-		ToBlock:   big.NewInt(int64(toBlock)),
-		Addresses: []common.Address{m.vpaContractAddr},
-		Topics:    [][]common.Hash{{m.prioritiesAssignedSig}},
-	}
-
-	logs, err := m.rpcHelper.FilterLogs(m.ctx, query)
-	if err != nil {
-		log.Errorf("Failed to filter PrioritiesAssigned logs: %v", err)
-		return
-	}
-
-	for _, vLog := range logs {
-		event := m.parsePrioritiesAssignedEvent(vLog)
-		if event != nil {
-			// Only process events for configured data markets
-			if m.isValidDataMarket(event.DataMarket.Hex()) {
-				m.vpaEventChan <- event
-			}
-		}
-	}
-
-	m.lastProcessedVPABlock = toBlock
-}
-
-// checkForSubmissionWindowConfigUpdatedEvents queries DataMarket contracts for SubmissionWindowConfigUpdated
-// and invalidates the window config cache so the next EpochReleased uses fresh config.
-func (m *EventMonitor) checkForSubmissionWindowConfigUpdatedEvents(currentBlock uint64) {
-	if m.windowConfigFetcher == nil || len(m.dataMarkets) == 0 || m.submissionWindowConfigUpdatedSig == (common.Hash{}) {
-		return
-	}
-	if m.lastProcessedWindowConfigBlock >= currentBlock {
-		return
-	}
-
-	toBlock := m.lastProcessedWindowConfigBlock + 1000
-	if toBlock > currentBlock {
-		toBlock = currentBlock
-	}
-
-	addresses := make([]common.Address, 0, len(m.dataMarkets))
-	for _, addr := range m.dataMarkets {
-		addresses = append(addresses, common.HexToAddress(addr))
-	}
-
-	query := ethereum.FilterQuery{
-		FromBlock: big.NewInt(int64(m.lastProcessedWindowConfigBlock + 1)),
-		ToBlock:   big.NewInt(int64(toBlock)),
-		Addresses: addresses,
-		Topics:    [][]common.Hash{{m.submissionWindowConfigUpdatedSig}},
-	}
-
-	logs, err := m.rpcHelper.FilterLogs(m.ctx, query)
-	if err != nil {
-		log.Errorf("Failed to filter SubmissionWindowConfigUpdated logs: %v", err)
-		return
-	}
-
-	for _, vLog := range logs {
-		dataMarketAddr := vLog.Address.Hex()
-		if m.isValidDataMarket(dataMarketAddr) {
-			m.windowConfigFetcher.InvalidateCache(dataMarketAddr)
-		}
-	}
-
-	m.lastProcessedWindowConfigBlock = toBlock
-}
 
 // parseEpochReleasedEvent parses the log into an EpochReleasedEvent
 func (m *EventMonitor) parseEpochReleasedEvent(vLog types.Log) *EpochReleasedEvent {

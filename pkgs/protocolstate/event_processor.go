@@ -6,7 +6,6 @@ import (
 	"math/big"
 	"time"
 
-	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
@@ -30,10 +29,66 @@ type EventProcessor struct {
 	lastProcessedBlock uint64
 	pollInterval       time.Duration
 
-	// Event signatures (cached)
+	// Event signatures (cached, exported for BlockPoller registration)
 	snapshotterChangedSig common.Hash
 	nodeMintedSig         common.Hash
 	nodeBurnedSig         common.Hash
+}
+
+// EventSignatures returns the cached event signature hashes so callers (e.g.
+// BlockPoller) can build FilterQuery entries without re-computing them.
+func (ep *EventProcessor) EventSignatures() (snapshotterChanged, nodeMinted, nodeBurned common.Hash) {
+	return ep.snapshotterChangedSig, ep.nodeMintedSig, ep.nodeBurnedSig
+}
+
+// ContractAddress returns the SnapshotterState contract address monitored by
+// this processor, for use in BlockPoller consumer registration.
+func (ep *EventProcessor) ContractAddress() common.Address {
+	return ep.snapshotterStateAddr
+}
+
+// HandleBlockPollerLogs processes logs delivered by the BlockPoller. Each log
+// is dispatched based on its event signature. This replaces the internal
+// polling loop when the BlockPoller is in use.
+func (ep *EventProcessor) HandleBlockPollerLogs(logs []types.Log, _ uint64) {
+	for _, vLog := range logs {
+		if len(vLog.Topics) == 0 {
+			continue
+		}
+		sig := vLog.Topics[0]
+
+		switch sig {
+		case ep.snapshotterChangedSig:
+			event, err := ep.parseSnapshotterAddressChanged(vLog)
+			if err != nil {
+				log.Errorf("Failed to parse SnapshotterAddressChanged event: %v", err)
+				continue
+			}
+			if event != nil {
+				ep.handleSnapshotterAddressChanged(event)
+			}
+
+		case ep.nodeMintedSig:
+			event, err := ep.parseNodeMinted(vLog)
+			if err != nil {
+				log.Errorf("Failed to parse NodeMinted event: %v", err)
+				continue
+			}
+			if event != nil {
+				ep.handleNodeMinted(event)
+			}
+
+		case ep.nodeBurnedSig:
+			event, err := ep.parseNodeBurned(vLog)
+			if err != nil {
+				log.Errorf("Failed to parse NodeBurned event: %v", err)
+				continue
+			}
+			if event != nil {
+				ep.handleNodeBurned(event)
+			}
+		}
+	}
 }
 
 // NewEventProcessor creates a new event processor
@@ -74,140 +129,6 @@ func NewEventProcessor(
 	}
 }
 
-// WatchEvents polls for SnapshotterState contract events and updates cache reactively
-func (ep *EventProcessor) WatchEvents() error {
-	log.Info("Starting event-driven slot cache updates (polling mode)...")
-	log.Infof("   Polling interval: %v", ep.pollInterval)
-	log.Infof("   Starting from block: %d", ep.lastProcessedBlock)
-
-	ticker := time.NewTicker(ep.pollInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ep.ctx.Done():
-			log.Info("Event processor stopped (context cancelled)")
-			return nil
-		case <-ticker.C:
-			ep.pollForEvents()
-		}
-	}
-}
-
-// pollForEvents queries for new events using FilterLogs (polling-based, works with all RPC nodes)
-func (ep *EventProcessor) pollForEvents() {
-	// Get current block
-	currentBlock, err := ep.rpcHelper.BlockNumber(ep.ctx)
-	if err != nil {
-		log.Errorf("Failed to get current block: %v", err)
-		return
-	}
-
-	// Don't scan if we're already up to date
-	if ep.lastProcessedBlock >= currentBlock {
-		return
-	}
-
-	// Limit scan range to avoid overwhelming the node
-	toBlock := ep.lastProcessedBlock + 1000
-	if toBlock > currentBlock {
-		toBlock = currentBlock
-	}
-
-	contractAddr := ep.snapshotterStateAddr
-
-	// Query for SnapshotterAddressChanged events
-	ep.querySnapshotterAddressChanged(contractAddr, ep.lastProcessedBlock+1, toBlock)
-
-	// Query for NodeMinted events
-	ep.queryNodeMinted(contractAddr, ep.lastProcessedBlock+1, toBlock)
-
-	// Query for NodeBurned events
-	ep.queryNodeBurned(contractAddr, ep.lastProcessedBlock+1, toBlock)
-
-	ep.lastProcessedBlock = toBlock
-}
-
-// querySnapshotterAddressChanged queries for SnapshotterAddressChanged events
-func (ep *EventProcessor) querySnapshotterAddressChanged(contractAddr common.Address, fromBlock, toBlock uint64) {
-	query := ethereum.FilterQuery{
-		FromBlock: big.NewInt(int64(fromBlock)),
-		ToBlock:   big.NewInt(int64(toBlock)),
-		Addresses: []common.Address{contractAddr},
-		Topics:    [][]common.Hash{{ep.snapshotterChangedSig}},
-	}
-
-	logs, err := ep.rpcHelper.FilterLogs(ep.ctx, query)
-	if err != nil {
-		log.Errorf("Failed to filter SnapshotterAddressChanged logs: %v", err)
-		return
-	}
-
-	for _, vLog := range logs {
-		event, err := ep.parseSnapshotterAddressChanged(vLog)
-		if err != nil {
-			log.Errorf("Failed to parse SnapshotterAddressChanged event: %v", err)
-			continue
-		}
-		if event != nil {
-			ep.handleSnapshotterAddressChanged(event)
-		}
-	}
-}
-
-// queryNodeMinted queries for NodeMinted events
-func (ep *EventProcessor) queryNodeMinted(contractAddr common.Address, fromBlock, toBlock uint64) {
-	query := ethereum.FilterQuery{
-		FromBlock: big.NewInt(int64(fromBlock)),
-		ToBlock:   big.NewInt(int64(toBlock)),
-		Addresses: []common.Address{contractAddr},
-		Topics:    [][]common.Hash{{ep.nodeMintedSig}},
-	}
-
-	logs, err := ep.rpcHelper.FilterLogs(ep.ctx, query)
-	if err != nil {
-		log.Errorf("Failed to filter NodeMinted logs: %v", err)
-		return
-	}
-
-	for _, vLog := range logs {
-		event, err := ep.parseNodeMinted(vLog)
-		if err != nil {
-			log.Errorf("Failed to parse NodeMinted event: %v", err)
-			continue
-		}
-		if event != nil {
-			ep.handleNodeMinted(event)
-		}
-	}
-}
-
-// queryNodeBurned queries for NodeBurned events
-func (ep *EventProcessor) queryNodeBurned(contractAddr common.Address, fromBlock, toBlock uint64) {
-	query := ethereum.FilterQuery{
-		FromBlock: big.NewInt(int64(fromBlock)),
-		ToBlock:   big.NewInt(int64(toBlock)),
-		Addresses: []common.Address{contractAddr},
-		Topics:    [][]common.Hash{{ep.nodeBurnedSig}},
-	}
-
-	logs, err := ep.rpcHelper.FilterLogs(ep.ctx, query)
-	if err != nil {
-		log.Errorf("Failed to filter NodeBurned logs: %v", err)
-		return
-	}
-
-	for _, vLog := range logs {
-		event, err := ep.parseNodeBurned(vLog)
-		if err != nil {
-			log.Errorf("Failed to parse NodeBurned event: %v", err)
-			continue
-		}
-		if event != nil {
-			ep.handleNodeBurned(event)
-		}
-	}
-}
 
 // parseSnapshotterAddressChanged parses a log into SnapshotterAddressChanged event
 func (ep *EventProcessor) parseSnapshotterAddressChanged(vLog types.Log) (*contract.SnapshotterStateContractSnapshotterAddressChanged, error) {

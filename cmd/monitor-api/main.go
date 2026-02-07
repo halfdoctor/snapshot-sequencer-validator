@@ -13,12 +13,14 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	rpchelper "github.com/powerloom/go-rpc-helper"
 	"github.com/redis/go-redis/v9"
 	"github.com/sirupsen/logrus"
 	swaggerFiles "github.com/swaggo/files"
 	ginSwagger "github.com/swaggo/gin-swagger"
 
 	_ "github.com/powerloom/snapshot-sequencer-validator/docs/swagger"
+	"github.com/powerloom/snapshot-sequencer-validator/pkgs/protocolstate"
 	keys "github.com/powerloom/snapshot-sequencer-validator/pkgs/redis"
 	"github.com/powerloom/snapshot-sequencer-validator/pkgs/utils"
 )
@@ -31,11 +33,12 @@ var log = logrus.New()
 // @BasePath /api/v1
 
 type MonitorAPI struct {
-	redis         *redis.Client
-	ctx           context.Context
-	keyBuilder    *keys.KeyBuilder
-	dataMarket    string // First data market address for VPA endpoints (from DATA_MARKET_ADDRESSES)
-	protocolState string // Protocol state contract address for VPA endpoints
+	redis            *redis.Client
+	ctx              context.Context
+	keyBuilder       *keys.KeyBuilder
+	dataMarket       string // First data market address for VPA endpoints (from DATA_MARKET_ADDRESSES)
+	protocolState    string // Protocol state contract address for VPA endpoints
+	snapshotterState string // SnapshotterState contract address (derived from ProtocolState at startup)
 }
 
 // DashboardSummary provides overall system health and metrics
@@ -208,24 +211,23 @@ type HeartbeatsResponse struct {
 	Timestamp  time.Time       `json:"timestamp"`
 }
 
-func NewMonitorAPI(redisClient *redis.Client, protocol, market string) *MonitorAPI {
-	// Get protocol state contract and first data market for VPA endpoints
+func NewMonitorAPI(redisClient *redis.Client, protocol, market, snapshotterState string) *MonitorAPI {
 	protocolState := getEnv("PROTOCOL_STATE_CONTRACT", "")
 	dataMarketsStr := getEnv("DATA_MARKET_ADDRESSES", "")
 	var dataMarket string
 	if dataMarketsStr != "" {
-		// Use first data market address
 		markets := strings.Split(dataMarketsStr, ",")
 		if len(markets) > 0 {
 			dataMarket = strings.TrimSpace(markets[0])
 		}
 	}
 	return &MonitorAPI{
-		redis:         redisClient,
-		ctx:           context.Background(),
-		keyBuilder:    keys.NewKeyBuilder(protocol, market),
-		dataMarket:    dataMarket,
-		protocolState: protocolState,
+		redis:            redisClient,
+		ctx:              context.Background(),
+		keyBuilder:       keys.NewKeyBuilder(protocol, market),
+		dataMarket:       dataMarket,
+		protocolState:    protocolState,
+		snapshotterState: snapshotterState,
 	}
 }
 
@@ -3572,6 +3574,63 @@ func (m *MonitorAPI) parseHeartbeatFromEntityID(entityID string, timestamp int64
 	return hb
 }
 
+// ProtocolStateSyncStatus returns the current sync status of the BlockPoller
+// consumers and the ColdSync state. All data is read from Redis using exact
+// keys constructed from protocolState and snapshotterState addresses.
+//
+// @Summary Get protocol state sync status
+// @Description Returns BlockPoller consumer block positions and cold sync state
+// @Tags protocol-state
+// @Produce json
+// @Success 200 {object} map[string]interface{}
+// @Router /protocol-state/sync-status [get]
+func (m *MonitorAPI) ProtocolStateSyncStatus(c *gin.Context) {
+	ctx := m.ctx
+
+	if m.protocolState == "" || m.snapshotterState == "" {
+		c.JSON(http.StatusOK, gin.H{
+			"error":     "snapshotterState address not available - POWERLOOM_RPC_NODES and PROTOCOL_STATE_ABI_PATH required",
+			"timestamp": time.Now(),
+		})
+		return
+	}
+
+	cacherPrefix := fmt.Sprintf("%s:%s", m.protocolState, m.snapshotterState)
+
+	// Read exact BlockPoller consumer keys
+	consumers := make(map[string]interface{})
+
+	// SlotEvents consumer (prefix = cacherPrefix)
+	slotEventsKey := fmt.Sprintf("%s:BlockPoller.SlotEvents.LastBlock", cacherPrefix)
+	if val, err := m.redis.Get(ctx, slotEventsKey).Result(); err == nil {
+		block, _ := strconv.ParseUint(val, 10, 64)
+		consumers["SlotEvents"] = gin.H{"last_block": block}
+	}
+
+	// EventMonitor consumer (prefix = protocolState)
+	eventMonitorKey := fmt.Sprintf("%s:BlockPoller.EventMonitor.LastBlock", m.protocolState)
+	if val, err := m.redis.Get(ctx, eventMonitorKey).Result(); err == nil {
+		block, _ := strconv.ParseUint(val, 10, 64)
+		consumers["EventMonitor"] = gin.H{"last_block": block}
+	}
+
+	// ColdSync.InitialComplete
+	initialCompleteKey := fmt.Sprintf("%s:ColdSync.InitialComplete", cacherPrefix)
+	initialCompleteVal, _ := m.redis.Get(ctx, initialCompleteKey).Result()
+	initialComplete := initialCompleteVal == "true"
+
+	// ColdSync.LastSyncTimestamp
+	lastSyncKey := fmt.Sprintf("%s:ColdSync.LastSyncTimestamp", cacherPrefix)
+	lastSyncTimestamp, _ := m.redis.Get(ctx, lastSyncKey).Result()
+
+	c.JSON(http.StatusOK, gin.H{
+		"consumers":             consumers,
+		"initial_sync_complete": initialComplete,
+		"last_cold_sync":        lastSyncTimestamp,
+		"timestamp":             time.Now(),
+	})
+}
+
 func main() {
 	// Configure logger
 	log.SetFormatter(&logrus.JSONFormatter{})
@@ -3629,8 +3688,46 @@ func main() {
 		"market":   market,
 	}).Info("Monitor API connected to Redis")
 
+	// Derive SnapshotterState address from ProtocolState contract
+	var snapshotterState string
+	rpcNodesEnv := getEnv("POWERLOOM_RPC_NODES", "")
+	abiPath := getEnv("PROTOCOL_STATE_ABI_PATH", "")
+	if rpcNodesEnv != "" && abiPath != "" {
+		var rpcURLs []string
+		if strings.HasPrefix(rpcNodesEnv, "[") {
+			_ = json.Unmarshal([]byte(rpcNodesEnv), &rpcURLs)
+		} else {
+			rpcURLs = strings.Split(rpcNodesEnv, ",")
+		}
+		if len(rpcURLs) > 0 {
+			nodes := make([]rpchelper.NodeConfig, len(rpcURLs))
+			for i, u := range rpcURLs {
+				nodes[i] = rpchelper.NodeConfig{URL: strings.TrimSpace(u)}
+			}
+			rpcCfg := &rpchelper.RPCConfig{
+				Nodes:          nodes,
+				RequestTimeout: 15 * time.Second,
+				MaxRetries:     2,
+			}
+			rpcH := rpchelper.NewRPCHelper(rpcCfg)
+			if err := rpcH.Initialize(ctx); err == nil {
+				addr, err := protocolstate.GetSnapshotterStateAddress(ctx, rpcH, protocol, abiPath)
+				if err == nil {
+					snapshotterState = addr.Hex()
+					log.WithField("snapshotter_state", snapshotterState).Info("Derived SnapshotterState address from ProtocolState contract")
+				} else {
+					log.WithError(err).Warn("Failed to derive SnapshotterState address - sync-status endpoint will be limited")
+				}
+			} else {
+				log.WithError(err).Warn("Failed to initialize RPC helper for SnapshotterState lookup")
+			}
+		}
+	} else {
+		log.Warn("POWERLOOM_RPC_NODES or PROTOCOL_STATE_ABI_PATH not set - sync-status endpoint will be limited")
+	}
+
 	// Create API instance
-	api := NewMonitorAPI(redisClient, protocol, market)
+	api := NewMonitorAPI(redisClient, protocol, market, snapshotterState)
 
 	// Setup routes
 	router := gin.Default()
@@ -3687,6 +3784,9 @@ func main() {
 		// NOTE: Heartbeats are NOT EIP-712 signed. Use simulation/submission data to correlate peer ID with snapshotter.
 		v1.GET("/heartbeats/recent", api.HeartbeatsRecent)
 		v1.GET("/heartbeats/peer/:peerID", api.HeartbeatsByPeer)
+
+		// Protocol state sync status (BlockPoller consumers, cold sync state)
+		v1.GET("/protocol-state/sync-status", api.ProtocolStateSyncStatus)
 	}
 
 	// Swagger documentation

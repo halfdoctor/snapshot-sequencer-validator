@@ -37,6 +37,7 @@ type SlotValidator struct {
 	protocolStateAddr    common.Address
 	snapshotterStateAddr common.Address
 	slotManager          *SlotManager // Optional: for on-demand slot fetching
+	verifiedTTL          time.Duration // TTL for the SlotVerified marker (default: 1 hour)
 }
 
 // NewSlotValidator creates a new slot validator
@@ -48,7 +49,15 @@ func NewSlotValidator(redisClient *redis.Client, protocolStateAddr, snapshotterS
 		protocolStateAddr:    protocolStateAddr,
 		snapshotterStateAddr: snapshotterStateAddr,
 		slotManager:          slotManager,
+		verifiedTTL:          1 * time.Hour,
 	}
+}
+
+// SetVerifiedTTL sets the TTL for demand-driven re-fetch state markers.
+// This controls how long after a contract re-fetch the validator will skip
+// re-fetching on repeated mismatches for the same slot.
+func (sv *SlotValidator) SetVerifiedTTL(ttl time.Duration) {
+	sv.verifiedTTL = ttl
 }
 
 // ValidateSnapshotterForSlot checks if the recovered EIP-712 signer address matches
@@ -106,12 +115,59 @@ func (sv *SlotValidator) ValidateSnapshotterForSlot(slotID uint64, signerAddr co
 
 	// Validate snapshotter address matches
 	if slot.SnapshotterAddress != signerAddr {
+		// Demand-driven re-fetch: the cache may be stale due to a missed
+		// SnapshotterAddressChanged event. Re-fetch from contract if the slot
+		// has not been recently verified to avoid permanent rejection.
+		if sv.slotManager != nil && !sv.wasRecentlyVerified(ctx, slotID) {
+			log.Infof("Address mismatch for slot %d (cached=%s, signer=%s) - re-fetching from contract",
+				slotID, slot.SnapshotterAddress.Hex(), signerAddr.Hex())
+
+			fetchCtx, fetchCancel := context.WithTimeout(ctx, 30*time.Second)
+			defer fetchCancel()
+
+			if fetchErr := sv.slotManager.FetchSlot(fetchCtx, slotID); fetchErr != nil {
+				log.Warnf("Demand-driven re-fetch failed for slot %d: %v", slotID, fetchErr)
+			} else {
+				sv.markAsVerified(ctx, slotID)
+
+				// Re-read from cache after refresh
+				updatedData, readErr := sv.redisClient.Get(ctx, slotKey).Result()
+				if readErr == nil {
+					var updatedSlot SlotInfo
+					if json.Unmarshal([]byte(updatedData), &updatedSlot) == nil {
+						if updatedSlot.Active && updatedSlot.SnapshotterAddress == signerAddr {
+							log.Infof("Slot %d self-healed via demand-driven re-fetch (new snapshotter=%s)",
+								slotID, signerAddr.Hex())
+							return nil
+						}
+					}
+				}
+			}
+		}
+
 		return fmt.Errorf("snapshotter address mismatch: slot %d is registered to %s, but signature is from %s",
 			slotID, slot.SnapshotterAddress.Hex(), signerAddr.Hex())
 	}
 
 	log.Debugf("Validated snapshotter %s for slot %d", signerAddr.Hex(), slotID)
 	return nil
+}
+
+// wasRecentlyVerified checks if the slot was recently re-fetched from contract.
+func (sv *SlotValidator) wasRecentlyVerified(ctx context.Context, slotID uint64) bool {
+	key := fmt.Sprintf("%s:%s:SlotVerified.%d", sv.protocolStateAddr.Hex(), sv.snapshotterStateAddr.Hex(), slotID)
+	exists, err := sv.redisClient.Exists(ctx, key).Result()
+	return err == nil && exists > 0
+}
+
+// markAsVerified sets a state marker indicating the slot was recently verified
+// by re-fetching from the contract. TTL prevents repeated contract calls for
+// the same invalid slot.
+func (sv *SlotValidator) markAsVerified(ctx context.Context, slotID uint64) {
+	key := fmt.Sprintf("%s:%s:SlotVerified.%d", sv.protocolStateAddr.Hex(), sv.snapshotterStateAddr.Hex(), slotID)
+	if err := sv.redisClient.Set(ctx, key, "1", sv.verifiedTTL).Err(); err != nil {
+		log.Warnf("Failed to set SlotVerified marker for slot %d: %v", slotID, err)
+	}
 }
 
 // GetSlotSnapshotter returns the registered snapshotter address for a slot
