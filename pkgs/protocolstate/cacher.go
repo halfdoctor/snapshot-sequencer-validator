@@ -202,7 +202,15 @@ func (c *Cacher) WaitForColdSync(ctx context.Context) error {
 		return c.performFullColdSync(ctx)
 	}
 
-	log.Infof("Smart startup: gap=%d blocks (threshold=%d), skipping cold sync - BlockPoller will catch up", gap, threshold)
+	log.Infof("Block gap small (%d blocks < threshold %d), skipping full cold sync - BlockPoller will catch up", gap, threshold)
+	
+	// Set timestamp even when skipping cold sync so dependent components (dequeuer) don't wait forever
+	if err := c.setLastSyncTimestamp(ctx); err != nil {
+		log.Warnf("Failed to set last sync timestamp after skipped sync: %v", err)
+	} else {
+		log.Debug("Set last sync timestamp (full sync skipped, BlockPoller handling updates)")
+	}
+	
 	return nil
 }
 
