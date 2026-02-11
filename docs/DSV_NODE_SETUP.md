@@ -696,6 +696,14 @@ VPA_VALIDATOR_ADDRESS=0xYourValidatorAddress
 # Multi-signer configuration (comma-separated)
 VPA_SIGNER_ADDRESSES=0xSIGNER1_ADDRESS,0xSIGNER2_ADDRESS
 VPA_SIGNER_PRIVATE_KEYS=0xSIGNER1_PRIVATE_KEY,0xSIGNER2_PRIVATE_KEY
+
+# RPC timeouts and connection pooling (relayer-py, mitigates "Timeout on reading data from socket")
+# Precedence: RPC_SOCK_READ_TIMEOUT_S overrides RPC_REQUEST_TIMEOUT_S when both set
+RPC_REQUEST_TIMEOUT_S=60
+RPC_SOCK_READ_TIMEOUT_S=60
+RPC_MAX_CONNECTIONS=100
+RPC_MAX_KEEPALIVE_CONNECTIONS=50
+RPC_KEEPALIVE_EXPIRY_S=300
 ```
 
 ### VPA Deployment

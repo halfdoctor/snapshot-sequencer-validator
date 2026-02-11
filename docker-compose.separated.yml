@@ -402,6 +402,13 @@ services:
       - POWERLOOM_RPC_NODES=${POWERLOOM_RPC_NODES}
       - PROTOCOL_STATE_CONTRACT=${PROTOCOL_STATE_CONTRACT}
       - ANCHOR_CHAIN_ID=${ANCHOR_CHAIN_ID:-11167}
+      # RPC timeouts and connection pooling (avoids "Timeout on reading data from socket")
+      # Precedence: RPC_SOCK_READ_TIMEOUT_S overrides RPC_REQUEST_TIMEOUT_S when both set
+      - RPC_REQUEST_TIMEOUT_S=${RPC_REQUEST_TIMEOUT_S:-60}
+      - RPC_SOCK_READ_TIMEOUT_S=${RPC_SOCK_READ_TIMEOUT_S:-}
+      - RPC_MAX_CONNECTIONS=${RPC_MAX_CONNECTIONS:-100}
+      - RPC_MAX_KEEPALIVE_CONNECTIONS=${RPC_MAX_KEEPALIVE_CONNECTIONS:-50}
+      - RPC_KEEPALIVE_EXPIRY_S=${RPC_KEEPALIVE_EXPIRY_S:-300}
       # Minimum signer balance check (default: 0 to disable for devnet)
       - MIN_SIGNER_BALANCE_ETH=${MIN_SIGNER_BALANCE_ETH:-0}
       # Multi-signer Configuration (comma-separated)
