@@ -779,11 +779,7 @@ func (m *EventMonitor) handleEpochReleased(event *EpochReleasedEvent) {
 				logFields["snapshot_reveal_window"] = config.SnapshotRevealWindow.Uint64()
 				log.WithFields(logFields).Info("✅ Using on-chain window config: Level 1 finalization triggers when snapshot reveal closes")
 			} else {
-				frac := "2/3"
-				if config.P1SubmissionWindow.Uint64() >= 25 {
-					frac = "3/4"
-				}
-				log.WithFields(logFields).Infof("✅ Using on-chain window config: %s of P1 window open for snapshot submissions, remainder for validator votes and on-chain commit", frac)
+				log.WithFields(logFields).Info("✅ Using on-chain window config: 2/3 of P1 window open for snapshot submissions, remainder for validator votes and on-chain commit")
 			}
 		}
 	} else {
@@ -990,7 +986,7 @@ func (m *EventMonitor) handleEpochReleased(event *EpochReleasedEvent) {
 	// Window closes when Level 1 finalization should begin
 	// Duration varies by contract configuration:
 	//   - New contracts with snapshot commit/reveal enabled: snapshotCommitWindow + snapshotRevealWindow (snapshot reveal closes)
-	//   - New contracts without snapshot commit/reveal: 2/3 or 3/4 of (PreSubmissionWindow + P1SubmissionWindow) open for submissions (3/4 if P1 >= 25s); remainder for votes and commit
+	//   - New contracts without snapshot commit/reveal: 2/3 of (PreSubmissionWindow + P1SubmissionWindow) open for submissions; remainder for votes and commit
 	// When window closes, triggerFinalization() is called to begin Level 1 local finalization
 	// Note: Validator vote commit/reveal is a separate workflow and doesn't affect this timing
 	if err := m.windowManager.StartSubmissionWindow(
@@ -1020,11 +1016,7 @@ func (m *EventMonitor) handleEpochReleased(event *EpochReleasedEvent) {
 		if hasSnapshotCommitReveal {
 			log.Infof("📋 Level 1 finalization will trigger when snapshot reveal window closes (in %v)", windowDuration)
 		} else {
-			frac := "2/3"
-			if windowConfig.P1SubmissionWindow.Uint64() >= 25 {
-				frac = "3/4"
-			}
-			log.Infof("📋 %s of P1 window open for snapshot submissions (in %v); then finalization and on-chain commit", frac, windowDuration)
+			log.Infof("📋 2/3 of P1 window open for snapshot submissions (in %v); then finalization and on-chain commit", windowDuration)
 		}
 	}
 }

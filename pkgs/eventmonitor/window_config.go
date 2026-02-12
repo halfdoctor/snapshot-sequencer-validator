@@ -40,8 +40,7 @@ type WindowConfig struct {
 // Case 2: Snapshot Commit/Reveal windows disabled (both zero)
 //   - The returned duration is how long the window stays OPEN for snapshot submissions.
 //   - The remainder of (PreSubmissionWindow + P1SubmissionWindow) is for validator votes and on-chain commit.
-//   - If P1 submission window < 25s: keep 2/3 of the total open for submissions (wait = 2/3 * total).
-//   - If P1 submission window >= 25s: keep 3/4 open for submissions (wait = 3/4 * total).
+//   - Keep 2/3 of the total open for submissions (wait = 2/3 * total); remainder for votes and commit.
 //
 // After this submission period, Level 1 finalization runs; then validators commit on-chain during P1, P2, etc.
 func (wc *WindowConfig) LocalFinalizationWindow(fallbackDelay time.Duration) time.Duration {
@@ -59,17 +58,11 @@ func (wc *WindowConfig) LocalFinalizationWindow(fallbackDelay time.Duration) tim
 		// Case 2: Snapshot Commit/Reveal disabled - fraction of total is submission period
 		// Total P1 window = PreSubmissionWindow + P1SubmissionWindow. We keep that fraction open for
 		// snapshot submissions; the remainder is for validator votes and on-chain commit.
-		// P1 < 25s: 2/3 open for submissions; P1 >= 25s: 3/4 open for submissions.
+		// 2/3 of total open for submissions; remainder for votes and commit.
 		totalSeconds := new(big.Int)
 		totalSeconds.Add(wc.PreSubmissionWindow, wc.P1SubmissionWindow)
 
-		const p1WindowThresholdSec = 25
-		var num, denom int64
-		if wc.P1SubmissionWindow.Uint64() < p1WindowThresholdSec {
-			num, denom = 2, 3
-		} else {
-			num, denom = 3, 4
-		}
+		const num, denom = 2, 3
 		submissionPeriodSeconds := new(big.Int).Mul(totalSeconds, big.NewInt(num))
 		submissionPeriodSeconds.Div(submissionPeriodSeconds, big.NewInt(denom))
 		return time.Duration(submissionPeriodSeconds.Uint64()) * time.Second
