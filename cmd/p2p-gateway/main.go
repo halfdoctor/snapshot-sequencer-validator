@@ -479,17 +479,16 @@ func (g *P2PGateway) initializeStreams() error {
 				"group":  groupName,
 			}).Info("Consumer group already exists, verifying stream state")
 
-			// Verify the stream exists and is accessible
-			info, err := g.redisClient.XInfoStream(g.ctx, streamKey).Result()
+			// Verify the stream exists and is accessible using XLen (avoids
+			// XINFO STREAM schema incompatibilities across Redis versions)
+			length, err := g.redisClient.XLen(g.ctx, streamKey).Result()
 			if err != nil {
 				return fmt.Errorf("stream exists but is not accessible: %w", err)
 			}
 
 			log.WithFields(logrus.Fields{
 				"stream":  streamKey,
-				"entries": info.Length,
-				"last_id": info.LastGeneratedID,
-				"groups":  info.Groups,
+				"entries": length,
 			}).Info("Stream verified and ready")
 		} else {
 			return fmt.Errorf("failed to create consumer group and stream: %w", err)
