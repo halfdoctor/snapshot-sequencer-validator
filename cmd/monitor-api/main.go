@@ -1787,17 +1787,15 @@ func getStreamLag(redisClient *redis.Client, ctx context.Context, streamKey, gro
 		return 0, fmt.Errorf("group %s not found", groupName)
 	}
 
-	// Get stream info to find total entries
-	streamInfo, err := redisClient.XInfoStream(ctx, streamKey).Result()
+	// Get stream length to estimate lag
+	streamLen, err := redisClient.XLen(ctx, streamKey).Result()
 	if err != nil {
 		return 0, err
 	}
 
 	// Simple approximation: if last delivered is "0-0", lag is total entries
-	// This is a simplification - a more accurate approach would be to calculate
-	// the difference between stream last ID and last delivered ID
 	if lastDeliveredID == "0-0" {
-		return streamInfo.Length, nil
+		return streamLen, nil
 	}
 
 	// For most cases, if the system is working, lag should be small

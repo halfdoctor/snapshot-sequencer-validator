@@ -522,8 +522,8 @@ func (g *P2PGateway) monitorStreamHealth() {
 			streamKey := g.keyBuilder.AggregationStream()
 			groupName := g.config.StreamConsumerGroup
 
-			// Check stream info
-			info, err := g.redisClient.XInfoStream(g.ctx, streamKey).Result()
+			// Check stream length
+			streamLen, err := g.redisClient.XLen(g.ctx, streamKey).Result()
 			if err != nil {
 				log.WithError(err).Error("Failed to get stream info")
 				continue
@@ -557,19 +557,17 @@ func (g *P2PGateway) monitorStreamHealth() {
 			// Log stream health metrics
 			log.WithFields(logrus.Fields{
 				"stream":    streamKey,
-				"entries":   info.Length,
+				"entries":   streamLen,
 				"pending":   ourGroup.Pending,
-				"last_id":   info.LastGeneratedID,
 				"consumers": ourGroup.Consumers,
 				"group":     groupName,
 			}).Debug("Stream health check")
 
 			// Emit stream health event
 			payload, _ := json.Marshal(map[string]interface{}{
-				"stream_entries":   info.Length,
+				"stream_entries":   streamLen,
 				"pending_messages": ourGroup.Pending,
 				"active_consumers": ourGroup.Consumers,
-				"last_id":          info.LastGeneratedID,
 			})
 			if err := g.eventEmitter.Emit(&events.Event{
 				Type:      events.EventStreamHealth,
@@ -596,15 +594,15 @@ func (g *P2PGateway) cleanupOldStreamEntries() {
 		case <-ticker.C:
 			streamKey := g.keyBuilder.AggregationStream()
 
-			// Get stream info to check current size
-			info, err := g.redisClient.XInfoStream(g.ctx, streamKey).Result()
+			// Get stream length to check current size
+			streamLen, err := g.redisClient.XLen(g.ctx, streamKey).Result()
 			if err != nil {
 				log.WithError(err).Debug("Failed to get stream info for cleanup")
 				continue
 			}
 
 			// Only trim if stream has more than 1000 entries
-			if info.Length <= 1000 {
+			if streamLen <= 1000 {
 				continue
 			}
 
@@ -619,14 +617,14 @@ func (g *P2PGateway) cleanupOldStreamEntries() {
 				log.WithFields(logrus.Fields{
 					"stream":    streamKey,
 					"trimmed":   result,
-					"remaining": info.Length - result,
-					"previous":  info.Length,
+					"remaining": streamLen - result,
+					"previous":  streamLen,
 				}).Info("Cleaned up old stream entries")
 
 				// Emit stream cleanup event
 				payload, _ := json.Marshal(map[string]interface{}{
 					"trimmed_entries":   result,
-					"remaining_entries": info.Length - result,
+					"remaining_entries": streamLen - result,
 					"stream_key":        streamKey,
 				})
 				if err := g.eventEmitter.Emit(&events.Event{
@@ -649,8 +647,11 @@ func (g *P2PGateway) ensureStreamExists() error {
 	groupName := g.config.StreamConsumerGroup
 
 	// Check if stream exists
-	info, err := g.redisClient.XInfoStream(g.ctx, streamKey).Result()
+	exists, err := g.redisClient.Exists(g.ctx, streamKey).Result()
 	if err != nil {
+		return fmt.Errorf("failed to check stream existence: %w", err)
+	}
+	if exists == 0 {
 		// Stream doesn't exist, try to create it with consumer group
 		log.WithField("stream", streamKey).Info("Stream does not exist, creating it")
 		if err := g.redisClient.XGroupCreateMkStream(g.ctx, streamKey, groupName, "0").Err(); err != nil {
@@ -690,9 +691,8 @@ func (g *P2PGateway) ensureStreamExists() error {
 	}
 
 	log.WithFields(logrus.Fields{
-		"stream":  streamKey,
-		"group":   groupName,
-		"entries": info.Length,
+		"stream": streamKey,
+		"group":  groupName,
 	}).Debug("Stream verified and ready")
 
 	return nil
