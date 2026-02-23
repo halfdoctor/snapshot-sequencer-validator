@@ -7,7 +7,6 @@ import (
 	"math/big"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/ethereum/go-ethereum"
@@ -22,10 +21,11 @@ import (
 
 // ValidatorPriorityAssigner binds to the VPA contract
 type ValidatorPriorityAssigner struct {
-	client       *ethclient.Client
-	contractAddr common.Address
-	abi          abi.ABI
-	validator    common.Address
+	client         *ethclient.Client
+	contractAddr   common.Address
+	abi            abi.ABI
+	validator      common.Address
+	validatorNodeId uint64 // Configured node ID (no chain lookup)
 }
 
 // PriorityInfo holds validator priority information
@@ -69,8 +69,6 @@ type PriorityCachingClient struct {
 	keyBuilder        *rediskeys.KeyBuilder
 	cacheTTL          time.Duration
 	logger            *logrus.Entry
-	cachedNodeId      *uint64 // Cached validator nodeId (doesn't change at runtime)
-	nodeIdMutex       sync.RWMutex
 	protocolStateAddr common.Address // ProtocolState contract for getPriorities, getActiveValidators
 	protocolStateABI  abi.ABI        // ProtocolState ABI
 }
@@ -78,10 +76,10 @@ type PriorityCachingClient struct {
 // NewPriorityCachingClient creates a new VPA client with Redis caching
 // protocolState and dataMarket are used for Redis key building
 // newProtocolState is used for getPriorities() contract calls (if empty, falls back to protocolState)
-func NewPriorityCachingClient(rpcURL, contractAddr, validatorAddr string,
+func NewPriorityCachingClient(rpcURL, contractAddr, validatorAddr string, validatorNodeId uint64,
 	redisClient *redis.Client, protocolState, dataMarket, newProtocolState string) (*PriorityCachingClient, error) {
 
-	vpaClient, err := NewValidatorPriorityAssigner(rpcURL, contractAddr, validatorAddr)
+	vpaClient, err := NewValidatorPriorityAssigner(rpcURL, contractAddr, validatorAddr, validatorNodeId)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create VPA client: %w", err)
 	}
@@ -118,7 +116,7 @@ func NewPriorityCachingClient(rpcURL, contractAddr, validatorAddr string,
 }
 
 // NewValidatorPriorityAssigner creates a new VPA contract client
-func NewValidatorPriorityAssigner(rpcURL string, contractAddr string, validatorAddr string) (*ValidatorPriorityAssigner, error) {
+func NewValidatorPriorityAssigner(rpcURL string, contractAddr string, validatorAddr string, validatorNodeId uint64) (*ValidatorPriorityAssigner, error) {
 	client, err := ethclient.Dial(rpcURL)
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to Ethereum client: %w", err)
@@ -130,6 +128,9 @@ func NewValidatorPriorityAssigner(rpcURL string, contractAddr string, validatorA
 	if !common.IsHexAddress(validatorAddr) {
 		return nil, fmt.Errorf("invalid validator address: %s", validatorAddr)
 	}
+	if validatorNodeId == 0 {
+		return nil, fmt.Errorf("validator node ID is required (VPA_VALIDATOR_NODE_ID)")
+	}
 
 	// Load VPA ABI from file using standardized path resolution
 	vpaABI, err := abiloader.LoadABI("ValidatorPriorityAssigner.json")
@@ -138,10 +139,11 @@ func NewValidatorPriorityAssigner(rpcURL string, contractAddr string, validatorA
 	}
 
 	return &ValidatorPriorityAssigner{
-		client:       client,
-		contractAddr: common.HexToAddress(contractAddr),
-		abi:          vpaABI,
-		validator:    common.HexToAddress(validatorAddr),
+		client:          client,
+		contractAddr:    common.HexToAddress(contractAddr),
+		abi:             vpaABI,
+		validator:       common.HexToAddress(validatorAddr),
+		validatorNodeId: validatorNodeId,
 	}, nil
 }
 
@@ -307,17 +309,11 @@ func (vpa *ValidatorPriorityAssigner) GetMyPriority(ctx context.Context, dataMar
 		return 0, fmt.Errorf("invalid data market address: %s", dataMarketAddr)
 	}
 
-	// First get the validator ID from the ValidatorState contract
-	validatorID, err := vpa.getValidatorID(ctx)
-	if err != nil {
-		return 0, fmt.Errorf("failed to get validator ID: %w", err)
-	}
-
 	// Create call data for getHistoricalPriority
 	data, err := vpa.abi.Pack("getHistoricalPriority",
 		common.HexToAddress(dataMarketAddr),
 		big.NewInt(int64(epochID)),
-		big.NewInt(int64(validatorID)))
+		big.NewInt(int64(vpa.validatorNodeId)))
 	if err != nil {
 		return 0, fmt.Errorf("failed to pack getHistoricalPriority call: %w", err)
 	}
@@ -339,36 +335,10 @@ func (vpa *ValidatorPriorityAssigner) GetMyPriority(ctx context.Context, dataMar
 	}
 
 	if priority == nil {
-		return 0, fmt.Errorf("no priority assigned for validator %d in epoch %d", validatorID, epochID)
+		return 0, fmt.Errorf("no priority assigned for validator %d in epoch %d", vpa.validatorNodeId, epochID)
 	}
 
 	return int(priority.Int64()), nil
-}
-
-// getValidatorID gets the validator nodeId from the ValidatorState contract
-// Calls ValidatorState.getNodeIdForValidator(validatorAddress) via VPA contract's validatorState reference
-func (vpa *ValidatorPriorityAssigner) getValidatorID(ctx context.Context) (uint64, error) {
-	// First, get ValidatorState contract address from VPA contract
-	validatorStateAddr, err := vpa.getValidatorStateAddress(ctx)
-	if err != nil {
-		return 0, fmt.Errorf("failed to get ValidatorState address: %w", err)
-	}
-
-	if validatorStateAddr == (common.Address{}) {
-		return 0, fmt.Errorf("ValidatorState address is zero")
-	}
-
-	// Call ValidatorState.getNodeIdForValidator(validatorAddress)
-	nodeId, err := vpa.callValidatorStateGetNodeId(ctx, validatorStateAddr)
-	if err != nil {
-		return 0, fmt.Errorf("failed to get nodeId from ValidatorState: %w", err)
-	}
-
-	if nodeId == 0 {
-		return 0, fmt.Errorf("validator address %s is not assigned to any node", vpa.validator.Hex())
-	}
-
-	return nodeId, nil
 }
 
 // getProtocolStateAddress gets the ProtocolState contract address from VPA contract
@@ -428,82 +398,9 @@ func (vpa *ValidatorPriorityAssigner) getValidatorStateAddress(ctx context.Conte
 	return validatorStateAddr, nil
 }
 
-// callValidatorStateGetNodeId calls ValidatorState.getNodeIdForValidator(validatorAddress)
-func (vpa *ValidatorPriorityAssigner) callValidatorStateGetNodeId(ctx context.Context, validatorStateAddr common.Address) (uint64, error) {
-	// Minimal ABI for ValidatorState.getNodeIdForValidator(address) -> uint256
-	validatorStateABI := `[{
-		"inputs": [{"internalType": "address", "name": "validatorAddress", "type": "address"}],
-		"name": "getNodeIdForValidator",
-		"outputs": [{"internalType": "uint256", "name": "", "type": "uint256"}],
-		"stateMutability": "view",
-		"type": "function"
-	}]`
-
-	parsedABI, err := abi.JSON(strings.NewReader(validatorStateABI))
-	if err != nil {
-		return 0, fmt.Errorf("failed to parse ValidatorState ABI: %w", err)
-	}
-
-	// Pack the function call
-	data, err := parsedABI.Pack("getNodeIdForValidator", vpa.validator)
-	if err != nil {
-		return 0, fmt.Errorf("failed to pack getNodeIdForValidator call: %w", err)
-	}
-
-	msg := ethereum.CallMsg{
-		To:   &validatorStateAddr,
-		Data: data,
-	}
-
-	result, err := vpa.client.CallContract(ctx, msg, nil)
-	if err != nil {
-		return 0, fmt.Errorf("failed to call getNodeIdForValidator: %w", err)
-	}
-
-	// Unpack the result (uint256)
-	var nodeId *big.Int
-	err = parsedABI.UnpackIntoInterface(&nodeId, "getNodeIdForValidator", result)
-	if err != nil {
-		return 0, fmt.Errorf("failed to unpack getNodeIdForValidator result: %w", err)
-	}
-
-	if nodeId == nil || nodeId.Uint64() == 0 {
-		return 0, fmt.Errorf("validator address %s is not assigned to any node", vpa.validator.Hex())
-	}
-
-	return nodeId.Uint64(), nil
-}
-
-// getCachedNodeId gets the validator nodeId with caching (only queries once).
-// Returns the node ID from ValidatorState (stable per validator).
+// getCachedNodeId returns the configured validator node ID (no chain lookup).
 func (pcc *PriorityCachingClient) getCachedNodeId(ctx context.Context) (uint64, error) {
-	pcc.nodeIdMutex.RLock()
-	if pcc.cachedNodeId != nil {
-		nodeId := *pcc.cachedNodeId
-		pcc.nodeIdMutex.RUnlock()
-		return nodeId, nil
-	}
-	pcc.nodeIdMutex.RUnlock()
-
-	pcc.nodeIdMutex.Lock()
-	defer pcc.nodeIdMutex.Unlock()
-
-	if pcc.cachedNodeId != nil {
-		return *pcc.cachedNodeId, nil
-	}
-
-	nodeId, err := pcc.ValidatorPriorityAssigner.getValidatorID(ctx)
-	if err != nil {
-		return 0, err
-	}
-
-	pcc.cachedNodeId = &nodeId
-	pcc.logger.WithFields(logrus.Fields{
-		"nodeId":        nodeId,
-		"validatorAddr": pcc.validator.Hex(),
-	}).Info("Cached validator nodeId (stable for runtime)")
-
-	return nodeId, nil
+	return pcc.ValidatorPriorityAssigner.validatorNodeId, nil
 }
 
 // getActiveValidatorsFromProtocolState calls ProtocolState.getActiveValidators(dataMarket, epochId).

@@ -114,12 +114,12 @@ func NewAggregator(cfg *config.Settings) (*Aggregator, error) {
 		}
 
 		// Initialize VPA caching client for each data market
-		if vpaContractAddr != (common.Address{}) && cfg.VPAValidatorAddress != "" {
+		if vpaContractAddr != (common.Address{}) && cfg.VPAValidatorAddress != "" && cfg.VPAValidatorNodeID != 0 {
 			rpcURL := cfg.RPCNodes[0]
 			for _, dataMarket := range cfg.DataMarketAddresses {
 				checksummedMarket := common.HexToAddress(dataMarket).Hex()
 				vpaClient, err := vpa.NewPriorityCachingClient(
-					rpcURL, vpaContractAddr.Hex(), cfg.VPAValidatorAddress,
+					rpcURL, vpaContractAddr.Hex(), cfg.VPAValidatorAddress, cfg.VPAValidatorNodeID,
 					redisClient, cfg.ProtocolStateContract, checksummedMarket, "")
 				if err != nil {
 					cancel()
@@ -129,7 +129,7 @@ func NewAggregator(cfg *config.Settings) (*Aggregator, error) {
 				log.WithField("data_market", checksummedMarket).Info("✅ VPA caching client initialized")
 			}
 		} else {
-			log.Warn("⚠️  VPA contract address or validator address not available")
+			log.Warn("⚠️  VPA requires contract address, validator address, and validator node ID (VPA_VALIDATOR_NODE_ID)")
 		}
 	}
 

@@ -123,11 +123,12 @@ type Config struct {
 	FinalizationBatchSize int      // Number of projects per finalization batch
 
 	// VPA Configuration (optional)
-	VPAContractAddress  string // VPA contract address for priority monitoring
-	VPAContractABIPath  string // Path to VPA contract ABI JSON file
-	VPAValidatorAddress string // This validator's address for VPA client
-	VPARPCURL           string // RPC URL for VPA client (if different from main RPC)
-	ProtocolState       string // Protocol state contract address for VPA integration, window config fetching, and namespacing
+	VPAContractAddress   string // VPA contract address for priority monitoring
+	VPAContractABIPath   string // Path to VPA contract ABI JSON file
+	VPAValidatorAddress  string // This validator's address for VPA client
+	VPAValidatorNodeID   uint64 // This validator's node ID (required; no chain lookup)
+	VPARPCURL            string // RPC URL for VPA client (if different from main RPC)
+	ProtocolState        string // Protocol state contract address for VPA integration, window config fetching, and namespacing
 
 	// Window Config Configuration
 	WindowConfigCacheTTL time.Duration // Cache TTL for window configs (default: 5 minutes)
@@ -199,7 +200,7 @@ func NewEventMonitor(cfg *Config) (*EventMonitor, error) {
 	var prioritiesAssignedSig common.Hash
 	var vpaEnabled bool
 
-	if cfg.VPAValidatorAddress != "" && cfg.ProtocolState != "" {
+	if cfg.VPAValidatorAddress != "" && cfg.VPAValidatorNodeID != 0 && cfg.ProtocolState != "" {
 		vpaEnabled = true
 
 		// Fetch VPA address from ProtocolState contract
@@ -250,6 +251,7 @@ func NewEventMonitor(cfg *Config) (*EventMonitor, error) {
 				cfg.VPARPCURL,
 				vpaContractAddr.Hex(),
 				cfg.VPAValidatorAddress,
+				cfg.VPAValidatorNodeID,
 				cfg.RedisClient,
 				cfg.ProtocolState,
 				cfg.DataMarkets[0], // Use first data market as default

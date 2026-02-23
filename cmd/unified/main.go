@@ -712,9 +712,10 @@ func main() {
 			FinalizationBatchSize: cfg.FinalizationBatchSize,
 
 			// VPA Configuration
-			VPAContractAddress:  cfg.VPAContractAddress,
-			VPAValidatorAddress: cfg.VPAValidatorAddress,
-			VPARPCURL:           strings.Join(cfg.RPCNodes, ","),
+			VPAContractAddress:   cfg.VPAContractAddress,
+			VPAValidatorAddress:  cfg.VPAValidatorAddress,
+			VPAValidatorNodeID:   cfg.VPAValidatorNodeID,
+			VPARPCURL:            strings.Join(cfg.RPCNodes, ","),
 			ProtocolState:       cfg.ProtocolStateContract,
 
 			// Window Config Configuration

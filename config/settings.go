@@ -128,8 +128,9 @@ type Settings struct {
 	EnableOnChainSubmission bool   // Enable submission to ProtocolState contract
 
 	// VPA Event Monitoring Configuration
-	VPAContractAddress  string // VPA contract address for priority monitoring
-	VPAValidatorAddress string // This validator's address for VPA client
+	VPAContractAddress   string // VPA contract address for priority monitoring
+	VPAValidatorAddress  string // This validator's address for VPA client
+	VPAValidatorNodeID   uint64 // This validator's node ID (required; no chain lookup)
 
 	// VPA Contract Submission Configuration
 	RelayerPyEndpoint string // relayer-py service endpoint for VPA-based contract submissions
@@ -295,6 +296,7 @@ func LoadConfig() error {
 		// VPA Event Monitoring Configuration
 		VPAContractAddress:  getEnv("VPA_CONTRACT_ADDRESS", ""),
 		VPAValidatorAddress: getEnv("VPA_VALIDATOR_ADDRESS", ""),
+		VPAValidatorNodeID:   getEnvAsUint64("VPA_VALIDATOR_NODE_ID", 0),
 
 		// VPA Contract Submission Configuration
 		RelayerPyEndpoint: getEnv("RELAYER_PY_ENDPOINT", ""),
@@ -671,6 +673,15 @@ func getEnvAsInt(key string, defaultValue int) int {
 	if value := os.Getenv(key); value != "" {
 		if intVal, err := strconv.Atoi(value); err == nil {
 			return intVal
+		}
+	}
+	return defaultValue
+}
+
+func getEnvAsUint64(key string, defaultValue uint64) uint64 {
+	if value := os.Getenv(key); value != "" {
+		if u, err := strconv.ParseUint(value, 10, 64); err == nil {
+			return u
 		}
 	}
 	return defaultValue
