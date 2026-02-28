@@ -70,16 +70,18 @@ func NewP2PHost(ctx context.Context, cfg *config.Settings) (*P2PHost, error) {
 	}
 
 	// Add public IP address if configured
+	// CRITICAL: Filter out internal Docker IPs - never advertise these to DHT/gossipsub
 	if cfg.P2PPublicIP != "" {
 		publicAddr, err := multiaddr.NewMultiaddr(fmt.Sprintf("/ip4/%s/tcp/%s", cfg.P2PPublicIP, p2pPort))
 		if err != nil {
 			log.Errorf("Failed to create public multiaddr: %v", err)
 		} else {
 			opts = append(opts, libp2p.AddrsFactory(func(addrs []multiaddr.Multiaddr) []multiaddr.Multiaddr {
-				// Add the public address to the list
-				return append(addrs, publicAddr)
+				// Filter out internal/reserved addresses - Docker IPs must not be advertised
+				filtered, _ := FilterReservedMultiaddrs(addrs)
+				return append(filtered, publicAddr)
 			}))
-			log.Infof("Advertising public IP: %s", cfg.P2PPublicIP)
+			log.Infof("Advertising public IP: %s (internal addresses filtered)", cfg.P2PPublicIP)
 		}
 	}
 
