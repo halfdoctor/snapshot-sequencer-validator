@@ -58,6 +58,7 @@ show_usage() {
     echo "  logs          - Show all logs"
     echo "  p2p-logs      - P2P Gateway logs"
     echo "  aggregator-logs - Aggregator logs"
+    echo "  spam-aggregator-logs - Spam Aggregator logs"
     echo "  finalizer-logs - Finalizer logs"
     echo "  dequeuer-logs - Dequeuer logs"
     echo "  event-logs    - Event monitor logs"
@@ -224,13 +225,17 @@ start_services() {
         fi
         print_color "$GREEN" "✅ Successfully cloned relayer-py"
 
-        # Switch to feat/tx-queue branch
-        print_color "$CYAN" "🔄 Switching to feat/tx-queue branch..."
-        if ! (cd "$RELAYER_DIR" && git checkout feat/tx-queue-memory-leak-fix); then
-            print_color "$RED" "❌ Failed to switch to feat/tx-queue-memory-leak-fix branch"
+        # Switch to specified branch (from .env) or default to develop
+        RELAYER_BRANCH="${RELAYER_PY_BRANCH:-develop}"
+        print_color "$CYAN" "🔄 Switching to branch: $RELAYER_BRANCH"
+        if [ -n "$RELAYER_PY_BRANCH" ]; then
+            print_color "$CYAN" "   (from RELAYER_PY_BRANCH in .env)"
+        fi
+        if ! (cd "$RELAYER_DIR" && git checkout "$RELAYER_BRANCH" 2>/dev/null); then
+            print_color "$RED" "❌ Failed to switch to $RELAYER_BRANCH branch"
             print_color "$YELLOW" "Continuing with default branch"
         else
-            print_color "$GREEN" "✅ Switched to feat/tx-queue-memory-leak-fix branch"
+            print_color "$GREEN" "✅ Switched to $RELAYER_BRANCH branch"
         fi
 
         # relayer-py now reads settings directly from environment variables
@@ -278,11 +283,16 @@ start_services() {
     # Start services with specified profiles
     print_color "$CYAN" "Starting services..."
     
+    # Enable BuildKit for faster, parallel builds with better caching
+    export DOCKER_BUILDKIT=1
+    export COMPOSE_DOCKER_CLI_BUILD=1
+    
     # Build flag - only add if force_rebuild is true
     local build_flag=""
     if [ "$force_rebuild" = true ]; then
         build_flag="--build"
         print_color "$YELLOW" "⚠️  Force rebuild enabled - images will be rebuilt"
+        print_color "$CYAN" "💡 BuildKit enabled for parallel builds and improved caching"
     fi
     
     if [ ${#profile_args[@]} -gt 0 ]; then
@@ -312,6 +322,7 @@ start_services() {
         print_color "$CYAN" "Components:"
         echo "  • P2P Gateway (port ${P2P_PORT:-9001})"
         echo "  • Aggregator (consensus)"
+        echo "  • Spam Aggregator (DDoS protection)"
         echo "  • Finalizer (batch creation)"
         echo "  • Dequeuer (submission processing)"
         echo "  • Event Monitor (epoch tracking)"
@@ -798,6 +809,9 @@ case "${1:-}" in
         ;;
     aggregator-logs)
         show_service_logs "aggregator" "$2"
+        ;;
+    spam-aggregator-logs)
+        show_service_logs "spam-aggregator" "$2"
         ;;
     finalizer-logs)
         show_service_logs "finalizer" "$2"

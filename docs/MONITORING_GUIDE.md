@@ -49,6 +49,57 @@ http://localhost:9091/swagger/index.html
 | `/api/v1/stats/daily` | Daily aggregated statistics | protocol, market |
 | `/api/v1/stats/hourly` | Hourly performance metrics | protocol, market |
 
+### Simulation and Heartbeat Tracking
+
+The monitoring system tracks simulation messages and heartbeat messages from snapshotters and local-collectors.
+
+**Key Distinction:**
+- **Simulation Messages**: Epoch 0 with real CID, EIP-712 signed - sent by snapshotters at startup to verify connectivity
+- **Heartbeat Messages**: Epoch 0 with empty CID, NOT EIP-712 signed - sent by local-collectors for P2P mesh maintenance
+
+#### Simulation Endpoints
+| Endpoint | Purpose |
+|----------|---------|
+| `/api/v1/simulations/recent` | Recent simulation messages (has snapshotter address from EIP-712 signature) |
+| `/api/v1/simulations/peer/:peerID` | Simulations from a specific peer |
+| `/api/v1/simulations/snapshotter/:address` | Simulations from a specific snapshotter address |
+
+#### Heartbeat Endpoints
+| Endpoint | Purpose |
+|----------|---------|
+| `/api/v1/heartbeats/recent` | Recent heartbeat messages (peer ID only, no snapshotter address) |
+| `/api/v1/heartbeats/peer/:peerID` | Heartbeats from a specific peer |
+
+**Important Note:** Heartbeat messages are NOT EIP-712 signed, so only peer ID is available. To correlate peer ID with snapshotter address, use simulation or submission data.
+
+#### Correlating Peer IDs with Snapshotter Addresses
+
+Since heartbeats don't contain EIP-712 signatures, use this workflow to correlate peer IDs:
+
+```bash
+# Step 1: Get simulations to find peer ID -> snapshotter address mapping
+curl "http://localhost:9091/api/v1/simulations/recent" | jq '.simulations[] | {peer_id, snapshotter_address}'
+
+# Alternative: Find peer ID from epoch submissions (also EIP-712 signed)
+curl "http://localhost:9091/api/v1/epochs/12345/submissions" | jq '.submissions[] | {peer_id, snapshotter}'
+
+# Step 2: Query heartbeats for the discovered peer ID
+curl "http://localhost:9091/api/v1/heartbeats/peer/12D3KooWxyz..."
+```
+
+**Example Monitoring Workflow:**
+
+```bash
+# Check if a peer is actively sending heartbeats
+curl "http://localhost:9091/api/v1/heartbeats/peer/12D3KooWExample" | jq '.count, .heartbeats[0:3]'
+
+# Find all peers that have sent simulations (and their snapshotter addresses)
+curl "http://localhost:9091/api/v1/simulations/recent?minutes=60" | jq '.simulations | group_by(.peer_id) | .[] | {peer_id: .[0].peer_id, snapshotter: .[0].snapshotter_address, count: length}'
+
+# Check heartbeat frequency for a known peer
+curl "http://localhost:9091/api/v1/heartbeats/peer/12D3KooWExample?limit=50" | jq '.heartbeats | [.[0].timestamp, .[-1].timestamp] | "\(.[0]) to \(.[1])"'
+```
+
 ### Using Query Parameters
 
 All endpoints support protocol/market filtering for multi-market environments:
@@ -825,7 +876,7 @@ curl "http://localhost:9091/api/v1/epochs/active?protocol=0x3B5A0FB70ef68B5dd677
 
 Get complete epoch state with all phase information.
 
-**⚠️ IMPORTANT**: You **MUST** pass `protocol` and `market` query parameters to see on-chain submission details written by relayer-py. Relayer-py writes using the NEW protocol state contract address (from `NEW_PROTOCOL_STATE_CONTRACT` env var) and the data market address from the transaction. If you don't pass these parameters, the endpoint uses default/legacy addresses and won't find the relayer-py data.
+**⚠️ IMPORTANT**: You **MUST** pass `protocol` and `market` query parameters to see on-chain submission details written by relayer-py. Relayer-py writes using the protocol state contract address (from `PROTOCOL_STATE_CONTRACT` env var) and the data market address from the transaction. If you don't pass these parameters, the endpoint uses default addresses and won't find the relayer-py data.
 
 **Example:**
 ```bash
@@ -837,7 +888,7 @@ curl "http://localhost:9091/api/v1/epochs/23847425/status"
 ```
 
 **Query Parameters**:
-- `protocol` (REQUIRED for relayer-py data): Protocol state contract address (must match `NEW_PROTOCOL_STATE_CONTRACT` in relayer-py)
+- `protocol` (REQUIRED for relayer-py data): Protocol state contract address (must match `PROTOCOL_STATE_CONTRACT` in relayer-py)
 - `market` (REQUIRED for relayer-py data): Data market address (must match the data market address in the transaction)
 
 **Response:**
@@ -1478,7 +1529,7 @@ docker exec <aggregator-container> printenv | grep RELAYER_PY_ENDPOINT
 **Configuration Checklist:**
 - `VPA_VALIDATOR_ADDRESS` - Your validator's Ethereum address
 - `VPA_CONTRACT_ADDRESS` - VPA contract address (or auto-fetched from ProtocolState)
-- `NEW_PROTOCOL_STATE_CONTRACT` - ProtocolState contract address
+- `PROTOCOL_STATE_CONTRACT` - ProtocolState contract address
 - `RELAYER_PY_ENDPOINT` - Relayer service endpoint (e.g., `http://relayer-py:8080`)
 - `ENABLE_ONCHAIN_SUBMISSION=true` - Enable VPA submissions
 
@@ -1829,7 +1880,7 @@ Failed without error details: 0
 
 **Why This Matters**:
 - Redis keys use lowercase addresses: `0xc9e7304f719d35919b0371d8b242ab59e0966d63:0xb6c1392944a335b72b9e34f9d4b8c0050cdb511f:epoch:23875427:state`
-- Relayer-py writes using lowercase addresses (from `NEW_PROTOCOL_STATE_CONTRACT` env var)
+- Relayer-py writes using lowercase addresses (from `PROTOCOL_STATE_CONTRACT` env var)
 - The Monitor API accepts addresses in any case, but Redis keys are case-sensitive
 - The scripts normalize addresses to ensure correct key matching
 
@@ -1861,7 +1912,7 @@ curl "http://localhost:9092/api/v1/epochs/23875427/status?protocol=0xC9e7304f719
 **No Transaction Hashes Found**:
 1. Verify relayer-py is running and processing transactions
 2. Check relayer-py logs for "Updated epoch state in Redis" messages
-3. Verify `NEW_PROTOCOL_STATE_CONTRACT` env var in relayer-py matches the protocol address used in script
+3. Verify `PROTOCOL_STATE_CONTRACT` env var in relayer-py matches the protocol address used in script
 4. Check Redis connectivity from relayer-py
 5. Verify addresses are correctly normalized (lowercase)
 

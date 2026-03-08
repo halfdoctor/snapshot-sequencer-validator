@@ -511,6 +511,8 @@ DEBUG_MODE=true
 
 ### Resource Cleanup
 
+#### Quick Cleanup (dsv.sh commands)
+
 ```bash
 # Clean Redis cache (stale keys)
 ./dsv.sh clean-cache
@@ -524,6 +526,42 @@ DEBUG_MODE=true
 # Remove all containers and volumes
 ./dsv.sh clean
 ```
+
+#### Advanced Cleanup (cleanup_old_redis_keys.py)
+
+For comprehensive Redis key cleanup, especially after refactoring or when dealing with memory pressure:
+
+**Discovery** (see what keys exist):
+```bash
+python3 scripts/cleanup_old_redis_keys.py --discover
+```
+
+**Clean all markets automatically** (recommended for multi-market deployments):
+```bash
+# Dry run first
+python3 scripts/cleanup_old_redis_keys.py --all-markets --keep-hours 24 --cleanup-queues --dry-run
+
+# Actually clean
+python3 scripts/cleanup_old_redis_keys.py --all-markets --keep-hours 24 --cleanup-queues
+```
+
+**Clean queues/streams** (no protocol/market needed):
+```bash
+python3 scripts/cleanup_old_redis_keys.py --cleanup-queues --queue-max-length 1000
+python3 scripts/cleanup_old_redis_keys.py --cleanup-streams --stream-max-length 10000
+```
+
+**Clean non-namespaced timelines** (no protocol/market needed):
+```bash
+python3 scripts/cleanup_old_redis_keys.py --keep-hours 24
+```
+
+**Clean specific protocol/market** (requires protocol/market addresses):
+```bash
+python3 scripts/cleanup_old_redis_keys.py --keep-epochs 60 --protocol 0x1234... --market 0x5678...
+```
+
+See [REDIS_KEYS.md](./REDIS_KEYS.md#manual-redis-key-cleanup) for detailed cleanup documentation and troubleshooting.
 
 ---
 
@@ -630,35 +668,42 @@ sudo chown -R 1000:1000 /mnt/storage/ipfs
 
 ## VPA (Validator Priority Assigner) Integration
 
-The VPA system enables priority-based batch submission to new protocol contracts, replacing legacy contract submission with a more efficient, multi-signer approach.
+The VPA system enables priority-based batch submission to protocol contracts using a multi-signer approach.
 
 ### VPA Architecture Overview
 
-The VPA integration adds a Python-based relayer service that handles transaction submission to new contracts:
+The VPA integration adds a Python-based relayer service that handles transaction submission:
 
 1. **relayer-py Service**: Multi-signer transaction relayer
 2. **Priority Caching**: Redis-based validator priority storage
-3. **Dual Contract Support**: New contracts with VPA, legacy contracts without
-4. **Automatic Setup**: Repository cloning and configuration via dsv.sh
+3. **Automatic Setup**: Repository cloning and configuration via dsv.sh
 
 ### VPA Environment Configuration
 
 Add these variables to your `.env` file:
 
 ```bash
-# Enable VPA integration (required for new contracts)
-USE_NEW_CONTRACTS=true
-
-# New protocol contract addresses
-NEW_PROTOCOL_STATE_CONTRACT=0xC9e7304f719D35919b0371d8B242ab59E0966d63
-NEW_DATA_MARKET_CONTRACT=0xb6c1392944a335b72b9e34f9D4b8c0050cdb511f
+# Protocol contract addresses
+PROTOCOL_STATE_CONTRACT=0xC9e7304f719D35919b0371d8B242ab59E0966d63
+DATA_MARKET_ADDRESSES=0xb6c1392944a335b72b9e34f9D4b8c0050cdb511f
 
 # relayer-py service endpoint
 RELAYER_PY_ENDPOINT=http://relayer-py:8080
 
+# VPA validator address (for priority checking)
+VPA_VALIDATOR_ADDRESS=0xYourValidatorAddress
+
 # Multi-signer configuration (comma-separated)
 VPA_SIGNER_ADDRESSES=0xSIGNER1_ADDRESS,0xSIGNER2_ADDRESS
 VPA_SIGNER_PRIVATE_KEYS=0xSIGNER1_PRIVATE_KEY,0xSIGNER2_PRIVATE_KEY
+
+# RPC timeouts and connection pooling (relayer-py, mitigates "Timeout on reading data from socket")
+# Precedence: RPC_SOCK_READ_TIMEOUT_S overrides RPC_REQUEST_TIMEOUT_S when both set
+RPC_REQUEST_TIMEOUT_S=60
+RPC_SOCK_READ_TIMEOUT_S=60
+RPC_MAX_CONNECTIONS=100
+RPC_MAX_KEEPALIVE_CONNECTIONS=50
+RPC_KEEPALIVE_EXPIRY_S=300
 ```
 
 ### VPA Deployment
@@ -712,16 +757,10 @@ curl http://localhost:8080/health
 
 ### VPA Contract Behavior
 
-**When USE_NEW_CONTRACTS=true:**
-- Submits ONLY to new contracts (ProtocolState + DataMarket)
-- No submission to legacy contracts
+- Submits to ProtocolState and DataMarket contracts
 - Priority-based submission via VPA authorization
 - Multi-signer support for higher throughput
-
-**When USE_NEW_CONTRACTS=false:**
-- No contract submissions (DSV does consensus only)
-- Legacy contract submission is completely disabled
-- Maintains compatibility with existing DSV workflow
+- Automatic priority assignment and window timing
 
 ### Multi-Signer Configuration
 

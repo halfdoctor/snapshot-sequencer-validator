@@ -475,6 +475,31 @@
       {
         "indexed": true,
         "internalType": "address",
+        "name": "updater",
+        "type": "address"
+      },
+      {
+        "indexed": false,
+        "internalType": "bool",
+        "name": "added",
+        "type": "bool"
+      },
+      {
+        "indexed": false,
+        "internalType": "uint256",
+        "name": "timestamp",
+        "type": "uint256"
+      }
+    ],
+    "name": "TrustedUpdaterUpdated",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {
+        "indexed": true,
+        "internalType": "address",
         "name": "implementation",
         "type": "address"
       }
@@ -593,6 +618,19 @@
   {
     "inputs": [],
     "name": "acceptOwnership",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "address",
+        "name": "_updater",
+        "type": "address"
+      }
+    ],
+    "name": "addTrustedUpdater",
     "outputs": [],
     "stateMutability": "nonpayable",
     "type": "function"
@@ -1664,6 +1702,19 @@
     "type": "function"
   },
   {
+    "inputs": [
+      {
+        "internalType": "address",
+        "name": "_updater",
+        "type": "address"
+      }
+    ],
+    "name": "removeTrustedUpdater",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
     "inputs": [],
     "name": "renounceOwnership",
     "outputs": [],
@@ -1936,6 +1987,25 @@
   {
     "inputs": [
       {
+        "internalType": "address",
+        "name": "",
+        "type": "address"
+      }
+    ],
+    "name": "trustedUpdaters",
+    "outputs": [
+      {
+        "internalType": "bool",
+        "name": "",
+        "type": "bool"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
         "internalType": "contract PowerloomDataMarket",
         "name": "dataMarket",
         "type": "address"
@@ -2015,6 +2085,57 @@
         "type": "address"
       },
       {
+        "internalType": "uint256",
+        "name": "day",
+        "type": "uint256"
+      },
+      {
+        "internalType": "uint256",
+        "name": "eligibleNodes",
+        "type": "uint256"
+      }
+    ],
+    "name": "updateEligibleNodesForDay",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "contract PowerloomDataMarket",
+        "name": "dataMarket",
+        "type": "address"
+      },
+      {
+        "internalType": "uint256[]",
+        "name": "slotIds",
+        "type": "uint256[]"
+      },
+      {
+        "internalType": "uint256[]",
+        "name": "submissionsList",
+        "type": "uint256[]"
+      },
+      {
+        "internalType": "uint256",
+        "name": "day",
+        "type": "uint256"
+      }
+    ],
+    "name": "updateEligibleSubmissionCountsForDay",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
+        "internalType": "contract PowerloomDataMarket",
+        "name": "dataMarket",
+        "type": "address"
+      },
+      {
         "internalType": "address",
         "name": "_address",
         "type": "address"
@@ -2046,6 +2167,19 @@
   {
     "inputs": [
       {
+        "internalType": "address",
+        "name": "_address",
+        "type": "address"
+      }
+    ],
+    "name": "updateSnapshotterState",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {
         "internalType": "contract PowerloomDataMarket",
         "name": "dataMarket",
         "type": "address"
@@ -2064,27 +2198,9 @@
         "internalType": "uint256",
         "name": "day",
         "type": "uint256"
-      },
-      {
-        "internalType": "uint256",
-        "name": "eligibleNodes",
-        "type": "uint256"
       }
     ],
-    "name": "updateRewards",
-    "outputs": [],
-    "stateMutability": "nonpayable",
-    "type": "function"
-  },
-  {
-    "inputs": [
-      {
-        "internalType": "address",
-        "name": "_address",
-        "type": "address"
-      }
-    ],
-    "name": "updateSnapshotterState",
+    "name": "updateSubmissionCounts",
     "outputs": [],
     "stateMutability": "nonpayable",
     "type": "function"

@@ -62,6 +62,16 @@ func (kb *KeyBuilder) OutgoingBroadcastBatch() string {
 	return fmt.Sprintf("%s:%s:outgoing:broadcast:batch", kb.ProtocolState, kb.DataMarket)
 }
 
+// OutgoingSpamReports returns the key for spam reports to broadcast
+func (kb *KeyBuilder) OutgoingSpamReports() string {
+	return fmt.Sprintf("%s:%s:outgoing:spam-reports", kb.ProtocolState, kb.DataMarket)
+}
+
+// IncomingSpamReports returns the key for received spam reports queue
+func (kb *KeyBuilder) IncomingSpamReports() string {
+	return fmt.Sprintf("%s:%s:incoming:spam-reports", kb.ProtocolState, kb.DataMarket)
+}
+
 // Dequeuer Keys
 
 // ProcessingSubmission returns the key for submission being processed
@@ -347,6 +357,62 @@ func (kb *KeyBuilder) MetricsParticipation() string {
 // MetricsCurrentEpoch returns the namespaced key for current epoch status
 func (kb *KeyBuilder) MetricsCurrentEpoch() string {
 	return fmt.Sprintf("%s:%s:metrics:current_epoch", kb.ProtocolState, kb.DataMarket)
+}
+
+// Simulation Message Keys (namespaced)
+// Used for caching epoch 0 simulation messages from snapshotters at startup
+// These messages contain real CIDs and EIP-712 signatures (unlike heartbeats which have empty CIDs)
+
+// SimulationsTimeline returns the ZSET key for simulation events ordered by timestamp
+// Format: {protocol}:{market}:simulations:timeline
+func (kb *KeyBuilder) SimulationsTimeline() string {
+	return fmt.Sprintf("%s:%s:simulations:timeline", kb.ProtocolState, kb.DataMarket)
+}
+
+// SimulationMetadata returns the HASH key for detailed simulation metadata
+// Format: {protocol}:{market}:simulations:metadata:{entityID}
+// Fields: peer_id, snapshotter_address, slot_id, project_id, snapshot_cid, data_market, timestamp
+func (kb *KeyBuilder) SimulationMetadata(entityID string) string {
+	return fmt.Sprintf("%s:%s:simulations:metadata:%s", kb.ProtocolState, kb.DataMarket, entityID)
+}
+
+// SimulationsByPeer returns the SET key for tracking simulations per peer ID
+// Format: {protocol}:{market}:simulations:peer:{peerID}
+// Members: simulation entity IDs
+func (kb *KeyBuilder) SimulationsByPeer(peerID string) string {
+	return fmt.Sprintf("%s:%s:simulations:peer:%s", kb.ProtocolState, kb.DataMarket, peerID)
+}
+
+// SimulationsBySnapshotter returns the SET key for tracking simulations per snapshotter address
+// Format: {protocol}:{market}:simulations:snapshotter:{address}
+// Members: simulation entity IDs
+func (kb *KeyBuilder) SimulationsBySnapshotter(address string) string {
+	return fmt.Sprintf("%s:%s:simulations:snapshotter:%s", kb.ProtocolState, kb.DataMarket, checksumAddress(address))
+}
+
+// SimulationsBySlot returns the SET key for tracking simulations per slot ID
+// Format: {protocol}:{market}:simulations:slot:{slotID}
+// Members: simulation entity IDs
+func (kb *KeyBuilder) SimulationsBySlot(slotID string) string {
+	return fmt.Sprintf("%s:%s:simulations:slot:%s", kb.ProtocolState, kb.DataMarket, slotID)
+}
+
+// Heartbeat Message Keys (namespaced)
+// Heartbeats are epoch 0 messages with empty CID from local-collector for P2P mesh maintenance
+// NOTE: Heartbeats are NOT EIP-712 signed, so only peer ID is available (no snapshotter address)
+// To correlate peer ID with snapshotter address, use simulation or submission data from other endpoints
+
+// HeartbeatsTimeline returns the ZSET key for heartbeat events ordered by timestamp
+// Format: {protocol}:{market}:heartbeats:timeline
+func (kb *KeyBuilder) HeartbeatsTimeline() string {
+	return fmt.Sprintf("%s:%s:heartbeats:timeline", kb.ProtocolState, kb.DataMarket)
+}
+
+// HeartbeatsByPeer returns the ZSET key for heartbeats from a specific peer
+// Format: {protocol}:{market}:heartbeats:peer:{peerID}
+// Members: heartbeat entity IDs with timestamp scores
+func (kb *KeyBuilder) HeartbeatsByPeer(peerID string) string {
+	return fmt.Sprintf("%s:%s:heartbeats:peer:%s", kb.ProtocolState, kb.DataMarket, peerID)
 }
 
 // Monitoring Keys (not namespaced)

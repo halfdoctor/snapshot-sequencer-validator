@@ -750,6 +750,11 @@ func (sw *StateWorker) pruneOldData(ctx context.Context) {
 		sw.keyBuilder.MetricsBatchesTimeline(),
 		sw.keyBuilder.MetricsSubmissionsTimeline(),
 		sw.keyBuilder.MetricsValidationsTimeline(),
+		// Also prune non-namespaced timeline (legacy code may still write to it)
+		"metrics:submissions:timeline",
+		"metrics:validations:timeline",
+		"metrics:epochs:timeline",
+		"metrics:batches:timeline",
 	}
 
 	totalRemoved := int64(0)
@@ -899,6 +904,44 @@ func (sw *StateWorker) monitorRedisKeySizes(ctx context.Context) {
 				"key":     aggregationQueueKey,
 				"deleted": deleted,
 			}).Info("Cleaned up legacy aggregation queue")
+		}
+	}
+
+	// Also scan for ALL legacy aggregation:queue keys (multi-market support)
+	// Pattern: *:*:aggregation:queue - handles multiple protocol:market combinations
+	cursor := uint64(0)
+	for {
+		var keys []string
+		keys, cursor, err = sw.redis.Scan(ctx, cursor, "*:*:aggregation:queue", 100).Result()
+		if err != nil {
+			log.WithError(err).Error("Failed to scan for legacy aggregation queues")
+			break
+		}
+		for _, key := range keys {
+			// Skip the one we already checked above
+			if key == aggregationQueueKey {
+				continue
+			}
+			size, err := sw.redis.LLen(ctx, key).Result()
+			if err == nil && size > thresholds["list"] {
+				log.WithFields(logrus.Fields{
+					"key":   key,
+					"size":  size,
+					"limit": thresholds["list"],
+				}).Warn("Legacy aggregation queue exceeds threshold - cleaning up")
+				deleted, err := sw.redis.Del(ctx, key).Result()
+				if err != nil {
+					log.WithError(err).WithField("key", key).Error("Failed to cleanup legacy aggregation queue")
+				} else if deleted > 0 {
+					log.WithFields(logrus.Fields{
+						"key":     key,
+						"deleted": deleted,
+					}).Info("Cleaned up legacy aggregation queue")
+				}
+			}
+		}
+		if cursor == 0 {
+			break
 		}
 	}
 }

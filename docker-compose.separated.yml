@@ -28,8 +28,8 @@ services:
       - REDIS_PORT=6379
       - REDIS_DB=${REDIS_DB:-0}
       - REDIS_PASSWORD=${REDIS_PASSWORD:-}
-      - BOOTSTRAP_PEERS=${BOOTSTRAP_PEERS}
-      - BOOTSTRAP_MULTIADDR=${BOOTSTRAP_MULTIADDR}
+      - BOOTSTRAP_PEERS=${BOOTSTRAP_PEERS:-}
+      - BOOTSTRAP_MULTIADDR=${BOOTSTRAP_MULTIADDR:-}
       - RENDEZVOUS_POINT=${RENDEZVOUS_POINT:-powerloom-snapshot-sequencer-network}
       - PRIVATE_KEY=${PRIVATE_KEY}
       - PUBLIC_IP=${PUBLIC_IP}
@@ -43,6 +43,16 @@ services:
       - GOSSIPSUB_VALIDATOR_PRESENCE_TOPIC=${GOSSIPSUB_VALIDATOR_PRESENCE_TOPIC:-/powerloom/validator/presence}
       - GOSSIPSUB_CONSENSUS_VOTES_TOPIC=${GOSSIPSUB_CONSENSUS_VOTES_TOPIC:-/powerloom/consensus/votes}
       - GOSSIPSUB_CONSENSUS_PROPOSALS_TOPIC=${GOSSIPSUB_CONSENSUS_PROPOSALS_TOPIC:-/powerloom/consensus/proposals}
+      # P2P Gateway submission processing configuration
+      - P2P_GATEWAY_SUBMISSION_WORKERS=${P2P_GATEWAY_SUBMISSION_WORKERS:-10}
+      - P2P_GATEWAY_SUBMISSION_CHAN_SIZE=${P2P_GATEWAY_SUBMISSION_CHAN_SIZE:-1000}
+      # Spam protection configuration
+      - ENABLE_SPAM_PROTECTION=${ENABLE_SPAM_PROTECTION:-true}
+      - FULL_NODE_PEER_IDS=${FULL_NODE_PEER_IDS:-}
+      - BULK_SERVICE_PEER_IDS=${BULK_SERVICE_PEER_IDS:-}
+      - SPAM_CACHE_TTL_HOURS=${SPAM_CACHE_TTL_HOURS:-24}
+      - ENABLE_SPAM_REPORT_BROADCAST=${ENABLE_SPAM_REPORT_BROADCAST:-true}
+      - SPAM_REPORT_TOPIC=${SPAM_REPORT_TOPIC:-}
     depends_on:
       redis:
         condition: service_healthy
@@ -75,6 +85,11 @@ services:
       - ENABLE_FINALIZER=false
       - ENABLE_BATCH_AGGREGATION=false
       - ENABLE_EVENT_MONITOR=false
+      # Spam protection configuration (local tracking only - P2P handled by spam-aggregator)
+      - ENABLE_SPAM_PROTECTION=${ENABLE_SPAM_PROTECTION:-true}
+      - FULL_NODE_PEER_IDS=${FULL_NODE_PEER_IDS:-}
+      - BULK_SERVICE_PEER_IDS=${BULK_SERVICE_PEER_IDS:-}
+      - SPAM_CACHE_TTL_HOURS=${SPAM_CACHE_TTL_HOURS:-24}
       # Dequeuer specific
       - DEQUEUER_WORKERS=${DEQUEUER_WORKERS:-5}
       - MAX_SUBMISSIONS_PER_EPOCH=${MAX_SUBMISSIONS_PER_EPOCH:-100}
@@ -92,7 +107,7 @@ services:
       - ENABLE_PROTOCOL_STATE_CACHER=${ENABLE_PROTOCOL_STATE_CACHER:-false}
       # Protocol State Cacher Configuration (needed to check cold sync status)
       - SLOT_SYNC_INTERVAL_SECONDS=${SLOT_SYNC_INTERVAL_SECONDS:-3600}
-      - CONTRACT_ABI_PATH=${CONTRACT_ABI_PATH:-./abi/LegacyProtocolState.json}
+      - CONTRACT_ABI_PATH=${CONTRACT_ABI_PATH:-./abi/PowerloomProtocolState.abi.json}
     depends_on:
       redis:
         condition: service_healthy
@@ -120,17 +135,24 @@ services:
       - REDIS_PASSWORD=${REDIS_PASSWORD:-}
       - DEBUG_MODE=${DEBUG_MODE:-false}
       # VPA Configuration for priority monitoring
-      - VPA_CONTRACT_ADDRESS=${VPA_CONTRACT_ADDRESS}
+      - VPA_CONTRACT_ADDRESS=${VPA_CONTRACT_ADDRESS:-}
       - VPA_VALIDATOR_ADDRESS=${VPA_VALIDATOR_ADDRESS}
-      - NEW_PROTOCOL_STATE_CONTRACT=${NEW_PROTOCOL_STATE_CONTRACT}
-      - NEW_DATA_MARKET_CONTRACT=${NEW_DATA_MARKET_CONTRACT}
-      - USE_NEW_CONTRACTS=${USE_NEW_CONTRACTS}
+      - VPA_VALIDATOR_NODE_ID=${VPA_VALIDATOR_NODE_ID:-}
       # Component toggles - ONLY EVENT MONITOR
       - ENABLE_LISTENER=false
       - ENABLE_DEQUEUER=false
       - ENABLE_FINALIZER=false
       - ENABLE_BATCH_AGGREGATION=false
       - ENABLE_EVENT_MONITOR=true
+      # Spam protection (needed for event monitor to trigger spam window aggregation)
+      - ENABLE_SPAM_PROTECTION=${ENABLE_SPAM_PROTECTION:-true}
+      - ENABLE_SPAM_REPORT_BROADCAST=${ENABLE_SPAM_REPORT_BROADCAST:-true}
+      - SPAM_REPORT_TOPIC=${SPAM_REPORT_TOPIC:-}
+      - SPAM_REPORT_CONSENSUS_DELAY_SECONDS=${SPAM_REPORT_CONSENSUS_DELAY_SECONDS:-10}
+      - FULL_NODE_PEER_IDS=${FULL_NODE_PEER_IDS:-}
+      - BULK_SERVICE_PEER_IDS=${BULK_SERVICE_PEER_IDS:-}
+      - SPAM_CACHE_TTL_HOURS=${SPAM_CACHE_TTL_HOURS:-24}
+      - GOSSIPSUB_VALIDATOR_PRESENCE_TOPIC=${GOSSIPSUB_VALIDATOR_PRESENCE_TOPIC:-/powerloom/dsv-devnet-alpha/validator/presence}
       # RPC Configuration
       - POWERLOOM_RPC_NODES=${POWERLOOM_RPC_NODES}
       - POWERLOOM_ARCHIVE_RPC_NODES=${POWERLOOM_ARCHIVE_RPC_NODES:-[]}
@@ -138,7 +160,7 @@ services:
       - PROTOCOL_STATE_CONTRACT=${PROTOCOL_STATE_CONTRACT}
       - DATA_MARKET_ADDRESSES=${DATA_MARKET_ADDRESSES}
       # Contract ABI path
-      - CONTRACT_ABI_PATH=${CONTRACT_ABI_PATH:-./abi/LegacyProtocolState.json}
+      - CONTRACT_ABI_PATH=${CONTRACT_ABI_PATH:-./abi/PowerloomProtocolState.abi.json}
       # Event monitoring config
       - EVENT_POLL_INTERVAL=${EVENT_POLL_INTERVAL:-12}
       - EVENT_START_BLOCK=${EVENT_START_BLOCK:-0}
@@ -175,14 +197,14 @@ services:
       - ENABLE_FINALIZER=false
       - ENABLE_BATCH_AGGREGATION=false
       - ENABLE_EVENT_MONITOR=false
-      - ENABLE_PROTOCOL_STATE_CACHER=true
+      - ENABLE_PROTOCOL_STATE_CACHER=${ENABLE_PROTOCOL_STATE_CACHER:-false}
       # RPC Configuration
       - POWERLOOM_RPC_NODES=${POWERLOOM_RPC_NODES}
       - POWERLOOM_ARCHIVE_RPC_NODES=${POWERLOOM_ARCHIVE_RPC_NODES:-[]}
       # Contract addresses
       - PROTOCOL_STATE_CONTRACT=${PROTOCOL_STATE_CONTRACT}
       # Contract ABI path
-      - CONTRACT_ABI_PATH=${CONTRACT_ABI_PATH:-./abi/LegacyProtocolState.json}
+      - CONTRACT_ABI_PATH=${CONTRACT_ABI_PATH:-./abi/PowerloomProtocolState.abi.json}
       # Protocol State Cacher Configuration
       - SLOT_SYNC_INTERVAL_SECONDS=${SLOT_SYNC_INTERVAL_SECONDS:-3600}
       - SLOT_SYNC_BATCH_SIZE=${SLOT_SYNC_BATCH_SIZE:-20}
@@ -241,6 +263,41 @@ services:
         max-size: "10m"
         max-file: "3"
 
+  # Spam Aggregator - Singleton for spam report P2P exchange and aggregation
+  spam-aggregator:
+    build:
+      context: .
+      dockerfile: Dockerfile.spam-aggregator
+    environment:
+      - SEQUENCER_ID=${SEQUENCER_ID:-validator1}
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_DB=${REDIS_DB:-0}
+      - REDIS_PASSWORD=${REDIS_PASSWORD:-}
+      - DEBUG_MODE=${DEBUG_MODE:-false}
+      # Spam protection configuration
+      - ENABLE_SPAM_PROTECTION=${ENABLE_SPAM_PROTECTION:-true}
+      - ENABLE_SPAM_REPORT_BROADCAST=${ENABLE_SPAM_REPORT_BROADCAST:-true}
+      - SPAM_REPORT_TOPIC=${SPAM_REPORT_TOPIC:-}
+      - SPAM_REPORT_CONSENSUS_DELAY_SECONDS=${SPAM_REPORT_CONSENSUS_DELAY_SECONDS:-10}
+      - FULL_NODE_PEER_IDS=${FULL_NODE_PEER_IDS:-}
+      - BULK_SERVICE_PEER_IDS=${BULK_SERVICE_PEER_IDS:-}
+      - SPAM_CACHE_TTL_HOURS=${SPAM_CACHE_TTL_HOURS:-24}
+      - GOSSIPSUB_VALIDATOR_PRESENCE_TOPIC=${GOSSIPSUB_VALIDATOR_PRESENCE_TOPIC:-/powerloom/dsv-devnet-alpha/validator/presence}
+      - PROTOCOL_STATE_CONTRACT=${PROTOCOL_STATE_CONTRACT}
+      - DATA_MARKET_ADDRESSES=${DATA_MARKET_ADDRESSES}
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - sequencer-net
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
   # Aggregator - Singleton for consensus/batch aggregation
   aggregator:
     build:
@@ -267,17 +324,16 @@ services:
       - PROTOCOL_STATE_CONTRACT=${PROTOCOL_STATE_CONTRACT}
       - DATA_MARKET_ADDRESSES=${DATA_MARKET_ADDRESSES}
       - POWERLOOM_RPC_NODES=${POWERLOOM_RPC_NODES}
-      - NEW_PROTOCOL_STATE_CONTRACT=${NEW_PROTOCOL_STATE_CONTRACT}
-      - NEW_DATA_MARKET_CONTRACT=${NEW_DATA_MARKET_CONTRACT}
-      - USE_NEW_CONTRACTS=${USE_NEW_CONTRACTS}
       # VPA Configuration - Required for VPA client initialization
       - ENABLE_ONCHAIN_SUBMISSION=${ENABLE_ONCHAIN_SUBMISSION:-true}
-      - VPA_CONTRACT_ADDRESS=${VPA_CONTRACT_ADDRESS}
+      - VPA_CONTRACT_ADDRESS=${VPA_CONTRACT_ADDRESS:-}
       - VPA_VALIDATOR_ADDRESS=${VPA_VALIDATOR_ADDRESS}
+      - VPA_VALIDATOR_NODE_ID=${VPA_VALIDATOR_NODE_ID:-}
       - RELAYER_PY_ENDPOINT=${RELAYER_PY_ENDPOINT:-http://relayer-py:8080}
       # Aggregation Configuration
       - AGGREGATION_WINDOW_SECONDS=${AGGREGATION_WINDOW_SECONDS:-20}
       - LEVEL1_FINALIZATION_DELAY_SECONDS=${LEVEL1_FINALIZATION_DELAY_SECONDS:-10}
+      - SPAM_REPORT_CONSENSUS_DELAY_SECONDS=${SPAM_REPORT_CONSENSUS_DELAY_SECONDS:-10}
     depends_on:
       redis:
         condition: service_healthy
@@ -346,8 +402,15 @@ services:
     environment:
       # Core RPC Configuration
       - POWERLOOM_RPC_NODES=${POWERLOOM_RPC_NODES}
-      - NEW_PROTOCOL_STATE_CONTRACT=${NEW_PROTOCOL_STATE_CONTRACT}
+      - PROTOCOL_STATE_CONTRACT=${PROTOCOL_STATE_CONTRACT}
       - ANCHOR_CHAIN_ID=${ANCHOR_CHAIN_ID:-11167}
+      # RPC timeouts and connection pooling (avoids "Timeout on reading data from socket")
+      # Precedence: RPC_SOCK_READ_TIMEOUT_S overrides RPC_REQUEST_TIMEOUT_S when both set
+      - RPC_REQUEST_TIMEOUT_S=${RPC_REQUEST_TIMEOUT_S:-60}
+      - RPC_SOCK_READ_TIMEOUT_S=${RPC_SOCK_READ_TIMEOUT_S:-}
+      - RPC_MAX_CONNECTIONS=${RPC_MAX_CONNECTIONS:-100}
+      - RPC_MAX_KEEPALIVE_CONNECTIONS=${RPC_MAX_KEEPALIVE_CONNECTIONS:-50}
+      - RPC_KEEPALIVE_EXPIRY_S=${RPC_KEEPALIVE_EXPIRY_S:-300}
       # Minimum signer balance check (default: 0 to disable for devnet)
       - MIN_SIGNER_BALANCE_ETH=${MIN_SIGNER_BALANCE_ETH:-0}
       # Multi-signer Configuration (comma-separated)
@@ -361,6 +424,8 @@ services:
       # RabbitMQ Configuration
       - RABBITMQ_HOST=rabbitmq
       - RABBITMQ_PORT=5672
+      # HTTP server (health + API); default 8080
+      - RELAYER_PORT=${RELAYER_PORT:-8080}
     depends_on:
       redis:
         condition: service_healthy
@@ -372,13 +437,13 @@ services:
     profiles:
       - vpa
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      test: ["CMD-SHELL", "curl -f http://localhost:${RELAYER_PORT:-8080}/health"]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 40s
     ports:
-      - "8080:8080"
+      - "${RELAYER_PORT:-8080}:${RELAYER_PORT:-8080}"
 
   # Monitor API - REST API for pipeline monitoring
   monitor-api:
@@ -452,7 +517,6 @@ services:
       # Cleanup configuration
       - DATA_CLEANUP_DAYS=${IPFS_CLEANUP_MAX_AGE_DAYS:-7}
       - IPFS_CLEANUP_INTERVAL_HOURS=${IPFS_CLEANUP_INTERVAL_HOURS:-72}
-      - CLEANUP_SCHEDULE=0 */${IPFS_CLEANUP_INTERVAL_HOURS:-72} * * *
     entrypoint: >
       sh -c '
         echo "Setting up data cleanup cron job..."
@@ -460,11 +524,14 @@ services:
 
         # Cleanup command: Remove old .data files AND run IPFS garbage collection
         # Garbage collection is critical to free inodes from unpinned blocks
+        DATA_CLEANUP_DAYS=${DATA_CLEANUP_DAYS:-7}
+        IPFS_CLEANUP_INTERVAL_HOURS=${IPFS_CLEANUP_INTERVAL_HOURS:-72}
+        CLEANUP_SCHEDULE="0 */${IPFS_CLEANUP_INTERVAL_HOURS} * * *"
         cleanup_cmd="date && echo Starting IPFS cleanup process... && find /data/ipfs -type f -mtime +${DATA_CLEANUP_DAYS} -name '\''*.data'\'' -print -delete && echo Running IPFS garbage collection to free inodes... && ipfs repo gc && echo Cleanup process completed."
         echo "${CLEANUP_SCHEDULE} ${cleanup_cmd} >> /proc/1/fd/1 2>&1" > /var/spool/cron/crontabs/root
         chmod 0644 /var/spool/cron/crontabs/root
 
-        echo "Cron job set up. Will clean files older than ${DATA_CLEANUP_DAYS} days and run garbage collection every ${IPFS_CLEANUP_INTERVAL_HOURS:-72} hours (${CLEANUP_SCHEDULE})"
+        echo "Cron job set up. Will clean files older than ${DATA_CLEANUP_DAYS} days and run garbage collection every ${IPFS_CLEANUP_INTERVAL_HOURS} hours (${CLEANUP_SCHEDULE})"
 
         # Initialize IPFS repository if not exists
         if [ ! -f /data/ipfs/config ]; then

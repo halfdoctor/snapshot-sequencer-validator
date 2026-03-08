@@ -1,0 +1,5 @@
+=== DSV Bulk Service Snapshotter Address Flagging Test ===
+Started: Wed Jan 14 16:40:21 IST 2026
+Running on: anomits-MacBook-Pro.local
+Repo root: /Users/anomit/workspace/decentralized_sequencer_eigen_workspace/decentralized-sequencer
+

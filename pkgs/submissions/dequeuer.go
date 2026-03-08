@@ -11,6 +11,7 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	customcrypto "github.com/powerloom/snapshot-sequencer-validator/pkgs/crypto"
 	redislib "github.com/powerloom/snapshot-sequencer-validator/pkgs/redis"
+	"github.com/powerloom/snapshot-sequencer-validator/pkgs/spam"
 	"github.com/redis/go-redis/v9"
 	log "github.com/sirupsen/logrus"
 )
@@ -28,6 +29,13 @@ type Dequeuer struct {
 	stats                 DequeuerStats
 	statsMutex            sync.RWMutex
 	protocolStateContract string // Protocol state contract address for Redis key namespacing
+
+	// Spam protection components
+	spamTracker          *spam.SpamTracker
+	rateLimiter          *spam.RateLimiter
+	flagging             *spam.FlaggingService
+	spamReporter         *spam.SpamReporter
+	enableSpamProtection bool
 }
 
 // DequeuerStats tracks processing metrics
@@ -41,7 +49,8 @@ type DequeuerStats struct {
 
 // NewDequeuer creates a new submission dequeuer
 // snapshotterStateAddr must be provided if enableSlotValidation is true
-func NewDequeuer(redisClient *redis.Client, keyBuilder *redislib.KeyBuilder, sequencerID string, chainID int64, protocolStateContract string, snapshotterStateAddr common.Address, enableSlotValidation bool) (*Dequeuer, error) {
+// slotManager is optional - if provided, enables on-demand slot fetching during validation
+func NewDequeuer(redisClient *redis.Client, keyBuilder *redislib.KeyBuilder, sequencerID string, chainID int64, protocolStateContract string, snapshotterStateAddr common.Address, enableSlotValidation bool, spamComponents *spam.SpamComponents, slotManager *SlotManager) (*Dequeuer, error) {
 	if enableSlotValidation && snapshotterStateAddr == (common.Address{}) {
 		return nil, fmt.Errorf("snapshotterStateAddr is required when slot validation is enabled")
 	}
@@ -51,9 +60,9 @@ func NewDequeuer(redisClient *redis.Client, keyBuilder *redislib.KeyBuilder, seq
 	}
 
 	protocolStateAddr := common.HexToAddress(protocolStateContract)
-	slotValidator := NewSlotValidator(redisClient, protocolStateAddr, snapshotterStateAddr)
+	slotValidator := NewSlotValidator(redisClient, protocolStateAddr, snapshotterStateAddr, slotManager)
 
-	return &Dequeuer{
+	d := &Dequeuer{
 		redisClient:           redisClient,
 		keyBuilder:            keyBuilder,
 		sequencerID:           sequencerID,
@@ -62,45 +71,158 @@ func NewDequeuer(redisClient *redis.Client, keyBuilder *redislib.KeyBuilder, seq
 		enableSlotValidation:  enableSlotValidation,
 		processedSubmissions:  make(map[string]*ProcessedSubmission),
 		protocolStateContract: protocolStateContract, // Store for Redis key namespacing
-	}, nil
+	}
+
+	// Initialize spam protection components if provided
+	if spamComponents != nil {
+		d.spamTracker = spamComponents.Tracker
+		d.rateLimiter = spamComponents.RateLimiter
+		d.flagging = spamComponents.Flagging
+		d.spamReporter = spamComponents.Reporter
+		d.enableSpamProtection = true
+	}
+
+	return d, nil
 }
 
 // ProcessSubmission validates and stores a submission
-func (d *Dequeuer) ProcessSubmission(submission *SnapshotSubmission, submissionID string, metaData map[string]interface{}) error {
+// Returns error and snapshotter address (empty if signature verification failed)
+func (d *Dequeuer) ProcessSubmission(submission *SnapshotSubmission, submissionID string, metaData map[string]interface{}) (string, error) {
 	startTime := time.Now()
 
 	// Check for duplicate
 	d.submissionsMutex.RLock()
-	if _, exists := d.processedSubmissions[submissionID]; exists {
+	if processed, exists := d.processedSubmissions[submissionID]; exists {
 		d.submissionsMutex.RUnlock()
 		log.Debugf("Submission %s already processed", submissionID)
-		return nil
+		return processed.SnapshotterAddr, nil
 	}
 	d.submissionsMutex.RUnlock()
 
+	// Extract peer ID from metadata
+	var peerID string
+	if metaData != nil {
+		if p, ok := metaData["peer_id"].(string); ok {
+			peerID = p
+		}
+	}
+
+	ctx := context.Background()
+
+	// Spam protection: Check flagged peers and snapshotters (if enabled)
+	if d.enableSpamProtection && d.flagging != nil {
+		// Check if peer is flagged
+		if peerID != "" {
+			flagged, err := d.flagging.IsPeerFlagged(ctx, peerID)
+			if err != nil {
+				log.Warnf("Failed to check if peer is flagged: %v", err)
+			} else if flagged {
+				d.updateStats(false, time.Since(startTime))
+				log.Warnf("Rejected submission from flagged peer: %s", peerID)
+				return "", fmt.Errorf("peer is flagged: %s", peerID)
+			}
+		}
+	}
+
 	// Validate submission
 	if err := d.validateSubmission(submission); err != nil {
+		// Track validation failure for spam protection
+		if d.enableSpamProtection && d.spamTracker != nil && peerID != "" {
+			if err := d.spamTracker.TrackValidationFailure(ctx, peerID, "", submission.Request.EpochId, err); err != nil {
+				log.Warnf("Failed to track validation failure: %v", err)
+			}
+		}
 		d.updateStats(false, time.Since(startTime))
-		return fmt.Errorf("validation failed: %w", err)
+		return "", fmt.Errorf("validation failed: %w", err)
 	}
 
 	// Verify signature and extract snapshotter address
 	snapshotterAddr, err := d.verifySignature(submission)
 	if err != nil {
+		// Track validation failure for spam protection
+		if d.enableSpamProtection && d.spamTracker != nil && peerID != "" {
+			if err := d.spamTracker.TrackValidationFailure(ctx, peerID, "", submission.Request.EpochId, err); err != nil {
+				log.Warnf("Failed to track validation failure: %v", err)
+			}
+		}
 		d.updateStats(false, time.Since(startTime))
-		return fmt.Errorf("signature verification failed: %w", err)
+		return "", fmt.Errorf("signature verification failed: %w", err)
+	}
+
+	// Detect and cache simulation messages (epoch 0 with real CID)
+	// Simulation messages are sent by snapshotters at startup to verify connectivity
+	// Unlike heartbeats (epoch 0 + empty CID), simulations contain real data and are EIP-712 signed
+	if submission.Request.EpochId == 0 && submission.Request.SnapshotCid != "" {
+		log.Infof("📡 Detected simulation message from peer %s, snapshotter %s (epoch=0, cid=%s)",
+			peerID, snapshotterAddr.Hex(), submission.Request.SnapshotCid)
+
+		// Cache the simulation for monitoring purposes
+		if err := d.CacheSimulation(peerID, snapshotterAddr, submission); err != nil {
+			log.Warnf("Failed to cache simulation message: %v", err)
+			// Don't fail the submission - caching is non-critical
+		}
+
+		// Update stats for simulation
+		d.updateStats(true, time.Since(startTime))
+
+		// Return early - simulation messages don't need further processing (slot validation, spam tracking, etc.)
+		// They're just for startup connectivity verification
+		return snapshotterAddr.Hex(), nil
+	}
+
+	// Spam protection: Check flagged snapshotter address (if enabled)
+	if d.enableSpamProtection && d.flagging != nil && snapshotterAddr != (common.Address{}) {
+		flagged, err := d.flagging.IsSnapshotterFlagged(ctx, snapshotterAddr.Hex())
+		if err != nil {
+			log.Warnf("Failed to check if snapshotter is flagged: %v", err)
+		} else if flagged {
+			d.updateStats(false, time.Since(startTime))
+			log.Warnf("Rejected submission from flagged snapshotter: %s", snapshotterAddr.Hex())
+			return snapshotterAddr.Hex(), fmt.Errorf("snapshotter is flagged: %s", snapshotterAddr.Hex())
+		}
 	}
 
 	// Validate snapshotter address against slot registration (if enabled)
 	if d.enableSlotValidation && snapshotterAddr != (common.Address{}) {
 		if err := d.slotValidator.ValidateSnapshotterForSlot(submission.Request.SlotId, snapshotterAddr); err != nil {
+			// Track validation failure for spam protection
+			if d.enableSpamProtection && d.spamTracker != nil && peerID != "" {
+				if err := d.spamTracker.TrackValidationFailure(ctx, peerID, snapshotterAddr.Hex(), submission.Request.EpochId, err); err != nil {
+					log.Warnf("Failed to track validation failure: %v", err)
+				}
+			}
 			d.updateStats(false, time.Since(startTime))
 			log.Errorf("Slot validation failed for submission (epoch=%d, slot=%d, signer=%s): %v",
 				submission.Request.EpochId, submission.Request.SlotId, snapshotterAddr.Hex(), err)
-			return fmt.Errorf("slot validation failed: %w", err)
+			return snapshotterAddr.Hex(), fmt.Errorf("slot validation failed: %w", err)
 		}
 		log.Debugf("Slot validation passed: slot %d is registered to %s",
 			submission.Request.SlotId, snapshotterAddr.Hex())
+	}
+
+	// Spam protection: Track submission count (if enabled)
+	// NOTE: We track FIRST, then check if spam should be reported
+	// Rate limiting is NOT enforced here - only flagged peers (after consensus) are rejected
+	if d.enableSpamProtection {
+		if d.spamTracker == nil {
+			log.Debugf("Spam tracker is nil (spam protection enabled but tracker not initialized)")
+		} else if peerID == "" {
+			log.Debugf("Peer ID is empty - skipping spam tracking for epoch %d", submission.Request.EpochId)
+		} else {
+			_, err := d.spamTracker.TrackSubmissionCount(ctx, peerID, snapshotterAddr.Hex(), submission.Request.EpochId)
+			if err != nil {
+				log.Warnf("Failed to track submission count: %v", err)
+			} else {
+				// Check if spam should be reported (checks consecutive violations threshold)
+				if d.spamReporter != nil {
+					if err := d.spamReporter.CheckAndReport(ctx, peerID, snapshotterAddr.Hex(), submission.Request.EpochId); err != nil {
+						log.Warnf("Failed to check/report spam: %v", err)
+					}
+				}
+			}
+		}
+	} else {
+		log.Debugf("Spam protection disabled - skipping tracking for epoch %d", submission.Request.EpochId)
 	}
 
 	// Store in local state
@@ -132,9 +254,8 @@ func (d *Dequeuer) ProcessSubmission(submission *SnapshotSubmission, submissionI
 	log.Debugf("Successfully processed submission %s for epoch %d, slot %d",
 		submissionID, submission.Request.EpochId, submission.Request.SlotId)
 
-	// Get peer ID from submission metadata if available
-	var peerID string
-	if processed.MetaData != nil {
+	// Get peer ID from submission metadata if available (already extracted above for spam protection)
+	if processed.MetaData != nil && peerID == "" {
 		if p, ok := processed.MetaData["peer_id"].(string); ok {
 			peerID = p
 		}
@@ -209,15 +330,7 @@ func (d *Dequeuer) ProcessSubmission(submission *SnapshotSubmission, submissionI
 	pipe.HIncrBy(context.Background(), fmt.Sprintf("metrics:hourly:%s:validations", hour), "total", 1)
 	pipe.Expire(context.Background(), fmt.Sprintf("metrics:hourly:%s:validations", hour), 2*time.Hour)
 
-	// 5. Add to submissions timeline
-	timestamp = time.Now().Unix()
-	// Note: We don't have access to namespaced keyBuilder here, so we use the non-namespaced timeline key
-	pipe.ZAdd(context.Background(), redislib.MetricsSubmissionsTimeline(), redis.Z{
-		Score:  float64(timestamp),
-		Member: fmt.Sprintf("validated:%s:%d", submissionID, timestamp),
-	})
-
-	// 6. Publish state change event
+	// 5. Publish state change event
 	pipe.Publish(context.Background(), "state:change", fmt.Sprintf("submission:validated:%s", submissionID))
 
 	// Execute pipeline (ignore errors - monitoring is non-critical)
@@ -225,13 +338,28 @@ func (d *Dequeuer) ProcessSubmission(submission *SnapshotSubmission, submissionI
 		log.Debugf("Failed to write monitoring metrics: %v", err)
 	}
 
-	return nil
+	return snapshotterAddr.Hex(), nil
 }
 
 func (d *Dequeuer) validateSubmission(submission *SnapshotSubmission) error {
 	// Epoch 0 heartbeat handling: Skip validation for epoch 0 with empty CID
 	// These are P2P mesh maintenance messages from Go local collector, not actual submissions
 	if submission.Request.EpochId == 0 && submission.Request.SnapshotCid == "" {
+		// TODO: [SIGNED-HEARTBEATS] Currently heartbeat messages (epoch 0 + empty CID) are not EIP-712 signed,
+		// so we cannot extract the snapshotter address. To enable peer banning based on heartbeat authenticity:
+		// 1. Modify local-collector to EIP-712 sign heartbeat messages with snapshotter private key
+		// 2. Verify signature here and extract snapshotter address
+		// 3. Cache peer ID -> snapshotter address mapping for heartbeats
+		// 4. Enable banning peers with invalid/missing EIP-712 signatures
+		// See: snapshotter-lite-local-collector/pkgs/service/msg_server.go publishHeartbeats()
+		//
+		// CURRENT IMPLEMENTATION (peer-ID-only tracking):
+		// Heartbeats are detected and cached by peer ID in cmd/unified/main.go cacheHeartbeat()
+		// This allows tracking peer activity without snapshotter address correlation.
+		// To correlate peer ID with snapshotter address, use:
+		//   - /api/v1/simulations/recent (simulation messages have EIP-712 signatures)
+		//   - /api/v1/epochs/{epochID}/submissions (regular submissions have EIP-712 signatures)
+		// Then query /api/v1/heartbeats/peer/{peerID} for heartbeat activity.
 		return fmt.Errorf("epoch 0 heartbeat: skipping")
 	}
 
@@ -282,7 +410,7 @@ func (d *Dequeuer) verifySignature(submission *SnapshotSubmission) (common.Addre
 		return common.Address{}, fmt.Errorf("signature verification failed: %w", err)
 	}
 
-	log.Infof("EIP-712 signature verified: epoch=%d, slot=%d, deadline=%d, project=%s, signer=%s, CID=%s",
+	log.Infof("EIP-712 signer extracted: epoch=%d, slot=%d, deadline=%d, project=%s, signer=%s, CID=%s",
 		submission.Request.EpochId, submission.Request.SlotId, submission.Request.Deadline,
 		submission.Request.ProjectId, signerAddr.Hex(), submission.Request.SnapshotCid)
 
@@ -339,23 +467,34 @@ func (d *Dequeuer) storeProcessingResult(submissionID string, processed *Process
 
 	// Add submission ID to ZSET for deterministic ordering (score = timestamp)
 	submissionsIdsKey := epochKeyBuilder.EpochSubmissionsIds(epochIDStr)
-	if err := d.redisClient.ZAdd(ctx, submissionsIdsKey, redis.Z{
+	zsetErr := d.redisClient.ZAdd(ctx, submissionsIdsKey, redis.Z{
 		Score:  float64(time.Now().Unix()),
 		Member: submissionID,
-	}).Err(); err != nil {
-		log.Errorf("❌ CRITICAL: Failed to add submission %s to ZSET %s: %v", submissionID, submissionsIdsKey, err)
+	}).Err()
+	if zsetErr != nil {
+		log.Errorf("❌ CRITICAL: Failed to add submission %s to ZSET %s: %v", submissionID, submissionsIdsKey, zsetErr)
 		// Continue - don't fail entire operation, but this is a critical error
-	} else {
-		log.Debugf("✅ Added submission %s to ZSET %s", submissionID, submissionsIdsKey)
 	}
 
 	// Store submission data in epoch-keyed HASH for deterministic lookup
 	submissionsDataKey := epochKeyBuilder.EpochSubmissionsData(epochIDStr)
-	if err := d.redisClient.HSet(ctx, submissionsDataKey, submissionID, data).Err(); err != nil {
-		log.Errorf("❌ CRITICAL: Failed to store submission %s in HASH %s: %v", submissionID, submissionsDataKey, err)
+	hashErr := d.redisClient.HSet(ctx, submissionsDataKey, submissionID, data).Err()
+	if hashErr != nil {
+		log.Errorf("❌ CRITICAL: Failed to store submission %s in HASH %s: %v", submissionID, submissionsDataKey, hashErr)
 		// Continue - don't fail entire operation, but this is a critical error
+	}
+
+	// Combined log for both operations (only when both succeed)
+	if zsetErr == nil && hashErr == nil {
+		log.Infof("✅ Added and stored submission %s to ZSET %s and HASH %s", submissionID, submissionsIdsKey, submissionsDataKey)
 	} else {
-		log.Debugf("✅ Stored submission %s in HASH %s", submissionID, submissionsDataKey)
+		// Log errors if either operation failed
+		if zsetErr != nil {
+			log.Errorf("❌ CRITICAL: Failed to add submission %s to ZSET %s: %v", submissionID, submissionsIdsKey, zsetErr)
+		}
+		if hashErr != nil {
+			log.Errorf("❌ CRITICAL: Failed to store submission %s in HASH %s: %v", submissionID, submissionsDataKey, hashErr)
+		}
 	}
 
 	// Set TTL on BOTH epoch structures (2 hours covers finalization window + buffer)
@@ -449,4 +588,78 @@ func (d *Dequeuer) GetProcessedCount(epochID uint64) int {
 		}
 	}
 	return count
+}
+
+// CacheSimulation stores simulation message data (epoch 0 with real CID) in Redis for monitoring.
+// Simulation messages are sent by snapshotters at startup to verify connectivity and are EIP-712 signed,
+// allowing us to extract the snapshotter address and map it to the peer ID.
+// This data is useful for:
+// 1. Verifying snapshotter identity at startup
+// 2. Mapping peer IDs to snapshotter addresses
+// 3. Monitoring which snapshotters have connected and when
+func (d *Dequeuer) CacheSimulation(peerID string, snapshotterAddr common.Address, submission *SnapshotSubmission) error {
+	ctx := context.Background()
+	timestamp := time.Now().Unix()
+
+	// Create entity ID for the simulation
+	entityID := fmt.Sprintf("sim:%d:%s:%d:%s",
+		submission.Request.SlotId,
+		submission.Request.ProjectId,
+		timestamp,
+		peerID)
+
+	// Create metadata for the simulation
+	metadata := map[string]interface{}{
+		"peer_id":             peerID,
+		"snapshotter_address": snapshotterAddr.Hex(),
+		"slot_id":             submission.Request.SlotId,
+		"project_id":          submission.Request.ProjectId,
+		"snapshot_cid":        submission.Request.SnapshotCid,
+		"data_market":         submission.DataMarket,
+		"timestamp":           timestamp,
+		"entity_id":           entityID,
+	}
+
+	metadataJSON, err := json.Marshal(metadata)
+	if err != nil {
+		return fmt.Errorf("failed to marshal simulation metadata: %w", err)
+	}
+
+	// Pipeline for atomic writes
+	pipe := d.redisClient.Pipeline()
+
+	// 1. Add to simulations timeline (ZSET sorted by timestamp)
+	pipe.ZAdd(ctx, d.keyBuilder.SimulationsTimeline(), redis.Z{
+		Score:  float64(timestamp),
+		Member: entityID,
+	})
+
+	// 2. Store simulation metadata (HASH with 7-day TTL)
+	pipe.SetEx(ctx, d.keyBuilder.SimulationMetadata(entityID), metadataJSON, 7*24*time.Hour)
+
+	// 3. Index by peer ID (SET with 7-day TTL)
+	peerKey := d.keyBuilder.SimulationsByPeer(peerID)
+	pipe.SAdd(ctx, peerKey, entityID)
+	pipe.Expire(ctx, peerKey, 7*24*time.Hour)
+
+	// 4. Index by snapshotter address (SET with 7-day TTL)
+	snapshotterKey := d.keyBuilder.SimulationsBySnapshotter(snapshotterAddr.Hex())
+	pipe.SAdd(ctx, snapshotterKey, entityID)
+	pipe.Expire(ctx, snapshotterKey, 7*24*time.Hour)
+
+	// 5. Index by slot ID (SET with 7-day TTL)
+	slotKey := d.keyBuilder.SimulationsBySlot(fmt.Sprintf("%d", submission.Request.SlotId))
+	pipe.SAdd(ctx, slotKey, entityID)
+	pipe.Expire(ctx, slotKey, 7*24*time.Hour)
+
+	// Execute pipeline
+	if _, err := pipe.Exec(ctx); err != nil {
+		return fmt.Errorf("failed to cache simulation: %w", err)
+	}
+
+	log.Infof("📡 Cached simulation message: peer=%s, snapshotter=%s, slot=%d, project=%s, cid=%s",
+		peerID, snapshotterAddr.Hex(), submission.Request.SlotId,
+		submission.Request.ProjectId, submission.Request.SnapshotCid)
+
+	return nil
 }

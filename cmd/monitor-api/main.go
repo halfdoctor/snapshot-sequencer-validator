@@ -13,12 +13,14 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	rpchelper "github.com/powerloom/go-rpc-helper"
 	"github.com/redis/go-redis/v9"
 	"github.com/sirupsen/logrus"
 	swaggerFiles "github.com/swaggo/files"
 	ginSwagger "github.com/swaggo/gin-swagger"
 
 	_ "github.com/powerloom/snapshot-sequencer-validator/docs/swagger"
+	"github.com/powerloom/snapshot-sequencer-validator/pkgs/protocolstate"
 	keys "github.com/powerloom/snapshot-sequencer-validator/pkgs/redis"
 	"github.com/powerloom/snapshot-sequencer-validator/pkgs/utils"
 )
@@ -34,8 +36,9 @@ type MonitorAPI struct {
 	redis            *redis.Client
 	ctx              context.Context
 	keyBuilder       *keys.KeyBuilder
-	newDataMarket    string // NEW_DATA_MARKET_CONTRACT for VPA endpoints
-	newProtocolState string // NEW_PROTOCOL_STATE_CONTRACT for VPA endpoints
+	dataMarket       string // First data market address for VPA endpoints (from DATA_MARKET_ADDRESSES)
+	protocolState    string // Protocol state contract address for VPA endpoints
+	snapshotterState string // SnapshotterState contract address (derived from ProtocolState at startup)
 }
 
 // DashboardSummary provides overall system health and metrics
@@ -168,15 +171,63 @@ type VPAStatsResponse struct {
 	Timestamp time.Time              `json:"timestamp"`
 }
 
-func NewMonitorAPI(redisClient *redis.Client, protocol, market string) *MonitorAPI {
-	newMarket := getEnv("NEW_DATA_MARKET_CONTRACT", "")
-	newProtocol := getEnv("NEW_PROTOCOL_STATE_CONTRACT", "")
+// SimulationInfo represents a single simulation message from a snapshotter
+// Simulation messages are epoch 0 messages with real CIDs sent at snapshotter startup
+type SimulationInfo struct {
+	EntityID           string `json:"entity_id"`           // Format: sim:{slotID}:{projectID}:{timestamp}:{peerID}
+	PeerID             string `json:"peer_id"`             // libp2p peer ID of the sender
+	SnapshotterAddress string `json:"snapshotter_address"` // EIP-712 recovered address from signature
+	SlotID             string `json:"slot_id"`             // Slot ID from the submission
+	ProjectID          string `json:"project_id"`          // Project ID from the submission
+	SnapshotCID        string `json:"snapshot_cid"`        // Real CID of the computed snapshot
+	DataMarket         string `json:"data_market"`         // Data market address
+	Timestamp          int64  `json:"timestamp"`           // Unix timestamp when received
+	Time               string `json:"time"`                // RFC3339 formatted time
+}
+
+// SimulationsResponse is the response structure for simulation listing endpoints
+type SimulationsResponse struct {
+	Count       int              `json:"count"`
+	Minutes     int              `json:"minutes,omitempty"` // For recent query
+	Simulations []SimulationInfo `json:"simulations"`
+	Timestamp   time.Time        `json:"timestamp"`
+}
+
+// HeartbeatInfo represents a single heartbeat message from a peer
+// Heartbeats are epoch 0 messages with empty CID for P2P mesh maintenance
+// NOTE: Heartbeats are NOT EIP-712 signed, so only peer ID is available (no snapshotter address)
+type HeartbeatInfo struct {
+	EntityID  string `json:"entity_id"` // Format: hb:{peerID}:{timestamp}
+	PeerID    string `json:"peer_id"`   // libp2p peer ID of the sender
+	Timestamp int64  `json:"timestamp"` // Unix timestamp when received
+	Time      string `json:"time"`      // RFC3339 formatted time
+}
+
+// HeartbeatsResponse is the response structure for heartbeat listing endpoints
+type HeartbeatsResponse struct {
+	Count      int             `json:"count"`
+	Minutes    int             `json:"minutes,omitempty"` // For recent query
+	Heartbeats []HeartbeatInfo `json:"heartbeats"`
+	Timestamp  time.Time       `json:"timestamp"`
+}
+
+func NewMonitorAPI(redisClient *redis.Client, protocol, market, snapshotterState string) *MonitorAPI {
+	protocolState := getEnv("PROTOCOL_STATE_CONTRACT", "")
+	dataMarketsStr := getEnv("DATA_MARKET_ADDRESSES", "")
+	var dataMarket string
+	if dataMarketsStr != "" {
+		markets := strings.Split(dataMarketsStr, ",")
+		if len(markets) > 0 {
+			dataMarket = strings.TrimSpace(markets[0])
+		}
+	}
 	return &MonitorAPI{
 		redis:            redisClient,
 		ctx:              context.Background(),
 		keyBuilder:       keys.NewKeyBuilder(protocol, market),
-		newDataMarket:    newMarket,
-		newProtocolState: newProtocol,
+		dataMarket:       dataMarket,
+		protocolState:    protocolState,
+		snapshotterState: snapshotterState,
 	}
 }
 
@@ -1736,17 +1787,15 @@ func getStreamLag(redisClient *redis.Client, ctx context.Context, streamKey, gro
 		return 0, fmt.Errorf("group %s not found", groupName)
 	}
 
-	// Get stream info to find total entries
-	streamInfo, err := redisClient.XInfoStream(ctx, streamKey).Result()
+	// Get stream length to estimate lag
+	streamLen, err := redisClient.XLen(ctx, streamKey).Result()
 	if err != nil {
 		return 0, err
 	}
 
 	// Simple approximation: if last delivered is "0-0", lag is total entries
-	// This is a simplification - a more accurate approach would be to calculate
-	// the difference between stream last ID and last delivered ID
 	if lastDeliveredID == "0-0" {
-		return streamInfo.Length, nil
+		return streamLen, nil
 	}
 
 	// For most cases, if the system is working, lag should be small
@@ -1903,7 +1952,7 @@ func (m *MonitorAPI) VPAEpochStatus(c *gin.Context) {
 	protocol := c.Query("protocol")
 	market := c.Query("market")
 
-	// Use specified protocol/market or fall back to NEW_DATA_MARKET_CONTRACT (VPA is only for new markets)
+	// Use specified protocol/market or fall back to configured protocol/data market for VPA endpoints
 	kb := m.keyBuilder
 	if protocol != "" || market != "" {
 		if protocol == "" {
@@ -1914,13 +1963,13 @@ func (m *MonitorAPI) VPAEpochStatus(c *gin.Context) {
 		}
 		kb = keys.NewKeyBuilder(protocol, market)
 	} else {
-		// Default to NEW_DATA_MARKET_CONTRACT for VPA endpoints
-		if m.newDataMarket != "" {
+		// Default to configured protocol/data market for VPA endpoints
+		if m.dataMarket != "" {
 			protocolToUse := m.keyBuilder.ProtocolState
-			if m.newProtocolState != "" {
-				protocolToUse = m.newProtocolState
+			if m.protocolState != "" {
+				protocolToUse = m.protocolState
 			}
-			kb = keys.NewKeyBuilder(protocolToUse, m.newDataMarket)
+			kb = keys.NewKeyBuilder(protocolToUse, m.dataMarket)
 		}
 	}
 
@@ -1986,7 +2035,7 @@ func (m *MonitorAPI) VPATimeline(c *gin.Context) {
 	timelineType := c.DefaultQuery("type", "both")
 	limitStr := c.DefaultQuery("limit", "50")
 
-	// Use specified protocol/market or fall back to NEW_DATA_MARKET_CONTRACT (VPA is only for new markets)
+	// Use specified protocol/market or fall back to configured protocol/data market for VPA endpoints
 	kb := m.keyBuilder
 	if protocol != "" || market != "" {
 		if protocol == "" {
@@ -1997,13 +2046,13 @@ func (m *MonitorAPI) VPATimeline(c *gin.Context) {
 		}
 		kb = keys.NewKeyBuilder(protocol, market)
 	} else {
-		// Default to NEW_DATA_MARKET_CONTRACT for VPA endpoints
-		if m.newDataMarket != "" {
+		// Default to configured protocol/data market for VPA endpoints
+		if m.dataMarket != "" {
 			protocolToUse := m.keyBuilder.ProtocolState
-			if m.newProtocolState != "" {
-				protocolToUse = m.newProtocolState
+			if m.protocolState != "" {
+				protocolToUse = m.protocolState
 			}
-			kb = keys.NewKeyBuilder(protocolToUse, m.newDataMarket)
+			kb = keys.NewKeyBuilder(protocolToUse, m.dataMarket)
 		}
 	}
 
@@ -2088,7 +2137,7 @@ func (m *MonitorAPI) VPAStats(c *gin.Context) {
 	protocol := c.Query("protocol")
 	market := c.Query("market")
 
-	// Use specified protocol/market or fall back to NEW_DATA_MARKET_CONTRACT (VPA is only for new markets)
+	// Use specified protocol/market or fall back to configured protocol/data market for VPA endpoints
 	kb := m.keyBuilder
 	if protocol != "" || market != "" {
 		if protocol == "" {
@@ -2099,13 +2148,13 @@ func (m *MonitorAPI) VPAStats(c *gin.Context) {
 		}
 		kb = keys.NewKeyBuilder(protocol, market)
 	} else {
-		// Default to NEW_DATA_MARKET_CONTRACT for VPA endpoints
-		if m.newDataMarket != "" {
+		// Default to configured protocol/data market for VPA endpoints
+		if m.dataMarket != "" {
 			protocolToUse := m.keyBuilder.ProtocolState
-			if m.newProtocolState != "" {
-				protocolToUse = m.newProtocolState
+			if m.protocolState != "" {
+				protocolToUse = m.protocolState
 			}
-			kb = keys.NewKeyBuilder(protocolToUse, m.newDataMarket)
+			kb = keys.NewKeyBuilder(protocolToUse, m.dataMarket)
 		}
 	}
 
@@ -2176,7 +2225,7 @@ func (m *MonitorAPI) EpochLifecycle(c *gin.Context) {
 	protocol := c.Query("protocol")
 	market := c.Query("market")
 
-	// Use specified protocol/market or fall back to NEW_DATA_MARKET_CONTRACT
+	// Use specified protocol/market or fall back to configured protocol/data market
 	kb := m.keyBuilder
 	if protocol != "" || market != "" {
 		if protocol == "" {
@@ -2187,12 +2236,12 @@ func (m *MonitorAPI) EpochLifecycle(c *gin.Context) {
 		}
 		kb = keys.NewKeyBuilder(protocol, market)
 	} else {
-		if m.newDataMarket != "" {
+		if m.dataMarket != "" {
 			protocolToUse := m.keyBuilder.ProtocolState
-			if m.newProtocolState != "" {
-				protocolToUse = m.newProtocolState
+			if m.protocolState != "" {
+				protocolToUse = m.protocolState
 			}
-			kb = keys.NewKeyBuilder(protocolToUse, m.newDataMarket)
+			kb = keys.NewKeyBuilder(protocolToUse, m.dataMarket)
 		}
 	}
 
@@ -2337,6 +2386,1249 @@ func (m *MonitorAPI) EpochLifecycle(c *gin.Context) {
 	c.JSON(http.StatusOK, lifecycle)
 }
 
+// @Summary Get flagged peers
+// @Description Get list of all flagged peer IDs (from Redis cache, synced from on-chain)
+// @Tags spam
+// @Produce json
+// @Param protocol query string false "Protocol state identifier"
+// @Param market query string false "Data market address"
+// @Success 200 {object} map[string]interface{} "List of flagged peers with metadata"
+// @Router /spam/flagged/peers [get]
+func (m *MonitorAPI) FlaggedPeers(c *gin.Context) {
+	protocol := c.Query("protocol")
+	market := c.Query("market")
+
+	kb := m.keyBuilder
+	if protocol != "" || market != "" {
+		if protocol == "" {
+			protocol = m.keyBuilder.ProtocolState
+		}
+		if market == "" {
+			market = m.keyBuilder.DataMarket
+		}
+		kb = keys.NewKeyBuilder(protocol, market)
+	}
+
+	// Get flagged peers set
+	flaggedSetKey := fmt.Sprintf("flagged_peers:%s", kb.DataMarket)
+	peerIDs, err := m.redis.SMembers(m.ctx, flaggedSetKey).Result()
+	if err != nil {
+		c.JSON(http.StatusOK, gin.H{
+			"flagged_peers": []string{},
+			"count":         0,
+			"timestamp":     time.Now(),
+		})
+		return
+	}
+
+	// Get metadata for each flagged peer
+	peers := make([]map[string]interface{}, 0)
+	for _, peerID := range peerIDs {
+		peerKey := fmt.Sprintf("%s:%s:spam:consensus_flagged:peer:%s", kb.ProtocolState, kb.DataMarket, peerID)
+		peerData, err := m.redis.Get(m.ctx, peerKey).Result()
+		if err == nil {
+			var metadata map[string]interface{}
+			if json.Unmarshal([]byte(peerData), &metadata) == nil {
+				metadata["peer_id"] = peerID
+				peers = append(peers, metadata)
+			}
+		} else {
+			// Peer is in set but no metadata - still include it
+			peers = append(peers, map[string]interface{}{
+				"peer_id": peerID,
+			})
+		}
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"flagged_peers": peers,
+		"count":         len(peers),
+		"timestamp":     time.Now(),
+	})
+}
+
+// @Summary Get flagged snapshotters
+// @Description Get list of all flagged snapshotter addresses (from Redis cache, synced from on-chain)
+// @Tags spam
+// @Produce json
+// @Param protocol query string false "Protocol state identifier"
+// @Param market query string false "Data market address"
+// @Success 200 {object} map[string]interface{} "List of flagged snapshotters with metadata"
+// @Router /spam/flagged/snapshotters [get]
+func (m *MonitorAPI) FlaggedSnapshotters(c *gin.Context) {
+	protocol := c.Query("protocol")
+	market := c.Query("market")
+
+	kb := m.keyBuilder
+	if protocol != "" || market != "" {
+		if protocol == "" {
+			protocol = m.keyBuilder.ProtocolState
+		}
+		if market == "" {
+			market = m.keyBuilder.DataMarket
+		}
+		kb = keys.NewKeyBuilder(protocol, market)
+	}
+
+	// Get flagged snapshotters set
+	flaggedSetKey := fmt.Sprintf("flagged_snapshotters:%s", kb.DataMarket)
+	snapshotterAddrs, err := m.redis.SMembers(m.ctx, flaggedSetKey).Result()
+	if err != nil {
+		c.JSON(http.StatusOK, gin.H{
+			"flagged_snapshotters": []string{},
+			"count":                0,
+			"timestamp":            time.Now(),
+		})
+		return
+	}
+
+	// Get metadata for each flagged snapshotter
+	snapshotters := make([]map[string]interface{}, 0)
+	for _, addr := range snapshotterAddrs {
+		snapshotterKey := fmt.Sprintf("%s:%s:spam:consensus_flagged:snapshotter:%s", kb.ProtocolState, kb.DataMarket, addr)
+		snapshotterData, err := m.redis.Get(m.ctx, snapshotterKey).Result()
+		if err == nil {
+			var metadata map[string]interface{}
+			if json.Unmarshal([]byte(snapshotterData), &metadata) == nil {
+				metadata["snapshotter_addr"] = addr
+				snapshotters = append(snapshotters, metadata)
+			}
+		} else {
+			// Snapshotter is in set but no metadata - still include it
+			snapshotters = append(snapshotters, map[string]interface{}{
+				"snapshotter_addr": addr,
+			})
+		}
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"flagged_snapshotters": snapshotters,
+		"count":                len(snapshotters),
+		"timestamp":            time.Now(),
+	})
+}
+
+// @Summary Get spam tracking info for a peer
+// @Description Get validation failures, submission counts, and aggregation info for a specific peer
+// @Tags spam
+// @Produce json
+// @Param peerID path string true "Peer ID (libp2p)"
+// @Param protocol query string false "Protocol state identifier"
+// @Param market query string false "Data market address"
+// @Param epochID query int false "Specific epoch ID (optional, defaults to current epoch)"
+// @Success 200 {object} map[string]interface{} "Spam tracking information for peer"
+// @Router /spam/peer/{peerID} [get]
+func (m *MonitorAPI) PeerSpamInfo(c *gin.Context) {
+	peerID := c.Param("peerID")
+	protocol := c.Query("protocol")
+	market := c.Query("market")
+	epochIDStr := c.Query("epochID")
+
+	kb := m.keyBuilder
+	if protocol != "" || market != "" {
+		if protocol == "" {
+			protocol = m.keyBuilder.ProtocolState
+		}
+		if market == "" {
+			market = m.keyBuilder.DataMarket
+		}
+		kb = keys.NewKeyBuilder(protocol, market)
+	}
+
+	result := make(map[string]interface{})
+	result["peer_id"] = peerID
+
+	// If epochID specified, get per-epoch tracking
+	if epochIDStr != "" {
+		epochID, err := strconv.ParseUint(epochIDStr, 10, 64)
+		if err == nil {
+			// Get validation failures for this epoch
+			failureKey := fmt.Sprintf("%s:%s:spam:validation_failures:peer:%s:%d", kb.ProtocolState, kb.DataMarket, peerID, epochID)
+			failures, _ := m.redis.Get(m.ctx, failureKey).Int64()
+
+			// Get submission count for this epoch
+			submissionKey := fmt.Sprintf("%s:%s:spam:submissions:peer:%s:%d", kb.ProtocolState, kb.DataMarket, peerID, epochID)
+			submissions, _ := m.redis.Get(m.ctx, submissionKey).Int64()
+
+			// Get peer-snapshotter associations
+			mapKey := fmt.Sprintf("%s:%s:spam:peer_snapshotter_map:%s:%d", kb.ProtocolState, kb.DataMarket, peerID, epochID)
+			snapshotterAddrs, _ := m.redis.SMembers(m.ctx, mapKey).Result()
+
+			result["epoch_id"] = epochID
+			result["validation_failures"] = failures
+			result["submission_count"] = submissions
+			result["snapshotter_addresses"] = snapshotterAddrs
+		}
+	}
+
+	// Get aggregation window info (if available)
+	// Window ID = round up to next multiple of 10 (end epoch of the 10-epoch range)
+	// Formula: ((epochID + 9) / 10) * 10
+	// Epochs 1-10 → Window 10, Epochs 11-20 → Window 20, etc.
+	const windowSize = 10
+	if epochIDStr != "" {
+		epochID, err := strconv.ParseUint(epochIDStr, 10, 64)
+		if err == nil {
+			windowID := ((epochID + uint64(windowSize) - 1) / uint64(windowSize)) * uint64(windowSize)
+			aggKey := fmt.Sprintf("%s:%s:spam:reports:peer:%s:window:%d", kb.ProtocolState, kb.DataMarket, peerID, windowID)
+			aggData, err := m.redis.Get(m.ctx, aggKey).Result()
+			if err == nil {
+				var aggregated map[string]interface{}
+				if json.Unmarshal([]byte(aggData), &aggregated) == nil {
+					result["aggregation_window"] = windowID
+					result["aggregated_reports"] = aggregated
+				}
+			}
+		}
+	}
+
+	// Check if peer is flagged
+	flaggedKey := fmt.Sprintf("%s:%s:spam:consensus_flagged:peer:%s", kb.ProtocolState, kb.DataMarket, peerID)
+	flagged, _ := m.redis.Exists(m.ctx, flaggedKey).Result()
+	result["is_flagged"] = flagged > 0
+
+	if flagged > 0 {
+		flaggedData, err := m.redis.Get(m.ctx, flaggedKey).Result()
+		if err == nil {
+			var flagMetadata map[string]interface{}
+			if json.Unmarshal([]byte(flaggedData), &flagMetadata) == nil {
+				result["flag_metadata"] = flagMetadata
+			}
+		}
+	}
+
+	result["timestamp"] = time.Now()
+	c.JSON(http.StatusOK, result)
+}
+
+// @Summary List all aggregation windows with reports
+// @Description Get list of all windows that have spam reports (for discovery/indexing). Windows are created at epoch boundaries (epochID % 10 == 0) and contain aggregated reports for a 10-epoch range. Windows persist for 2 hours (TTL).
+// @Tags spam
+// @Produce json
+// @Param protocol query string false "Protocol state identifier"
+// @Param market query string false "Data market address"
+// @Success 200 {object} map[string]interface{} "List of windows with window_id, epoch_range (e.g., '24189511-24189520'), first_epoch, last_epoch, and peer_count"
+// @Router /spam/windows [get]
+func (m *MonitorAPI) SpamWindows(c *gin.Context) {
+	protocol := c.Query("protocol")
+	market := c.Query("market")
+
+	kb := m.keyBuilder
+	if protocol != "" || market != "" {
+		if protocol == "" {
+			protocol = m.keyBuilder.ProtocolState
+		}
+		if market == "" {
+			market = m.keyBuilder.DataMarket
+		}
+		kb = keys.NewKeyBuilder(protocol, market)
+	}
+
+	windowsSetKey := fmt.Sprintf("%s:%s:spam:reports:windows", kb.ProtocolState, kb.DataMarket)
+	windowIDs, err := m.redis.SMembers(m.ctx, windowsSetKey).Result()
+	if err != nil {
+		c.JSON(http.StatusOK, gin.H{
+			"windows": []interface{}{},
+			"count":   0,
+		})
+		return
+	}
+
+	// Sort window IDs numerically and get details for each
+	windows := make([]map[string]interface{}, 0)
+	for _, windowIDStr := range windowIDs {
+		windowID, err := strconv.Atoi(windowIDStr)
+		if err != nil {
+			continue
+		}
+
+		// Get peer count in this window
+		windowPeersKey := fmt.Sprintf("%s:%s:spam:reports:window:%d:peers", kb.ProtocolState, kb.DataMarket, windowID)
+		peerCount, _ := m.redis.SCard(m.ctx, windowPeersKey).Result()
+
+		// Calculate epoch range
+		firstEpoch := windowID - 9
+		lastEpoch := windowID
+
+		windows = append(windows, map[string]interface{}{
+			"window_id":   windowID,
+			"epoch_range": fmt.Sprintf("%d-%d", firstEpoch, lastEpoch),
+			"first_epoch": firstEpoch,
+			"last_epoch":  lastEpoch,
+			"peer_count":  peerCount,
+		})
+	}
+
+	// Sort by window ID descending (latest first)
+	sort.Slice(windows, func(i, j int) bool {
+		return windows[i]["window_id"].(int) > windows[j]["window_id"].(int)
+	})
+
+	c.JSON(http.StatusOK, gin.H{
+		"windows":   windows,
+		"count":     len(windows),
+		"timestamp": time.Now(),
+	})
+}
+
+// @Summary Get details for a specific aggregation window
+// @Description Get all peers and their aggregated reports for a specific window. Window ID is the end epoch of the 10-epoch range (e.g., window 24189520 contains epochs 24189511-24189520). Includes validator counts (consensus requires >= 2 validators), all spam reports with epoch_id, violation_type, count, and evidence.
+// @Tags spam
+// @Produce json
+// @Param windowID path int true "Window ID (end epoch of 10-epoch range, e.g., 24189520 for epochs 24189511-24189520)"
+// @Param protocol query string false "Protocol state identifier"
+// @Param market query string false "Data market address"
+// @Success 200 {object} map[string]interface{} "Window details including window_id, epoch_range, peers array with peer_id, validator_count, report_count, first_epoch, last_epoch, and reports array"
+// @Router /spam/windows/{windowID} [get]
+func (m *MonitorAPI) SpamWindowDetails(c *gin.Context) {
+	windowIDStr := c.Param("windowID")
+	protocol := c.Query("protocol")
+	market := c.Query("market")
+
+	windowID, err := strconv.Atoi(windowIDStr)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid window ID"})
+		return
+	}
+
+	kb := m.keyBuilder
+	if protocol != "" || market != "" {
+		if protocol == "" {
+			protocol = m.keyBuilder.ProtocolState
+		}
+		if market == "" {
+			market = m.keyBuilder.DataMarket
+		}
+		kb = keys.NewKeyBuilder(protocol, market)
+	}
+
+	// Calculate epoch range
+	firstEpoch := windowID - 9
+	lastEpoch := windowID
+
+	// Get all peers in this window
+	windowPeersKey := fmt.Sprintf("%s:%s:spam:reports:window:%d:peers", kb.ProtocolState, kb.DataMarket, windowID)
+	peerIDs, err := m.redis.SMembers(m.ctx, windowPeersKey).Result()
+	if err != nil {
+		c.JSON(http.StatusOK, gin.H{
+			"window_id":   windowID,
+			"epoch_range": fmt.Sprintf("%d-%d", firstEpoch, lastEpoch),
+			"peers":       []interface{}{},
+			"peer_count":  0,
+		})
+		return
+	}
+
+	// Get aggregated reports for each peer
+	peers := make([]map[string]interface{}, 0)
+	for _, peerID := range peerIDs {
+		aggKey := fmt.Sprintf("%s:%s:spam:reports:peer:%s:window:%d", kb.ProtocolState, kb.DataMarket, peerID, windowID)
+		aggData, err := m.redis.Get(m.ctx, aggKey).Result()
+		if err != nil {
+			continue
+		}
+
+		var aggregated map[string]interface{}
+		if json.Unmarshal([]byte(aggData), &aggregated) == nil {
+			reportCount := 0
+			if reports, ok := aggregated["reports"].([]interface{}); ok {
+				reportCount = len(reports)
+			}
+			peers = append(peers, map[string]interface{}{
+				"peer_id":         peerID,
+				"validator_count": aggregated["validator_count"],
+				"first_epoch":     aggregated["first_epoch"],
+				"last_epoch":      aggregated["last_epoch"],
+				"report_count":    reportCount,
+				"reports":         aggregated["reports"],
+			})
+		}
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"window_id":   windowID,
+		"epoch_range": fmt.Sprintf("%d-%d", firstEpoch, lastEpoch),
+		"first_epoch": firstEpoch,
+		"last_epoch":  lastEpoch,
+		"peers":       peers,
+		"peer_count":  len(peers),
+		"timestamp":   time.Now(),
+	})
+}
+
+// @Summary Get spam protection statistics
+// @Description Get aggregated spam protection statistics including flagged counts, reports, and enforcement metrics
+// @Tags spam
+// @Produce json
+// @Param protocol query string false "Protocol state identifier"
+// @Param market query string false "Data market address"
+// @Success 200 {object} map[string]interface{} "Spam protection statistics"
+// @Router /spam/stats [get]
+func (m *MonitorAPI) SpamStats(c *gin.Context) {
+	protocol := c.Query("protocol")
+	market := c.Query("market")
+
+	kb := m.keyBuilder
+	if protocol != "" || market != "" {
+		if protocol == "" {
+			protocol = m.keyBuilder.ProtocolState
+		}
+		if market == "" {
+			market = m.keyBuilder.DataMarket
+		}
+		kb = keys.NewKeyBuilder(protocol, market)
+	}
+
+	stats := make(map[string]interface{})
+
+	// Count flagged peers
+	flaggedPeersKey := fmt.Sprintf("flagged_peers:%s", kb.DataMarket)
+	flaggedPeerCount, _ := m.redis.SCard(m.ctx, flaggedPeersKey).Result()
+	stats["flagged_peers_count"] = flaggedPeerCount
+
+	// Count flagged snapshotters
+	flaggedSnapshottersKey := fmt.Sprintf("flagged_snapshotters:%s", kb.DataMarket)
+	flaggedSnapshotterCount, _ := m.redis.SCard(m.ctx, flaggedSnapshottersKey).Result()
+	stats["flagged_snapshotters_count"] = flaggedSnapshotterCount
+
+	// Count active validators (for consensus calculation)
+	activeValidatorsKey := fmt.Sprintf("%s:%s:active:validators", kb.ProtocolState, kb.DataMarket)
+	activeValidatorCount, _ := m.redis.SCard(m.ctx, activeValidatorsKey).Result()
+	stats["active_validators_count"] = activeValidatorCount
+
+	// Note: Per-epoch tracking keys are ephemeral (24h TTL) and would require scanning
+	// For production, these should be aggregated by state-tracker or queried via Prometheus metrics
+
+	stats["timestamp"] = time.Now()
+	c.JSON(http.StatusOK, stats)
+}
+
+// @Summary List epochs with tracking data
+// @Description Get list of epochs that have spam tracking data. Queries epochs from aggregation windows (persistent) and active epoch peer sets (ephemeral, for recent epochs not yet aggregated). Epoch peer sets are deleted after window aggregation, so this endpoint primarily returns epochs from windows.
+// @Tags spam
+// @Produce json
+// @Param protocol query string false "Protocol state identifier"
+// @Param market query string false "Data market address"
+// @Param limit query int false "Maximum number of epochs to return (default: 100, max: 1000)"
+// @Success 200 {object} map[string]interface{} "List of epochs with tracking data, each containing epoch_id and peer_count"
+// @Router /spam/epochs [get]
+func (m *MonitorAPI) SpamEpochs(c *gin.Context) {
+	protocol := c.Query("protocol")
+	market := c.Query("market")
+	limitStr := c.DefaultQuery("limit", "100")
+
+	kb := m.keyBuilder
+	if protocol != "" || market != "" {
+		if protocol == "" {
+			protocol = m.keyBuilder.ProtocolState
+		}
+		if market == "" {
+			market = m.keyBuilder.DataMarket
+		}
+		kb = keys.NewKeyBuilder(protocol, market)
+	}
+
+	limit, _ := strconv.Atoi(limitStr)
+	if limit <= 0 || limit > 1000 {
+		limit = 100
+	}
+
+	// Query epochs from windows instead of epoch peer sets
+	// Epoch peer sets are ephemeral and deleted after window aggregation
+	// Windows contain the aggregated data and persist longer
+	epochs := make([]map[string]interface{}, 0)
+	epochSet := make(map[uint64]bool) // Track unique epochs
+	windowSize := 10                  // Hardcoded window size
+
+	// Get all windows and extract epochs from aggregated reports
+	windowsSetKey := fmt.Sprintf("%s:%s:spam:reports:windows", kb.ProtocolState, kb.DataMarket)
+	windowIDs, err := m.redis.SMembers(m.ctx, windowsSetKey).Result()
+	if err == nil {
+		// Track peer count per epoch across all windows
+		epochPeerCounts := make(map[uint64]int64)
+
+		for _, windowIDStr := range windowIDs {
+			windowID, err := strconv.Atoi(windowIDStr)
+			if err != nil {
+				continue
+			}
+			// Extract epochs from window (window contains epochs windowID-9 to windowID)
+			windowStartEpoch := uint64(windowID - windowSize + 1)
+			windowEndEpoch := uint64(windowID)
+
+			// Get window peers set
+			windowPeersKey := fmt.Sprintf("%s:%s:spam:reports:window:%d:peers", kb.ProtocolState, kb.DataMarket, windowID)
+			peerIDs, _ := m.redis.SMembers(m.ctx, windowPeersKey).Result()
+
+			// For each peer, extract epochs from their aggregated reports
+			for _, peerID := range peerIDs {
+				windowKey := fmt.Sprintf("%s:%s:spam:reports:peer:%s:window:%d", kb.ProtocolState, kb.DataMarket, peerID, windowID)
+				reportData, err := m.redis.Get(m.ctx, windowKey).Result()
+				if err == nil {
+					var aggregated map[string]interface{}
+					if json.Unmarshal([]byte(reportData), &aggregated) == nil {
+						if reports, ok := aggregated["reports"].([]interface{}); ok {
+							// Track which epochs this peer has reports for
+							peerEpochs := make(map[uint64]bool)
+							for _, report := range reports {
+								if reportMap, ok := report.(map[string]interface{}); ok {
+									if epochID, ok := reportMap["epoch_id"].(float64); ok {
+										epoch := uint64(epochID)
+										// Only count epochs within this window range
+										if epoch >= windowStartEpoch && epoch <= windowEndEpoch {
+											if !peerEpochs[epoch] {
+												peerEpochs[epoch] = true
+												epochPeerCounts[epoch]++
+												epochSet[epoch] = true
+											}
+										}
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+
+		// Convert epoch peer counts to epochs list
+		for epoch, peerCount := range epochPeerCounts {
+			if peerCount > 0 {
+				epochs = append(epochs, map[string]interface{}{
+					"epoch_id":   epoch,
+					"peer_count": peerCount,
+				})
+			}
+		}
+	}
+
+	// Also check for active epoch peer sets (for epochs not yet aggregated into windows)
+	// These exist for epochs that haven't reached window boundary yet
+	// Start from the latest window end epoch + window size to check recent epochs
+	currentEpoch := uint64(0)
+	if len(windowIDs) > 0 {
+		// Find the maximum window ID
+		for _, windowIDStr := range windowIDs {
+			if windowID, err := strconv.Atoi(windowIDStr); err == nil {
+				if uint64(windowID) > currentEpoch {
+					currentEpoch = uint64(windowID)
+				}
+			}
+		}
+		// Add window size to check epochs beyond the latest window
+		currentEpoch += uint64(windowSize)
+	} else {
+		// Fallback: start from a high epoch if no windows found
+		currentEpoch = uint64(100000)
+	}
+	for epoch := currentEpoch; epoch > currentEpoch-100 && len(epochs) < limit; epoch-- {
+		if epochSet[epoch] {
+			continue // Already added from windows
+		}
+		epochPeersKey := fmt.Sprintf("%s:%s:spam:epoch:%d:peers", kb.ProtocolState, kb.DataMarket, epoch)
+		exists, err := m.redis.Exists(m.ctx, epochPeersKey).Result()
+		if err == nil && exists > 0 {
+			peerCount, _ := m.redis.SCard(m.ctx, epochPeersKey).Result()
+			if peerCount > 0 {
+				epochs = append(epochs, map[string]interface{}{
+					"epoch_id":   epoch,
+					"peer_count": peerCount,
+				})
+			}
+		}
+	}
+
+	// Sort by epoch ID descending (newest first)
+	sort.Slice(epochs, func(i, j int) bool {
+		return epochs[i]["epoch_id"].(uint64) > epochs[j]["epoch_id"].(uint64)
+	})
+
+	// Limit results
+	if len(epochs) > limit {
+		epochs = epochs[:limit]
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"epochs":    epochs,
+		"count":     len(epochs),
+		"timestamp": time.Now(),
+	})
+}
+
+// @Summary Get epoch-by-epoch tracking for a peer
+// @Description Get tracking data (submissions, validation failures) for a peer across multiple epochs
+// @Tags spam
+// @Produce json
+// @Param peerID path string true "Peer ID (libp2p)"
+// @Param startEpoch query int false "Start epoch (default: current epoch - 10)"
+// @Param endEpoch query int false "End epoch (default: current epoch)"
+// @Param protocol query string false "Protocol state identifier"
+// @Param market query string false "Data market address"
+// @Success 200 {object} map[string]interface{} "Epoch-by-epoch tracking data"
+// @Router /spam/peer/{peerID}/epochs [get]
+func (m *MonitorAPI) PeerSpamEpochs(c *gin.Context) {
+	peerID := c.Param("peerID")
+	protocol := c.Query("protocol")
+	market := c.Query("market")
+	startEpochStr := c.Query("startEpoch")
+	endEpochStr := c.Query("endEpoch")
+
+	kb := m.keyBuilder
+	if protocol != "" || market != "" {
+		if protocol == "" {
+			protocol = m.keyBuilder.ProtocolState
+		}
+		if market == "" {
+			market = m.keyBuilder.DataMarket
+		}
+		kb = keys.NewKeyBuilder(protocol, market)
+	}
+
+	// Parse epoch range
+	var startEpoch, endEpoch uint64
+	if endEpochStr != "" {
+		endEpoch, _ = strconv.ParseUint(endEpochStr, 10, 64)
+	} else {
+		// Default to checking recent epochs
+		endEpoch = 100000 // High number, will be adjusted
+	}
+	if startEpochStr != "" {
+		startEpoch, _ = strconv.ParseUint(startEpochStr, 10, 64)
+	} else {
+		// Default: last 10 epochs
+		if endEpoch > 10 {
+			startEpoch = endEpoch - 10
+		} else {
+			startEpoch = 1
+		}
+	}
+
+	// Limit range to prevent excessive queries
+	if endEpoch-startEpoch > 100 {
+		endEpoch = startEpoch + 100
+	}
+
+	epochData := make([]map[string]interface{}, 0)
+	for epoch := startEpoch; epoch <= endEpoch; epoch++ {
+		// Get submission count
+		submissionKey := fmt.Sprintf("%s:%s:spam:submissions:peer:%s:%d", kb.ProtocolState, kb.DataMarket, peerID, epoch)
+		submissions, _ := m.redis.Get(m.ctx, submissionKey).Int64()
+
+		// Get validation failure count
+		failureKey := fmt.Sprintf("%s:%s:spam:validation_failures:peer:%s:%d", kb.ProtocolState, kb.DataMarket, peerID, epoch)
+		failures, _ := m.redis.Get(m.ctx, failureKey).Int64()
+
+		// Only include epochs with data
+		if submissions > 0 || failures > 0 {
+			// Get snapshotter addresses
+			mapKey := fmt.Sprintf("%s:%s:spam:peer_snapshotter_map:%s:%d", kb.ProtocolState, kb.DataMarket, peerID, epoch)
+			snapshotterAddrs, _ := m.redis.SMembers(m.ctx, mapKey).Result()
+
+			epochData = append(epochData, map[string]interface{}{
+				"epoch_id":              epoch,
+				"submission_count":      submissions,
+				"validation_failures":   failures,
+				"snapshotter_addresses": snapshotterAddrs,
+			})
+		}
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"peer_id":     peerID,
+		"epochs":      epochData,
+		"count":       len(epochData),
+		"start_epoch": startEpoch,
+		"end_epoch":   endEpoch,
+		"timestamp":   time.Now(),
+	})
+}
+
+// @Summary List recent simulation messages
+// @Description Get recent simulation messages (epoch 0 with real CIDs) from snapshotters. Simulations are sent at startup to verify connectivity and contain EIP-712 signatures.
+// @Tags simulations
+// @Produce json
+// @Param limit query int false "Maximum number of simulations to return (default: 50, max: 500)"
+// @Param minutes query int false "Time window in minutes (default: 60)"
+// @Param protocol query string false "Protocol state identifier"
+// @Param market query string false "Data market address"
+// @Success 200 {object} SimulationsResponse "List of recent simulation messages"
+// @Router /simulations/recent [get]
+func (m *MonitorAPI) SimulationsRecent(c *gin.Context) {
+	protocol := c.Query("protocol")
+	market := c.Query("market")
+	limitStr := c.DefaultQuery("limit", "50")
+	minutesStr := c.DefaultQuery("minutes", "60")
+
+	kb := m.keyBuilder
+	if protocol != "" || market != "" {
+		if protocol == "" {
+			protocol = m.keyBuilder.ProtocolState
+		}
+		if market == "" {
+			market = m.keyBuilder.DataMarket
+		}
+		kb = keys.NewKeyBuilder(protocol, market)
+	}
+
+	limit, _ := strconv.Atoi(limitStr)
+	if limit <= 0 || limit > 500 {
+		limit = 50
+	}
+
+	minutes, _ := strconv.Atoi(minutesStr)
+	if minutes <= 0 {
+		minutes = 60
+	}
+
+	// Calculate time window
+	cutoffTime := time.Now().Add(-time.Duration(minutes) * time.Minute).Unix()
+
+	// Get simulation entity IDs from timeline (ZSET)
+	timelineKey := kb.SimulationsTimeline()
+	entityIDs, err := m.redis.ZRangeByScoreWithScores(m.ctx, timelineKey, &redis.ZRangeBy{
+		Min:   fmt.Sprintf("%d", cutoffTime),
+		Max:   "+inf",
+		Count: int64(limit),
+	}).Result()
+
+	if err != nil {
+		log.WithError(err).Error("Failed to query simulations timeline")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to query simulations"})
+		return
+	}
+
+	simulations := make([]SimulationInfo, 0, len(entityIDs))
+	for _, z := range entityIDs {
+		entityID := z.Member.(string)
+		timestamp := int64(z.Score)
+
+		// Get metadata for this simulation
+		metadataKey := kb.SimulationMetadata(entityID)
+		metadataJSON, err := m.redis.Get(m.ctx, metadataKey).Result()
+		if err != nil {
+			// Metadata might have expired, create partial record from entity ID
+			sim := m.parseSimulationFromEntityID(entityID, timestamp)
+			simulations = append(simulations, sim)
+			continue
+		}
+
+		var metadata map[string]interface{}
+		if err := json.Unmarshal([]byte(metadataJSON), &metadata); err != nil {
+			sim := m.parseSimulationFromEntityID(entityID, timestamp)
+			simulations = append(simulations, sim)
+			continue
+		}
+
+		sim := m.metadataToSimulationInfo(entityID, metadata)
+		simulations = append(simulations, sim)
+	}
+
+	c.JSON(http.StatusOK, SimulationsResponse{
+		Count:       len(simulations),
+		Minutes:     minutes,
+		Simulations: simulations,
+		Timestamp:   time.Now(),
+	})
+}
+
+// @Summary Get simulations by peer ID
+// @Description Get all simulation messages from a specific peer (libp2p ID)
+// @Tags simulations
+// @Produce json
+// @Param peerID path string true "Peer ID (libp2p)"
+// @Param protocol query string false "Protocol state identifier"
+// @Param market query string false "Data market address"
+// @Success 200 {object} SimulationsResponse "Simulations from the specified peer"
+// @Router /simulations/peer/{peerID} [get]
+func (m *MonitorAPI) SimulationsByPeer(c *gin.Context) {
+	peerID := c.Param("peerID")
+	protocol := c.Query("protocol")
+	market := c.Query("market")
+
+	if peerID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "peerID is required"})
+		return
+	}
+
+	kb := m.keyBuilder
+	if protocol != "" || market != "" {
+		if protocol == "" {
+			protocol = m.keyBuilder.ProtocolState
+		}
+		if market == "" {
+			market = m.keyBuilder.DataMarket
+		}
+		kb = keys.NewKeyBuilder(protocol, market)
+	}
+
+	// Get simulation entity IDs for this peer
+	peerKey := kb.SimulationsByPeer(peerID)
+	entityIDs, err := m.redis.SMembers(m.ctx, peerKey).Result()
+	if err != nil {
+		log.WithError(err).WithField("peer_id", peerID).Error("Failed to query peer simulations")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to query peer simulations"})
+		return
+	}
+
+	simulations := make([]SimulationInfo, 0, len(entityIDs))
+	for _, entityID := range entityIDs {
+		// Get metadata
+		metadataKey := kb.SimulationMetadata(entityID)
+		metadataJSON, err := m.redis.Get(m.ctx, metadataKey).Result()
+		if err != nil {
+			// Try to get timestamp from timeline
+			timestamp, _ := m.redis.ZScore(m.ctx, kb.SimulationsTimeline(), entityID).Result()
+			sim := m.parseSimulationFromEntityID(entityID, int64(timestamp))
+			simulations = append(simulations, sim)
+			continue
+		}
+
+		var metadata map[string]interface{}
+		if err := json.Unmarshal([]byte(metadataJSON), &metadata); err != nil {
+			continue
+		}
+
+		sim := m.metadataToSimulationInfo(entityID, metadata)
+		simulations = append(simulations, sim)
+	}
+
+	c.JSON(http.StatusOK, SimulationsResponse{
+		Count:       len(simulations),
+		Simulations: simulations,
+		Timestamp:   time.Now(),
+	})
+}
+
+// @Summary Get simulations by snapshotter address
+// @Description Get all simulation messages from a specific snapshotter (EIP-712 recovered address)
+// @Tags simulations
+// @Produce json
+// @Param address path string true "Snapshotter address (Ethereum address)"
+// @Param protocol query string false "Protocol state identifier"
+// @Param market query string false "Data market address"
+// @Success 200 {object} SimulationsResponse "Simulations from the specified snapshotter"
+// @Router /simulations/snapshotter/{address} [get]
+func (m *MonitorAPI) SimulationsBySnapshotter(c *gin.Context) {
+	address := c.Param("address")
+	protocol := c.Query("protocol")
+	market := c.Query("market")
+
+	if address == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "address is required"})
+		return
+	}
+
+	kb := m.keyBuilder
+	if protocol != "" || market != "" {
+		if protocol == "" {
+			protocol = m.keyBuilder.ProtocolState
+		}
+		if market == "" {
+			market = m.keyBuilder.DataMarket
+		}
+		kb = keys.NewKeyBuilder(protocol, market)
+	}
+
+	// Get simulation entity IDs for this snapshotter
+	snapshotterKey := kb.SimulationsBySnapshotter(address)
+	entityIDs, err := m.redis.SMembers(m.ctx, snapshotterKey).Result()
+	if err != nil {
+		log.WithError(err).WithField("address", address).Error("Failed to query snapshotter simulations")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to query snapshotter simulations"})
+		return
+	}
+
+	simulations := make([]SimulationInfo, 0, len(entityIDs))
+	for _, entityID := range entityIDs {
+		// Get metadata
+		metadataKey := kb.SimulationMetadata(entityID)
+		metadataJSON, err := m.redis.Get(m.ctx, metadataKey).Result()
+		if err != nil {
+			// Try to get timestamp from timeline
+			timestamp, _ := m.redis.ZScore(m.ctx, kb.SimulationsTimeline(), entityID).Result()
+			sim := m.parseSimulationFromEntityID(entityID, int64(timestamp))
+			simulations = append(simulations, sim)
+			continue
+		}
+
+		var metadata map[string]interface{}
+		if err := json.Unmarshal([]byte(metadataJSON), &metadata); err != nil {
+			continue
+		}
+
+		sim := m.metadataToSimulationInfo(entityID, metadata)
+		simulations = append(simulations, sim)
+	}
+
+	c.JSON(http.StatusOK, SimulationsResponse{
+		Count:       len(simulations),
+		Simulations: simulations,
+		Timestamp:   time.Now(),
+	})
+}
+
+// @Summary Get simulations by slot ID
+// @Description Get simulation messages for a specific slot ID
+// @Tags simulations
+// @Produce json
+// @Param slotID path string true "Slot ID"
+// @Param limit query int false "Maximum number of simulations to return" default(10)
+// @Param protocol query string false "Protocol state identifier"
+// @Param market query string false "Data market address"
+// @Success 200 {object} SimulationsResponse "Simulations from the specified slot ID"
+// @Router /simulations/slot/{slotID} [get]
+func (m *MonitorAPI) SimulationsBySlot(c *gin.Context) {
+	slotID := c.Param("slotID")
+	limitStr := c.DefaultQuery("limit", "10")
+	protocol := c.Query("protocol")
+	market := c.Query("market")
+
+	if slotID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "slotID is required"})
+		return
+	}
+
+	limit, _ := strconv.Atoi(limitStr)
+	if limit <= 0 || limit > 500 {
+		limit = 10
+	}
+
+	kb := m.keyBuilder
+	if protocol != "" || market != "" {
+		if protocol == "" {
+			protocol = m.keyBuilder.ProtocolState
+		}
+		if market == "" {
+			market = m.keyBuilder.DataMarket
+		}
+		kb = keys.NewKeyBuilder(protocol, market)
+	}
+
+	// Get simulation entity IDs for this slot ID
+	slotKey := kb.SimulationsBySlot(slotID)
+	entityIDs, err := m.redis.SMembers(m.ctx, slotKey).Result()
+	if err != nil {
+		log.WithError(err).WithField("slotID", slotID).Error("Failed to query slot simulations")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to query slot simulations"})
+		return
+	}
+
+	// Get timestamps for all entity IDs from timeline to sort by most recent
+	timelineKey := kb.SimulationsTimeline()
+	type simWithTimestamp struct {
+		entityID  string
+		timestamp int64
+	}
+	simsWithTimestamps := make([]simWithTimestamp, 0, len(entityIDs))
+	for _, entityID := range entityIDs {
+		timestamp, err := m.redis.ZScore(m.ctx, timelineKey, entityID).Result()
+		if err != nil {
+			// If not in timeline, use 0 (will be sorted last)
+			timestamp = 0
+		}
+		simsWithTimestamps = append(simsWithTimestamps, simWithTimestamp{
+			entityID:  entityID,
+			timestamp: int64(timestamp),
+		})
+	}
+
+	// Sort by timestamp descending (most recent first)
+	sort.Slice(simsWithTimestamps, func(i, j int) bool {
+		return simsWithTimestamps[i].timestamp > simsWithTimestamps[j].timestamp
+	})
+
+	// Limit results
+	if len(simsWithTimestamps) > limit {
+		simsWithTimestamps = simsWithTimestamps[:limit]
+	}
+
+	simulations := make([]SimulationInfo, 0, len(simsWithTimestamps))
+	for _, simWithTS := range simsWithTimestamps {
+		// Get metadata
+		metadataKey := kb.SimulationMetadata(simWithTS.entityID)
+		metadataJSON, err := m.redis.Get(m.ctx, metadataKey).Result()
+		if err != nil {
+			// Use timestamp from timeline
+			sim := m.parseSimulationFromEntityID(simWithTS.entityID, simWithTS.timestamp)
+			simulations = append(simulations, sim)
+			continue
+		}
+
+		var metadata map[string]interface{}
+		if err := json.Unmarshal([]byte(metadataJSON), &metadata); err != nil {
+			sim := m.parseSimulationFromEntityID(simWithTS.entityID, simWithTS.timestamp)
+			simulations = append(simulations, sim)
+			continue
+		}
+
+		sim := m.metadataToSimulationInfo(simWithTS.entityID, metadata)
+		simulations = append(simulations, sim)
+	}
+
+	c.JSON(http.StatusOK, SimulationsResponse{
+		Count:       len(simulations),
+		Simulations: simulations,
+		Timestamp:   time.Now(),
+	})
+}
+
+// Helper function to parse simulation info from entity ID format: sim:{slotID}:{projectID}:{timestamp}:{peerID}
+func (m *MonitorAPI) parseSimulationFromEntityID(entityID string, timestamp int64) SimulationInfo {
+	sim := SimulationInfo{
+		EntityID:  entityID,
+		Timestamp: timestamp,
+		Time:      time.Unix(timestamp, 0).Format(time.RFC3339),
+	}
+
+	// Try to parse entity ID: sim:{slotID}:{projectID}:{timestamp}:{peerID}
+	parts := strings.Split(entityID, ":")
+	if len(parts) >= 5 && parts[0] == "sim" {
+		sim.SlotID = parts[1]
+		sim.ProjectID = parts[2]
+		// parts[3] is timestamp
+		sim.PeerID = parts[4]
+	}
+
+	return sim
+}
+
+// Helper function to convert metadata map to SimulationInfo
+func (m *MonitorAPI) metadataToSimulationInfo(entityID string, metadata map[string]interface{}) SimulationInfo {
+	sim := SimulationInfo{
+		EntityID: entityID,
+	}
+
+	if v, ok := metadata["peer_id"].(string); ok {
+		sim.PeerID = v
+	}
+	if v, ok := metadata["snapshotter_address"].(string); ok {
+		sim.SnapshotterAddress = v
+	}
+	if v, ok := metadata["slot_id"].(float64); ok {
+		sim.SlotID = fmt.Sprintf("%.0f", v)
+	}
+	if v, ok := metadata["project_id"].(string); ok {
+		sim.ProjectID = v
+	}
+	if v, ok := metadata["snapshot_cid"].(string); ok {
+		sim.SnapshotCID = v
+	}
+	if v, ok := metadata["data_market"].(string); ok {
+		sim.DataMarket = v
+	}
+	if v, ok := metadata["timestamp"].(float64); ok {
+		sim.Timestamp = int64(v)
+		sim.Time = time.Unix(int64(v), 0).Format(time.RFC3339)
+	}
+
+	return sim
+}
+
+// HeartbeatsRecent returns recent heartbeat messages from peers
+// Heartbeats are epoch 0 messages with empty CID for P2P mesh maintenance
+// NOTE: Heartbeats are NOT EIP-712 signed, so only peer ID is available (no snapshotter address)
+// @Summary Get recent heartbeat messages
+// @Description Returns heartbeat messages received within the specified time window. Heartbeats are NOT EIP-712 signed - only peer ID is available.
+// @Tags Heartbeats
+// @Produce json
+// @Param limit query int false "Maximum number of heartbeats to return" default(100)
+// @Param minutes query int false "Time window in minutes" default(60)
+// @Param protocol query string false "Protocol state contract address"
+// @Param market query string false "Data market address"
+// @Success 200 {object} HeartbeatsResponse "Recent heartbeat messages"
+// @Router /heartbeats/recent [get]
+func (m *MonitorAPI) HeartbeatsRecent(c *gin.Context) {
+	limitStr := c.DefaultQuery("limit", "100")
+	minutesStr := c.DefaultQuery("minutes", "60")
+	protocol := c.Query("protocol")
+	market := c.Query("market")
+
+	limit, _ := strconv.Atoi(limitStr)
+	if limit <= 0 || limit > 1000 {
+		limit = 100
+	}
+
+	minutes, _ := strconv.Atoi(minutesStr)
+	if minutes <= 0 || minutes > 1440 { // Max 24 hours
+		minutes = 60
+	}
+
+	kb := m.keyBuilder
+	if protocol != "" || market != "" {
+		if protocol == "" {
+			protocol = m.keyBuilder.ProtocolState
+		}
+		if market == "" {
+			market = m.keyBuilder.DataMarket
+		}
+		kb = keys.NewKeyBuilder(protocol, market)
+	}
+
+	// Query heartbeats timeline within time window
+	minTime := time.Now().Add(-time.Duration(minutes) * time.Minute).Unix()
+	maxTime := time.Now().Unix()
+
+	results, err := m.redis.ZRevRangeByScoreWithScores(m.ctx, kb.HeartbeatsTimeline(), &redis.ZRangeBy{
+		Min:   fmt.Sprintf("%d", minTime),
+		Max:   fmt.Sprintf("%d", maxTime),
+		Count: int64(limit),
+	}).Result()
+	if err != nil {
+		log.WithError(err).Error("Failed to query heartbeats timeline")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to query heartbeats"})
+		return
+	}
+
+	heartbeats := make([]HeartbeatInfo, 0, len(results))
+	for _, result := range results {
+		entityID := result.Member.(string)
+		timestamp := int64(result.Score)
+		heartbeats = append(heartbeats, m.parseHeartbeatFromEntityID(entityID, timestamp))
+	}
+
+	c.JSON(http.StatusOK, HeartbeatsResponse{
+		Count:      len(heartbeats),
+		Minutes:    minutes,
+		Heartbeats: heartbeats,
+		Timestamp:  time.Now(),
+	})
+}
+
+// HeartbeatsByPeer returns heartbeat messages from a specific peer
+// @Summary Get heartbeats from a specific peer
+// @Description Returns all heartbeat messages from the specified peer ID. Heartbeats are NOT EIP-712 signed.
+// @Tags Heartbeats
+// @Produce json
+// @Param peerID path string true "libp2p Peer ID"
+// @Param limit query int false "Maximum number of heartbeats to return" default(100)
+// @Param protocol query string false "Protocol state contract address"
+// @Param market query string false "Data market address"
+// @Success 200 {object} HeartbeatsResponse "Heartbeats from the specified peer"
+// @Router /heartbeats/peer/{peerID} [get]
+func (m *MonitorAPI) HeartbeatsByPeer(c *gin.Context) {
+	peerID := c.Param("peerID")
+	limitStr := c.DefaultQuery("limit", "100")
+	protocol := c.Query("protocol")
+	market := c.Query("market")
+
+	if peerID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "peerID is required"})
+		return
+	}
+
+	limit, _ := strconv.Atoi(limitStr)
+	if limit <= 0 || limit > 1000 {
+		limit = 100
+	}
+
+	kb := m.keyBuilder
+	if protocol != "" || market != "" {
+		if protocol == "" {
+			protocol = m.keyBuilder.ProtocolState
+		}
+		if market == "" {
+			market = m.keyBuilder.DataMarket
+		}
+		kb = keys.NewKeyBuilder(protocol, market)
+	}
+
+	// Get heartbeat entity IDs for this peer (sorted by timestamp descending)
+	peerKey := kb.HeartbeatsByPeer(peerID)
+	results, err := m.redis.ZRevRangeWithScores(m.ctx, peerKey, 0, int64(limit-1)).Result()
+	if err != nil {
+		log.WithError(err).WithField("peer_id", peerID).Error("Failed to query peer heartbeats")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to query peer heartbeats"})
+		return
+	}
+
+	heartbeats := make([]HeartbeatInfo, 0, len(results))
+	for _, result := range results {
+		entityID := result.Member.(string)
+		timestamp := int64(result.Score)
+		heartbeats = append(heartbeats, m.parseHeartbeatFromEntityID(entityID, timestamp))
+	}
+
+	c.JSON(http.StatusOK, HeartbeatsResponse{
+		Count:      len(heartbeats),
+		Heartbeats: heartbeats,
+		Timestamp:  time.Now(),
+	})
+}
+
+// Helper function to parse heartbeat info from entity ID format: hb:{peerID}:{timestamp}
+func (m *MonitorAPI) parseHeartbeatFromEntityID(entityID string, timestamp int64) HeartbeatInfo {
+	hb := HeartbeatInfo{
+		EntityID:  entityID,
+		Timestamp: timestamp,
+		Time:      time.Unix(timestamp, 0).Format(time.RFC3339),
+	}
+
+	// Try to parse entity ID: hb:{peerID}:{timestamp}
+	parts := strings.Split(entityID, ":")
+	if len(parts) >= 2 && parts[0] == "hb" {
+		hb.PeerID = parts[1]
+	}
+
+	return hb
+}
+
+// ProtocolStateSyncStatus returns the current sync status of the BlockPoller
+// consumers and the ColdSync state. All data is read from Redis using exact
+// keys constructed from protocolState and snapshotterState addresses.
+//
+// @Summary Get protocol state sync status
+// @Description Returns BlockPoller consumer block positions and cold sync state
+// @Tags protocol-state
+// @Produce json
+// @Success 200 {object} map[string]interface{}
+// @Router /protocol-state/sync-status [get]
+func (m *MonitorAPI) ProtocolStateSyncStatus(c *gin.Context) {
+	ctx := m.ctx
+
+	if m.protocolState == "" || m.snapshotterState == "" {
+		c.JSON(http.StatusOK, gin.H{
+			"error":     "snapshotterState address not available - POWERLOOM_RPC_NODES and PROTOCOL_STATE_ABI_PATH required",
+			"timestamp": time.Now(),
+		})
+		return
+	}
+
+	cacherPrefix := fmt.Sprintf("%s:%s", m.protocolState, m.snapshotterState)
+
+	// Read exact BlockPoller consumer keys
+	consumers := make(map[string]interface{})
+
+	// SlotEvents consumer (prefix = cacherPrefix)
+	slotEventsKey := fmt.Sprintf("%s:BlockPoller.SlotEvents.LastBlock", cacherPrefix)
+	if val, err := m.redis.Get(ctx, slotEventsKey).Result(); err == nil {
+		block, _ := strconv.ParseUint(val, 10, 64)
+		consumers["SlotEvents"] = gin.H{"last_block": block}
+	}
+
+	// EventMonitor consumer (prefix = protocolState)
+	eventMonitorKey := fmt.Sprintf("%s:BlockPoller.EventMonitor.LastBlock", m.protocolState)
+	if val, err := m.redis.Get(ctx, eventMonitorKey).Result(); err == nil {
+		block, _ := strconv.ParseUint(val, 10, 64)
+		consumers["EventMonitor"] = gin.H{"last_block": block}
+	}
+
+	// ColdSync.InitialComplete
+	initialCompleteKey := fmt.Sprintf("%s:ColdSync.InitialComplete", cacherPrefix)
+	initialCompleteVal, _ := m.redis.Get(ctx, initialCompleteKey).Result()
+	initialComplete := initialCompleteVal == "true"
+
+	// ColdSync.LastSyncTimestamp
+	lastSyncKey := fmt.Sprintf("%s:ColdSync.LastSyncTimestamp", cacherPrefix)
+	lastSyncTimestamp, _ := m.redis.Get(ctx, lastSyncKey).Result()
+
+	c.JSON(http.StatusOK, gin.H{
+		"consumers":             consumers,
+		"initial_sync_complete": initialComplete,
+		"last_cold_sync":        lastSyncTimestamp,
+		"timestamp":             time.Now(),
+	})
+}
+
 func main() {
 	// Configure logger
 	log.SetFormatter(&logrus.JSONFormatter{})
@@ -2394,8 +3686,46 @@ func main() {
 		"market":   market,
 	}).Info("Monitor API connected to Redis")
 
+	// Derive SnapshotterState address from ProtocolState contract
+	var snapshotterState string
+	rpcNodesEnv := getEnv("POWERLOOM_RPC_NODES", "")
+	abiPath := getEnv("PROTOCOL_STATE_ABI_PATH", "")
+	if rpcNodesEnv != "" && abiPath != "" {
+		var rpcURLs []string
+		if strings.HasPrefix(rpcNodesEnv, "[") {
+			_ = json.Unmarshal([]byte(rpcNodesEnv), &rpcURLs)
+		} else {
+			rpcURLs = strings.Split(rpcNodesEnv, ",")
+		}
+		if len(rpcURLs) > 0 {
+			nodes := make([]rpchelper.NodeConfig, len(rpcURLs))
+			for i, u := range rpcURLs {
+				nodes[i] = rpchelper.NodeConfig{URL: strings.TrimSpace(u)}
+			}
+			rpcCfg := &rpchelper.RPCConfig{
+				Nodes:          nodes,
+				RequestTimeout: 15 * time.Second,
+				MaxRetries:     2,
+			}
+			rpcH := rpchelper.NewRPCHelper(rpcCfg)
+			if err := rpcH.Initialize(ctx); err == nil {
+				addr, err := protocolstate.GetSnapshotterStateAddress(ctx, rpcH, protocol, abiPath)
+				if err == nil {
+					snapshotterState = addr.Hex()
+					log.WithField("snapshotter_state", snapshotterState).Info("Derived SnapshotterState address from ProtocolState contract")
+				} else {
+					log.WithError(err).Warn("Failed to derive SnapshotterState address - sync-status endpoint will be limited")
+				}
+			} else {
+				log.WithError(err).Warn("Failed to initialize RPC helper for SnapshotterState lookup")
+			}
+		}
+	} else {
+		log.Warn("POWERLOOM_RPC_NODES or PROTOCOL_STATE_ABI_PATH not set - sync-status endpoint will be limited")
+	}
+
 	// Create API instance
-	api := NewMonitorAPI(redisClient, protocol, market)
+	api := NewMonitorAPI(redisClient, protocol, market, snapshotterState)
 
 	// Setup routes
 	router := gin.Default()
@@ -2431,6 +3761,30 @@ func main() {
 		v1.GET("/vpa/epoch/:epochID/lifecycle", api.EpochLifecycle)
 		v1.GET("/vpa/timeline", api.VPATimeline)
 		v1.GET("/vpa/stats", api.VPAStats)
+
+		// Spam Protection endpoints
+		v1.GET("/spam/flagged/peers", api.FlaggedPeers)
+		v1.GET("/spam/flagged/snapshotters", api.FlaggedSnapshotters)
+		v1.GET("/spam/peer/:peerID", api.PeerSpamInfo)
+		v1.GET("/spam/peer/:peerID/epochs", api.PeerSpamEpochs)
+		v1.GET("/spam/windows", api.SpamWindows)
+		v1.GET("/spam/windows/:windowID", api.SpamWindowDetails)
+		v1.GET("/spam/epochs", api.SpamEpochs)
+		v1.GET("/spam/stats", api.SpamStats)
+
+		// Simulation endpoints - for epoch 0 messages with real CIDs from snapshotters at startup
+		v1.GET("/simulations/recent", api.SimulationsRecent)
+		v1.GET("/simulations/peer/:peerID", api.SimulationsByPeer)
+		v1.GET("/simulations/snapshotter/:address", api.SimulationsBySnapshotter)
+		v1.GET("/simulations/slot/:slotID", api.SimulationsBySlot)
+
+		// Heartbeat endpoints - for epoch 0 mesh maintenance messages (peer ID only, no snapshotter address)
+		// NOTE: Heartbeats are NOT EIP-712 signed. Use simulation/submission data to correlate peer ID with snapshotter.
+		v1.GET("/heartbeats/recent", api.HeartbeatsRecent)
+		v1.GET("/heartbeats/peer/:peerID", api.HeartbeatsByPeer)
+
+		// Protocol state sync status (BlockPoller consumers, cold sync state)
+		v1.GET("/protocol-state/sync-status", api.ProtocolStateSyncStatus)
 	}
 
 	// Swagger documentation

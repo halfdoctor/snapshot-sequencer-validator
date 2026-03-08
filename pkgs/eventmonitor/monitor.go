@@ -5,11 +5,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"math/big"
+	"reflect"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
@@ -20,7 +20,7 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
-// EventMonitor watches for EpochReleased and PrioritiesAssigned events and manages submission windows
+// EventMonitor watches for EpochReleased, PrioritiesAssigned, and SubmissionWindowConfigUpdated events and manages submission windows
 type EventMonitor struct {
 	rpcHelper    *rpchelper.RPCHelper
 	redisClient  *redis.Client
@@ -34,9 +34,8 @@ type EventMonitor struct {
 	vpaEnabled      bool
 
 	// Window management
-	windowManager          *WindowManager
-	windowConfigFetcher    *WindowConfigFetcher // Fetches window config from contract
-	newDataMarketContracts map[string]bool      // Set of NEW data market addresses that support getSubmissionWindowConfig
+	windowManager       *WindowManager
+	windowConfigFetcher *WindowConfigFetcher // Fetches window config from contract
 
 	// Event tracking
 	lastProcessedBlock uint64
@@ -48,11 +47,18 @@ type EventMonitor struct {
 	prioritiesAssignedSig common.Hash // Cache VPA event signature
 	lastProcessedVPABlock uint64      // Separate block tracking for VPA contract
 
+	// SubmissionWindowConfigUpdated (DataMarket): invalidate window config cache
+	submissionWindowConfigUpdatedSig common.Hash // DataMarket event: config updated
+	lastProcessedWindowConfigBlock   uint64      // Block tracking for DataMarket config events
+
 	// Configuration
 	pollInterval         time.Duration
 	windowDuration       time.Duration // Fallback default if contract fetch fails
 	dataMarkets          []string      // List of data market addresses to monitor
 	estimatedMaxPriority int           // Estimated max priority for total window calculation (default: 10)
+
+	// Spam protection components (optional)
+	spamComponents interface{} // *spam.SpamComponents - using interface{} to avoid circular import
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -117,17 +123,19 @@ type Config struct {
 	FinalizationBatchSize int      // Number of projects per finalization batch
 
 	// VPA Configuration (optional)
-	VPAContractAddress       string // VPA contract address for priority monitoring
-	VPAContractABIPath       string // Path to VPA contract ABI JSON file
-	VPAValidatorAddress      string // This validator's address for VPA client
-	VPARPCURL                string // RPC URL for VPA client (if different from main RPC)
-	ProtocolState            string // Protocol state contract address for namespacing
-	NewProtocolStateContract string // NEW ProtocolState contract address for VPA integration and window config fetching
+	VPAContractAddress   string // VPA contract address for priority monitoring
+	VPAContractABIPath   string // Path to VPA contract ABI JSON file
+	VPAValidatorAddress  string // This validator's address for VPA client
+	VPAValidatorNodeID   uint64 // This validator's node ID (required; no chain lookup)
+	VPARPCURL            string // RPC URL for VPA client (if different from main RPC)
+	ProtocolState        string // Protocol state contract address for VPA integration, window config fetching, and namespacing
 
 	// Window Config Configuration
-	WindowConfigCacheTTL   time.Duration // Cache TTL for window configs (default: 5 minutes)
-	EstimatedMaxPriority   int           // Estimated max priority for total window calculation (default: 10)
-	NewDataMarketContracts []string      // List of NEW data market addresses that support getSubmissionWindowConfig
+	WindowConfigCacheTTL time.Duration // Cache TTL for window configs (default: 5 minutes)
+	EstimatedMaxPriority int           // Estimated max priority for total window calculation (default: 10)
+
+	// Spam protection components (optional)
+	SpamComponents interface{} // *spam.SpamComponents - using interface{} to avoid circular import
 }
 
 // NewEventMonitor creates a new event monitor
@@ -192,12 +200,12 @@ func NewEventMonitor(cfg *Config) (*EventMonitor, error) {
 	var prioritiesAssignedSig common.Hash
 	var vpaEnabled bool
 
-	if cfg.VPAValidatorAddress != "" && cfg.ProtocolState != "" {
+	if cfg.VPAValidatorAddress != "" && cfg.VPAValidatorNodeID != 0 && cfg.ProtocolState != "" {
 		vpaEnabled = true
 
-		// Always fetch VPA address from NEW ProtocolState contract
-		if cfg.NewProtocolStateContract != "" {
-			log.Infof("🔍 Fetching VPA address from NEW ProtocolState contract...")
+		// Fetch VPA address from ProtocolState contract
+		if cfg.ProtocolState != "" {
+			log.Infof("🔍 Fetching VPA address from ProtocolState contract...")
 
 			// Parse RPC URL from VPARPCURL (POWERLOOM_RPC_NODES can be comma-separated or JSON array)
 			var rpcURL string
@@ -221,13 +229,13 @@ func NewEventMonitor(cfg *Config) (*EventMonitor, error) {
 			}
 
 			// Use shared VPA fetching function
-			fetchedVPAAddress, err := vpa.FetchVPAAddress(rpcURL, cfg.NewProtocolStateContract)
+			fetchedVPAAddress, err := vpa.FetchVPAAddress(rpcURL, cfg.ProtocolState)
 			if err != nil {
 				log.Warnf("⚠️  Failed to fetch VPA address: %v", err)
 				vpaContractAddr = common.Address{}
 			} else {
 				vpaContractAddr = fetchedVPAAddress
-				log.Infof("✅ Successfully fetched VPA address from NEW ProtocolState: %s", vpaContractAddr.Hex())
+				log.Infof("✅ Successfully fetched VPA address from ProtocolState: %s", vpaContractAddr.Hex())
 			}
 		}
 	}
@@ -243,10 +251,11 @@ func NewEventMonitor(cfg *Config) (*EventMonitor, error) {
 				cfg.VPARPCURL,
 				vpaContractAddr.Hex(),
 				cfg.VPAValidatorAddress,
+				cfg.VPAValidatorNodeID,
 				cfg.RedisClient,
 				cfg.ProtocolState,
 				cfg.DataMarkets[0], // Use first data market as default
-				cfg.NewProtocolStateContract,
+				cfg.ProtocolState,
 			)
 			if err != nil {
 				cancel()
@@ -305,39 +314,32 @@ func NewEventMonitor(cfg *Config) (*EventMonitor, error) {
 		estimatedMaxPriority = 10 // Default safe upper bound
 	}
 
-	if cfg.NewProtocolStateContract != "" {
+	if cfg.ProtocolState != "" {
 		cacheTTL := cfg.WindowConfigCacheTTL
 		if cacheTTL == 0 {
 			cacheTTL = 5 * time.Minute // Default cache TTL
 		}
 
-		fetcher, err := NewWindowConfigFetcher(cfg.RPCHelper, cfg.NewProtocolStateContract, cacheTTL)
+		fetcher, err := NewWindowConfigFetcher(cfg.RPCHelper, cfg.ProtocolState, cacheTTL)
 		if err != nil {
 			log.Warnf("⚠️  Failed to initialize window config fetcher, will use fallback duration: %v", err)
 		} else {
 			windowConfigFetcher = fetcher
 			log.WithFields(log.Fields{
-				"protocol_state_contract": cfg.NewProtocolStateContract,
-				"contract_type":           "NEW ProtocolState (VPA-enabled)",
-			}).Info("✅ Initialized window config fetcher - will call getDataMarketSubmissionWindowConfig on NEW contract")
+				"protocol_state_contract": cfg.ProtocolState,
+				"contract_type":           "ProtocolState (VPA-enabled)",
+			}).Info("✅ Initialized window config fetcher - will call getDataMarketSubmissionWindowConfig")
 		}
 	} else {
-		log.Info("Window config fetcher disabled - NEW_PROTOCOL_STATE_CONTRACT not configured, using fallback duration")
+		log.Info("Window config fetcher disabled - PROTOCOL_STATE_CONTRACT not configured, using fallback duration")
 	}
 
-	// Build set of new data market addresses for quick lookup
-	newDataMarketSet := make(map[string]bool)
-	for _, addr := range cfg.NewDataMarketContracts {
-		// Normalize address (lowercase)
-		newDataMarketSet[strings.ToLower(addr)] = true
-	}
-	if len(newDataMarketSet) > 0 {
-		log.WithFields(log.Fields{
-			"new_data_markets": cfg.NewDataMarketContracts,
-			"count":            len(newDataMarketSet),
-		}).Info("✅ Configured NEW data markets that support getSubmissionWindowConfig - will fetch window config from NEW ProtocolState contract")
-	} else {
-		log.Info("No NEW data markets configured - all data markets will use fallback window duration")
+	// SubmissionWindowConfigUpdated is emitted by DataMarket contracts (not ProtocolState).
+	// Event signature: SubmissionWindowConfigUpdated(uint256,uint256,uint256,uint256,uint256,uint256,uint256)
+	submissionWindowConfigUpdatedSig := common.Hash{}
+	if windowConfigFetcher != nil {
+		submissionWindowConfigUpdatedSig = crypto.Keccak256Hash([]byte("SubmissionWindowConfigUpdated(uint256,uint256,uint256,uint256,uint256,uint256,uint256)"))
+		log.Infof("✅ Will listen for SubmissionWindowConfigUpdated on data markets to invalidate window config cache")
 	}
 
 	return &EventMonitor{
@@ -353,6 +355,9 @@ func NewEventMonitor(cfg *Config) (*EventMonitor, error) {
 		vpaEnabled:            vpaEnabled,
 		prioritiesAssignedSig: prioritiesAssignedSig,
 		lastProcessedVPABlock: startBlock, // Start from same block as main monitoring
+
+		submissionWindowConfigUpdatedSig: submissionWindowConfigUpdatedSig,
+		lastProcessedWindowConfigBlock:   startBlock,
 
 		// Window management
 		windowManager:       windowManager,
@@ -370,28 +375,171 @@ func NewEventMonitor(cfg *Config) (*EventMonitor, error) {
 		dataMarkets:          cfg.DataMarkets,
 		estimatedMaxPriority: estimatedMaxPriority,
 
+		// Spam protection components
+		spamComponents: cfg.SpamComponents,
+
 		ctx:    ctx,
 		cancel: cancel,
 	}, nil
 }
 
-// Start begins monitoring for events
+// Start launches the event processing goroutines. Log dispatch is handled
+// by the BlockPoller via HandleBlockPollerLogs; this method only starts the
+// channel consumers that act on parsed events.
 func (m *EventMonitor) Start() error {
 	log.Info("🚀 Starting event monitor...")
 
-	// Start event processor
 	go m.processEvents()
 
-	// Start VPA event processor if enabled
 	if m.vpaEnabled {
 		go m.processVPAEvents()
 		log.Info("✅ VPA event processor started")
 	}
 
-	// Start block poller
-	go m.pollBlocks()
-
 	return nil
+}
+
+// GetBlockPollerQueries returns the FilterQuery configurations that the
+// BlockPoller should run for this consumer. Callers use this to register
+// the event monitor as a BlockPoller consumer.
+func (m *EventMonitor) GetBlockPollerQueries() []struct {
+	Addresses []common.Address
+	Topics    [][]common.Hash
+} {
+	queries := make([]struct {
+		Addresses []common.Address
+		Topics    [][]common.Hash
+	}, 0, 3)
+
+	// EpochReleased from ProtocolState
+	queries = append(queries, struct {
+		Addresses []common.Address
+		Topics    [][]common.Hash
+	}{
+		Addresses: []common.Address{m.contractAddr},
+		Topics:    [][]common.Hash{{m.epochReleasedSig}},
+	})
+
+	// PrioritiesAssigned from VPA contract
+	if m.vpaEnabled && m.vpaContractAddr != (common.Address{}) {
+		queries = append(queries, struct {
+			Addresses []common.Address
+			Topics    [][]common.Hash
+		}{
+			Addresses: []common.Address{m.vpaContractAddr},
+			Topics:    [][]common.Hash{{m.prioritiesAssignedSig}},
+		})
+	}
+
+	// SubmissionWindowConfigUpdated from DataMarket contracts
+	if m.windowConfigFetcher != nil && len(m.dataMarkets) > 0 && m.submissionWindowConfigUpdatedSig != (common.Hash{}) {
+		addresses := make([]common.Address, 0, len(m.dataMarkets))
+		for _, addr := range m.dataMarkets {
+			addresses = append(addresses, common.HexToAddress(addr))
+		}
+		queries = append(queries, struct {
+			Addresses []common.Address
+			Topics    [][]common.Hash
+		}{
+			Addresses: addresses,
+			Topics:    [][]common.Hash{{m.submissionWindowConfigUpdatedSig}},
+		})
+	}
+
+	return queries
+}
+
+// HandleBlockPollerLogs processes logs received from the BlockPoller.
+// It dispatches each log to the appropriate handler based on event signature,
+// applying stale epoch filtering for time-sensitive events.
+func (m *EventMonitor) HandleBlockPollerLogs(logs []types.Log, currentBlock uint64) {
+	for _, vLog := range logs {
+		if len(vLog.Topics) == 0 {
+			continue
+		}
+		sig := vLog.Topics[0]
+
+		switch sig {
+		case m.epochReleasedSig:
+			event := m.parseEpochReleasedEvent(vLog)
+			if event == nil {
+				continue
+			}
+			if !m.isValidDataMarket(event.DataMarketAddress.Hex()) {
+				continue
+			}
+			// Stale epoch filtering: skip submission pipeline if epoch is too old
+			eventAge := currentBlock - event.BlockNumber
+			staleThreshold := m.getStaleEpochThreshold(event.DataMarketAddress.Hex())
+			if eventAge > staleThreshold {
+				log.Infof("Stale epoch %s for market %s (age=%d blocks, threshold=%d) - recording only",
+					event.EpochID, event.DataMarketAddress.Hex(), eventAge, staleThreshold)
+				m.recordStaleEpoch(event)
+				continue
+			}
+			m.eventChan <- event
+
+		case m.prioritiesAssignedSig:
+			if !m.vpaEnabled {
+				continue
+			}
+			event := m.parsePrioritiesAssignedEvent(vLog)
+			if event == nil {
+				continue
+			}
+			if !m.isValidDataMarket(event.DataMarket.Hex()) {
+				continue
+			}
+			// Stale priority filtering: skip if epoch too old
+			eventAge := currentBlock - event.BlockNumber
+			staleThreshold := m.getStaleEpochThreshold(event.DataMarket.Hex())
+			if eventAge > staleThreshold {
+				log.Debugf("Stale priorities for epoch %s (age=%d blocks) - skipping", event.EpochID, eventAge)
+				continue
+			}
+			m.vpaEventChan <- event
+
+		case m.submissionWindowConfigUpdatedSig:
+			dataMarketAddr := vLog.Address.Hex()
+			if m.windowConfigFetcher != nil && m.isValidDataMarket(dataMarketAddr) {
+				m.windowConfigFetcher.InvalidateCache(dataMarketAddr)
+			}
+		}
+	}
+}
+
+// getStaleEpochThreshold returns the block age beyond which an EpochReleased event
+// should be considered stale for a given data market. It uses the P1 submission window
+// from the cached window config (1 block ~= 1 second on the anchor chain).
+func (m *EventMonitor) getStaleEpochThreshold(dataMarketAddr string) uint64 {
+	if m.windowConfigFetcher != nil {
+		config, err := m.windowConfigFetcher.FetchWindowConfig(m.ctx, dataMarketAddr)
+		if err == nil && config != nil && config.P1SubmissionWindow != nil {
+			p1 := config.P1SubmissionWindow.Uint64()
+			if p1 > 0 {
+				return p1
+			}
+		}
+	}
+	// Fallback: use window duration converted to ~blocks (1 block/sec)
+	return uint64(m.windowDuration.Seconds())
+}
+
+// recordStaleEpoch logs a stale epoch event to Redis timeline for monitoring
+// without triggering the submission pipeline.
+func (m *EventMonitor) recordStaleEpoch(event *EpochReleasedEvent) {
+	dataMarketAddr := event.DataMarketAddress.Hex()
+	kb := m.windowManager.getKeyBuilder(dataMarketAddr)
+	timestamp := time.Now().Unix()
+
+	pipe := m.redisClient.Pipeline()
+	pipe.ZAdd(m.ctx, kb.MetricsEpochsTimeline(), redis.Z{
+		Score:  float64(timestamp),
+		Member: fmt.Sprintf("stale:%s", event.EpochID.String()),
+	})
+	if _, err := pipe.Exec(m.ctx); err != nil {
+		log.Debugf("Failed to record stale epoch %s: %v", event.EpochID, err)
+	}
 }
 
 // Stop gracefully shuts down the monitor
@@ -401,118 +549,6 @@ func (m *EventMonitor) Stop() {
 	m.windowManager.Shutdown()
 }
 
-// pollBlocks continuously polls for new blocks and events
-func (m *EventMonitor) pollBlocks() {
-	ticker := time.NewTicker(m.pollInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-m.ctx.Done():
-			return
-		case <-ticker.C:
-			m.checkForNewEvents()
-		}
-	}
-}
-
-// checkForNewEvents queries for new EpochReleased and PrioritiesAssigned events
-func (m *EventMonitor) checkForNewEvents() {
-	// Get current block
-	currentBlock, err := m.rpcHelper.BlockNumber(m.ctx)
-	if err != nil {
-		log.Errorf("Failed to get current block: %v", err)
-		return
-	}
-
-	// Check for legacy EpochReleased events
-	m.checkForEpochReleasedEvents(currentBlock)
-
-	// Check for VPA PrioritiesAssigned events if enabled
-	if m.vpaEnabled {
-		m.checkForPrioritiesAssignedEvents(currentBlock)
-	}
-}
-
-// checkForEpochReleasedEvents queries for new EpochReleased events from legacy protocol state contract
-func (m *EventMonitor) checkForEpochReleasedEvents(currentBlock uint64) {
-	// Don't scan if we're already up to date
-	if m.lastProcessedBlock >= currentBlock {
-		return
-	}
-
-	// Limit scan range to avoid overwhelming the node
-	toBlock := m.lastProcessedBlock + 1000
-	if toBlock > currentBlock {
-		toBlock = currentBlock
-	}
-
-	// Use cached event signature (computed once at startup)
-	query := ethereum.FilterQuery{
-		FromBlock: big.NewInt(int64(m.lastProcessedBlock + 1)),
-		ToBlock:   big.NewInt(int64(toBlock)),
-		Addresses: []common.Address{m.contractAddr},
-		Topics:    [][]common.Hash{{m.epochReleasedSig}},
-	}
-
-	logs, err := m.rpcHelper.FilterLogs(m.ctx, query)
-	if err != nil {
-		log.Errorf("Failed to filter EpochReleased logs: %v", err)
-		return
-	}
-
-	for _, vLog := range logs {
-		event := m.parseEpochReleasedEvent(vLog)
-		if event != nil {
-			// Only process events for configured data markets
-			if m.isValidDataMarket(event.DataMarketAddress.Hex()) {
-				m.eventChan <- event
-			}
-		}
-	}
-
-	m.lastProcessedBlock = toBlock
-}
-
-// checkForPrioritiesAssignedEvents queries for new PrioritiesAssigned events from VPA contract
-func (m *EventMonitor) checkForPrioritiesAssignedEvents(currentBlock uint64) {
-	// Don't scan if we're already up to date
-	if m.lastProcessedVPABlock >= currentBlock {
-		return
-	}
-
-	// Limit scan range to avoid overwhelming the node
-	toBlock := m.lastProcessedVPABlock + 1000
-	if toBlock > currentBlock {
-		toBlock = currentBlock
-	}
-
-	// Use cached VPA event signature
-	query := ethereum.FilterQuery{
-		FromBlock: big.NewInt(int64(m.lastProcessedVPABlock + 1)),
-		ToBlock:   big.NewInt(int64(toBlock)),
-		Addresses: []common.Address{m.vpaContractAddr},
-		Topics:    [][]common.Hash{{m.prioritiesAssignedSig}},
-	}
-
-	logs, err := m.rpcHelper.FilterLogs(m.ctx, query)
-	if err != nil {
-		log.Errorf("Failed to filter PrioritiesAssigned logs: %v", err)
-		return
-	}
-
-	for _, vLog := range logs {
-		event := m.parsePrioritiesAssignedEvent(vLog)
-		if event != nil {
-			// Only process events for configured data markets
-			if m.isValidDataMarket(event.DataMarket.Hex()) {
-				m.vpaEventChan <- event
-			}
-		}
-	}
-
-	m.lastProcessedVPABlock = toBlock
-}
 
 // parseEpochReleasedEvent parses the log into an EpochReleasedEvent
 func (m *EventMonitor) parseEpochReleasedEvent(vLog types.Log) *EpochReleasedEvent {
@@ -702,94 +738,59 @@ func (m *EventMonitor) handleEpochReleased(event *EpochReleasedEvent) {
 	var windowDuration time.Duration
 	var windowConfig *WindowConfig
 	var useFallback bool
-	var isLegacyContract bool // Track if we're using legacy contract
 
-	// Only fetch window config from contract if this is a NEW data market that supports it
-	// Legacy data markets don't have getSubmissionWindowConfig() and will revert
+	// TODO: Dynamic update of submission window config. Fallback (windowDuration) is set once at
+	// startup from env; contract config is fetched per-epoch with cache TTL. Neither supports
+	// hot reload (e.g. env change or contract config update) without restart.
+	// Always try to fetch window config from contract
 	if m.windowConfigFetcher != nil {
-		dataMarketLower := strings.ToLower(dataMarketAddr)
-		if !m.newDataMarketContracts[dataMarketLower] {
-			log.WithFields(log.Fields{
-				"data_market": dataMarketAddr,
-			}).Debug("Legacy data market - checking if we should use fallback delay or legacy window")
-			// For legacy contracts, we have two options:
-			// 1. Use legacy contract's snapshotSubmissionWindow() if commit/reveal is enabled (legacy behavior)
-			// 2. Use LEVEL1_FINALIZATION_DELAY_SECONDS if commit/reveal is disabled (matches new contract timing)
-			// Since we can't easily check commit/reveal status for legacy contracts, and the user wants
-			// LEVEL1_FINALIZATION_DELAY_SECONDS to be respected, we'll use the fallback delay when commit/reveal is disabled.
-			// For now, always use fallback delay to ensure consistent timing with new contracts.
+		log.WithFields(log.Fields{
+			"data_market": dataMarketAddr,
+		}).Debug("Fetching window config from ProtocolState contract")
+		config, err := m.windowConfigFetcher.FetchWindowConfig(m.ctx, dataMarketAddr)
+		if err != nil {
+			log.WithError(err).WithFields(log.Fields{
+				"data_market":             dataMarketAddr,
+				"protocol_state_contract": m.windowConfigFetcher.protocolStateAddr.Hex(),
+			}).Warn("⚠️  Failed to fetch window config from ProtocolState contract, using fallback duration")
 			windowDuration = m.windowDuration
 			useFallback = true
-			isLegacyContract = true
-			log.WithFields(log.Fields{
-				"data_market":     dataMarketAddr,
-				"window_duration": windowDuration,
-				"source":          "LEVEL1_FINALIZATION_DELAY_SECONDS",
-			}).Info("✅ Using LEVEL1_FINALIZATION_DELAY_SECONDS for legacy contract - Level 1 finalization will trigger after delay (ensures timing matches new contract)")
 		} else {
-			log.WithFields(log.Fields{
-				"data_market": dataMarketAddr,
-			}).Debug("Fetching window config from NEW ProtocolState contract")
-			config, err := m.windowConfigFetcher.FetchWindowConfig(m.ctx, dataMarketAddr)
-			if err != nil {
-				log.WithError(err).WithFields(log.Fields{
-					"data_market":             dataMarketAddr,
-					"protocol_state_contract": m.windowConfigFetcher.protocolStateAddr.Hex(),
-				}).Warn("⚠️  Failed to fetch window config from NEW ProtocolState contract, using fallback duration")
-				windowDuration = m.windowDuration
-				useFallback = true
+			windowConfig = config
+			// LocalFinalizationWindow() handles two cases:
+			// 1. Snapshot Commit/Reveal enabled: triggers when snapshot reveal closes (snapshotCommit + snapshotReveal)
+			// 2. Snapshot Commit/Reveal disabled: triggers when P1 window closes (preSubmissionWindow + p1SubmissionWindow)
+			// P1 and PN windows in contract are for on-chain submission AFTER local finalization completes.
+			// Note: Validator vote commit/reveal is a separate workflow and doesn't affect Level 1 finalization timing.
+			windowDuration = config.LocalFinalizationWindow(m.windowDuration)
+
+			hasSnapshotCommitReveal := config.SnapshotCommitWindow.Uint64() > 0 ||
+				config.SnapshotRevealWindow.Uint64() > 0
+
+			logFields := log.Fields{
+				"data_market":                    dataMarketAddr,
+				"p1_window":                      config.P1SubmissionWindow.Uint64(),
+				"pN_window":                      config.PNSubmissionWindow.Uint64(),
+				"pre_submission_window":          config.PreSubmissionWindow.Uint64(),
+				"finalization_duration":          windowDuration,
+				"snapshot_commit_reveal_enabled": hasSnapshotCommitReveal,
+			}
+
+			if hasSnapshotCommitReveal {
+				logFields["snapshot_commit_window"] = config.SnapshotCommitWindow.Uint64()
+				logFields["snapshot_reveal_window"] = config.SnapshotRevealWindow.Uint64()
+				log.WithFields(logFields).Info("✅ Using on-chain window config: Level 1 finalization triggers when snapshot reveal closes")
 			} else {
-				windowConfig = config
-				// LocalFinalizationWindow() handles two cases:
-				// 1. Snapshot Commit/Reveal enabled: triggers when snapshot reveal closes (snapshotCommit + snapshotReveal)
-				// 2. Snapshot Commit/Reveal disabled: triggers when P1 window closes (preSubmissionWindow + p1SubmissionWindow)
-				// P1 and PN windows in contract are for on-chain submission AFTER local finalization completes.
-				// Note: Validator vote commit/reveal is a separate workflow and doesn't affect Level 1 finalization timing.
-				windowDuration = config.LocalFinalizationWindow(m.windowDuration)
-
-				hasSnapshotCommitReveal := config.SnapshotCommitWindow.Uint64() > 0 ||
-					config.SnapshotRevealWindow.Uint64() > 0
-
-				logFields := log.Fields{
-					"data_market":                    dataMarketAddr,
-					"p1_window":                      config.P1SubmissionWindow.Uint64(),
-					"pN_window":                      config.PNSubmissionWindow.Uint64(),
-					"pre_submission_window":          config.PreSubmissionWindow.Uint64(),
-					"finalization_duration":          windowDuration,
-					"snapshot_commit_reveal_enabled": hasSnapshotCommitReveal,
-				}
-
-				if hasSnapshotCommitReveal {
-					logFields["snapshot_commit_window"] = config.SnapshotCommitWindow.Uint64()
-					logFields["snapshot_reveal_window"] = config.SnapshotRevealWindow.Uint64()
-					log.WithFields(logFields).Info("✅ Using on-chain window config: Level 1 finalization triggers when snapshot reveal closes")
-				} else {
-					log.WithFields(logFields).Info("✅ Using on-chain window config: Level 1 finalization triggers when P1 window closes")
-				}
+				log.WithFields(logFields).Info("✅ Using on-chain window config: 2/3 of P1 window open for snapshot submissions, remainder for validator votes and on-chain commit")
 			}
 		}
 	} else {
-		// Window config fetcher not initialized - try to query legacy contract directly
+		// Window config fetcher not initialized - use fallback duration
 		log.WithFields(log.Fields{
 			"data_market": dataMarketAddr,
-		}).Debug("Window config fetcher not initialized - fetching snapshotSubmissionWindow from legacy ProtocolState contract")
-		legacyWindow, err := m.fetchLegacySubmissionWindow(dataMarketAddr)
-		if err != nil {
-			log.WithError(err).WithFields(log.Fields{
-				"data_market": dataMarketAddr,
-			}).Warn("⚠️  Failed to fetch snapshotSubmissionWindow from legacy contract, using fallback duration")
-			windowDuration = m.windowDuration
-			useFallback = true
-		} else {
-			windowDuration = time.Duration(legacyWindow.Uint64()) * time.Second
-			useFallback = false // Successfully fetched from legacy contract
-			isLegacyContract = true
-			log.WithFields(log.Fields{
-				"data_market":     dataMarketAddr,
-				"window_duration": windowDuration,
-				"source":          "legacy_contract_snapshotSubmissionWindow",
-			}).Info("✅ Using snapshotSubmissionWindow from legacy ProtocolState contract - Level 1 finalization will trigger when submission window closes (after collecting snapshot CIDs)")
-		}
+		}).Warn("⚠️  Window config fetcher not initialized - using fallback duration")
+		windowDuration = m.windowDuration
+		useFallback = true
 	}
 
 	// Skip old epochs whose windows would have already expired
@@ -863,12 +864,131 @@ func (m *EventMonitor) handleEpochReleased(event *EpochReleasedEvent) {
 		}
 	}
 
+	// Check if this is a 10-epoch boundary for spam aggregation windows
+	// Windows are created at epochs 10, 20, 30, etc. (epochID % 10 == 0)
+	epochIDInt := event.EpochID.Uint64()
+	if epochIDInt > 0 && epochIDInt%10 == 0 {
+		log.Infof("Epoch %d is an aggregation window boundary. Triggering local spam data aggregation.", epochIDInt)
+		// This is a window boundary - create window and aggregate local tracking data
+		// Note: spamComponents may be nil if spam protection is disabled
+		if m.spamComponents != nil {
+
+			scValue := reflect.ValueOf(m.spamComponents)
+			if scValue.Kind() == reflect.Ptr && !scValue.IsNil() {
+				// Get Aggregator field
+				aggregatorField := scValue.Elem().FieldByName("Aggregator")
+				trackerField := scValue.Elem().FieldByName("Tracker")
+
+				if aggregatorField.IsValid() && trackerField.IsValid() {
+					if !aggregatorField.IsNil() && !trackerField.IsNil() {
+						// Call CreateWindowAndAggregateLocalData using reflection
+						createWindowMethod := aggregatorField.MethodByName("CreateWindowAndAggregateLocalData")
+						if createWindowMethod.IsValid() {
+							ctxVal := reflect.ValueOf(m.ctx)
+							epochVal := reflect.ValueOf(epochIDInt)
+							trackerVal := trackerField
+
+							log.Debugf("Calling CreateWindowAndAggregateLocalData for epoch %d", epochIDInt)
+							results := createWindowMethod.Call([]reflect.Value{ctxVal, epochVal, trackerVal})
+							if len(results) > 0 && !results[0].IsNil() {
+								if err, ok := results[0].Interface().(error); ok && err != nil {
+									log.Errorf("Failed to create spam aggregation window at epoch boundary %d: %v", epochIDInt, err)
+								} else {
+									log.Infof("Successfully created spam aggregation window for epoch %d", epochIDInt)
+									// Note: Consensus checking is now scheduled by SpamReportWindowManager
+									// after collection window closes and reports are sent, with additional delay
+									// for other validators' reports to arrive
+								}
+							} else {
+								log.Infof("Successfully created spam aggregation window for epoch %d (no error returned)", epochIDInt)
+								// Note: Consensus checking is now scheduled by SpamReportWindowManager
+								// after collection window closes and reports are sent, with additional delay
+								// for other validators' reports to arrive
+							}
+						} else {
+							log.Warnf("CreateWindowAndAggregateLocalData method not found on aggregator (type: %s)", aggregatorField.Type())
+						}
+					} else {
+						if aggregatorField.IsNil() {
+							log.Warnf("Spam aggregator is nil at epoch boundary %d", epochIDInt)
+						}
+						if trackerField.IsNil() {
+							log.Warnf("Spam tracker is nil at epoch boundary %d", epochIDInt)
+						}
+					}
+				} else {
+					log.Warnf("Spam components fields not found (aggregator valid: %v, tracker valid: %v)", aggregatorField.IsValid(), trackerField.IsValid())
+				}
+			} else {
+				log.Warnf("Spam components value is not a valid pointer (kind: %s, isNil: %v)", scValue.Kind(), scValue.IsNil())
+			}
+		} else {
+			log.Warnf("Spam components not initialized - skipping window creation at epoch boundary %d", epochIDInt)
+		}
+	}
+
+	// Start spam report collection window (if spam protection enabled)
+	// This window batches all spam reports for the epoch and sends them after collection window
+	// Collection window: LEVEL1_FINALIZATION_DELAY_SECONDS + 10 seconds
+	if m.spamComponents != nil {
+		scValue := reflect.ValueOf(m.spamComponents)
+		if scValue.Kind() == reflect.Ptr && !scValue.IsNil() {
+			reporterField := scValue.Elem().FieldByName("Reporter")
+			if reporterField.IsValid() && !reporterField.IsNil() {
+				// Get window manager from reporter using reflection
+				getWindowManagerMethod := reporterField.MethodByName("GetWindowManager")
+				if getWindowManagerMethod.IsValid() {
+					results := getWindowManagerMethod.Call([]reflect.Value{})
+					if len(results) > 0 && !results[0].IsNil() {
+						windowManager := results[0]
+
+						// Set consensus check callback if this is a window boundary epoch
+						epochIDInt := event.EpochID.Uint64()
+						if epochIDInt%10 == 0 {
+							setCallbackMethod := windowManager.MethodByName("SetConsensusCheckCallback")
+							if setCallbackMethod.IsValid() {
+								// Create callback function that calls checkConsensusAfterDelay
+								callbackFunc := reflect.MakeFunc(reflect.TypeOf(func(uint64) {}), func(args []reflect.Value) []reflect.Value {
+									epID := uint64(args[0].Uint())
+									go m.checkConsensusAfterDelay(epID)
+									return nil
+								})
+								setCallbackMethod.Call([]reflect.Value{callbackFunc})
+								log.Debugf("Set consensus check callback for window boundary epoch %d", epochIDInt)
+							}
+						}
+
+						// Call StartReportCollectionWindow using reflection
+						startWindowMethod := windowManager.MethodByName("StartReportCollectionWindow")
+						if startWindowMethod.IsValid() {
+							// Convert timestamp from Unix seconds to time.Time
+							releaseTime := time.Unix(int64(event.Timestamp), 0)
+							ctxVal := reflect.ValueOf(m.ctx)
+							dataMarketVal := reflect.ValueOf(dataMarketAddr)
+							epochVal := reflect.ValueOf(epochIDInt)
+							releaseTimeVal := reflect.ValueOf(releaseTime)
+							callResults := startWindowMethod.Call([]reflect.Value{ctxVal, dataMarketVal, epochVal, releaseTimeVal})
+							if len(callResults) > 0 && !callResults[0].IsNil() {
+								if err, ok := callResults[0].Interface().(error); ok && err != nil {
+									log.Debugf("Failed to start spam report collection window for epoch %d: %v", epochIDInt, err)
+								} else {
+									log.Debugf("Started spam report collection window for epoch %d", epochIDInt)
+								}
+							} else {
+								log.Debugf("Started spam report collection window for epoch %d", epochIDInt)
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
 	// Start submission window - this window is for collecting snapshot CIDs from snapshotter nodes
 	// Window closes when Level 1 finalization should begin
-	// Duration varies by contract type:
-	//   - Legacy contracts: Queries snapshotSubmissionWindow(dataMarket) function (typically 20 seconds)
+	// Duration varies by contract configuration:
 	//   - New contracts with snapshot commit/reveal enabled: snapshotCommitWindow + snapshotRevealWindow (snapshot reveal closes)
-	//   - New contracts without snapshot commit/reveal: preSubmissionWindow + p1SubmissionWindow (P1 window closes)
+	//   - New contracts without snapshot commit/reveal: 2/3 of (PreSubmissionWindow + P1SubmissionWindow) open for submissions; remainder for votes and commit
 	// When window closes, triggerFinalization() is called to begin Level 1 local finalization
 	// Note: Validator vote commit/reveal is a separate workflow and doesn't affect this timing
 	if err := m.windowManager.StartSubmissionWindow(
@@ -882,26 +1002,54 @@ func (m *EventMonitor) handleEpochReleased(event *EpochReleasedEvent) {
 	}
 
 	if useFallback {
-		// Only warn if window config fetcher is not initialized (missing NEW_PROTOCOL_STATE_CONTRACT)
+		// Only warn if window config fetcher is not initialized (missing PROTOCOL_STATE_CONTRACT)
 		// If it's initialized but failed for this specific data market, that's already logged above
 		if m.windowConfigFetcher == nil {
-			log.Warnf("⚠️  Using fallback window duration %v for epoch %s (NEW_PROTOCOL_STATE_CONTRACT not configured)",
+			log.Warnf("⚠️  Using fallback window duration %v for epoch %s (PROTOCOL_STATE_CONTRACT not configured)",
 				windowDuration, event.EpochID.String())
 		}
-		// If window config fetcher exists but we're using fallback, it means this is a legacy data market
-		// This is expected and already logged above, so no need for additional warning
-	} else if isLegacyContract {
-		// Legacy contract - message already logged above with correct context
-		// No need to log again
+		// If window config fetcher exists but we're using fallback, it means contract call failed
+		// This is already logged above, so no need for additional warning
 	} else {
-		// New contract with window config
+		// Contract with window config
 		hasSnapshotCommitReveal := windowConfig != nil && (windowConfig.SnapshotCommitWindow.Uint64() > 0 ||
 			windowConfig.SnapshotRevealWindow.Uint64() > 0)
 
 		if hasSnapshotCommitReveal {
 			log.Infof("📋 Level 1 finalization will trigger when snapshot reveal window closes (in %v)", windowDuration)
 		} else {
-			log.Infof("📋 Level 1 finalization will trigger when P1 window closes (in %v)", windowDuration)
+			log.Infof("📋 2/3 of P1 window open for snapshot submissions (in %v); then finalization and on-chain commit", windowDuration)
+		}
+	}
+}
+
+// checkConsensusAfterDelay waits 10 seconds then checks consensus for the completed window
+// This allows all validators' reports to arrive before checking consensus
+func (m *EventMonitor) checkConsensusAfterDelay(epochID uint64) {
+	log.Infof("Waiting 10 seconds for validator reports before checking consensus for window %d", epochID)
+	time.Sleep(10 * time.Second)
+
+	// Now call CheckWindowForConsensus
+	if m.spamComponents != nil {
+		scValue := reflect.ValueOf(m.spamComponents)
+		if scValue.Kind() == reflect.Ptr && !scValue.IsNil() {
+			aggregatorField := scValue.Elem().FieldByName("Aggregator")
+			if aggregatorField.IsValid() && !aggregatorField.IsNil() {
+				checkConsensusMethod := aggregatorField.MethodByName("CheckWindowForConsensus")
+				if checkConsensusMethod.IsValid() {
+					ctxVal := reflect.ValueOf(m.ctx)
+					epochVal := reflect.ValueOf(epochID)
+					log.Infof("Checking consensus for window %d after 10-second delay", epochID)
+					results := checkConsensusMethod.Call([]reflect.Value{ctxVal, epochVal})
+					if len(results) > 0 && !results[0].IsNil() {
+						if err, ok := results[0].Interface().(error); ok && err != nil {
+							log.Errorf("Failed to check consensus for window %d: %v", epochID, err)
+						} else {
+							log.Infof("Successfully checked consensus for window %d", epochID)
+						}
+					}
+				}
+			}
 		}
 	}
 }
@@ -1376,38 +1524,6 @@ func (wm *WindowManager) getKeyBuilder(dataMarket string) *rediskeys.KeyBuilder 
 	kb := rediskeys.NewKeyBuilder(wm.protocolState, dataMarket)
 	wm.keyBuilders[dataMarket] = kb
 	return kb
-}
-
-// fetchLegacySubmissionWindow queries the legacy ProtocolState contract's snapshotSubmissionWindow function
-func (m *EventMonitor) fetchLegacySubmissionWindow(dataMarketAddr string) (*big.Int, error) {
-	if m.contractABI == nil {
-		return nil, fmt.Errorf("contract ABI not loaded")
-	}
-
-	// Pack the function call: snapshotSubmissionWindow(address dataMarket)
-	dataMarket := common.HexToAddress(dataMarketAddr)
-	packedData, err := m.contractABI.GetABI().Pack("snapshotSubmissionWindow", dataMarket)
-	if err != nil {
-		return nil, fmt.Errorf("failed to pack snapshotSubmissionWindow call: %w", err)
-	}
-
-	// Call the contract
-	result, err := m.rpcHelper.CallContract(m.ctx, ethereum.CallMsg{
-		To:   &m.contractAddr,
-		Data: packedData,
-	}, nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to call snapshotSubmissionWindow: %w", err)
-	}
-
-	// Unpack the result (returns uint256)
-	var windowSeconds *big.Int
-	err = m.contractABI.GetABI().UnpackIntoInterface(&windowSeconds, "snapshotSubmissionWindow", result)
-	if err != nil {
-		return nil, fmt.Errorf("failed to unpack snapshotSubmissionWindow result: %w", err)
-	}
-
-	return windowSeconds, nil
 }
 
 func (wm *WindowManager) IsWindowOpen(dataMarket string, epochID *big.Int) bool {

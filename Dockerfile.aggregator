@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1.4
 # Build stage
 FROM golang:1.25-alpine AS builder
 
@@ -7,13 +8,18 @@ WORKDIR /app
 
 # Copy go mod files
 COPY go.mod go.sum ./
-RUN go mod download
+
+# Download dependencies with cache mount
+RUN --mount=type=cache,target=/go/pkg/mod \
+    go mod download
 
 # Copy source code
 COPY . .
 
-# Build the Aggregator binary
-RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o aggregator cmd/aggregator/main.go
+# Build the Aggregator binary with cache mounts
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o aggregator cmd/aggregator/main.go
 
 # Runtime stage
 FROM alpine:latest

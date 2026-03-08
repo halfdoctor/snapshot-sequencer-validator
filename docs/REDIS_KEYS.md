@@ -616,3 +616,330 @@ State-tracker monitors Redis key sizes and logs warnings if they exceed threshol
 
 ### Metrics Aggregation
 State-tracker manages rolling windows for metrics aggregation. Timeline keys are the source of truth and must be pruned regularly.
+
+## Spam Protection Keys (namespaced per protocol:market)
+
+### Per-Epoch Tracking Keys (TTL: 24 hours)
+
+**Validation Failures**:
+- `{protocol}:{market}:spam:validation_failures:peer:{peerID}:{epochID}` - Counter (INT) - PRIMARY
+  - Written by: Dequeuer (on validation failure)
+  - Read by: Spam Reporter (to check thresholds)
+  - TTL: 24 hours (set on first increment)
+  - Purpose: Track validation failures per peer per epoch
+
+- `{protocol}:{market}:spam:validation_failures:snapshotter:{snapshotterAddr}:{epochID}` - Counter (INT) - SECONDARY
+  - Written by: Dequeuer (on validation failure)
+  - Read by: Spam Reporter (for evidence)
+  - TTL: 24 hours (set on first increment)
+  - Purpose: Track validation failures per snapshotter address per epoch
+
+**Submission Counts**:
+- `{protocol}:{market}:spam:submissions:peer:{peerID}:{epochID}` - Counter (INT) - PRIMARY
+  - Written by: Dequeuer (after signature verification)
+  - Read by: Rate Limiter (to check limits)
+  - TTL: 24 hours (set on first increment)
+  - Purpose: Track submission count per peer per epoch (enforcement)
+
+- `{protocol}:{market}:spam:submissions:snapshotter:{snapshotterAddr}:{epochID}` - Counter (INT) - SECONDARY
+  - Written by: Dequeuer (after signature verification)
+  - Read by: Spam Reporter (for evidence)
+  - TTL: 24 hours (set on first increment)
+  - Purpose: Track submission count per snapshotter address per epoch (evidence)
+
+**Peer-Snapshotter Association**:
+- `{protocol}:{market}:spam:peer_snapshotter_map:{peerID}:{epochID}` - SET (snapshotter addresses)
+  - Written by: Dequeuer (when tracking submissions/failures)
+  - Read by: Spam Aggregator (to collect all addresses for flagging)
+  - TTL: 24 hours (set on first association)
+  - Purpose: Track which snapshotter addresses are used by which peer in an epoch
+
+### Aggregation Window Keys (TTL: 2 hours)
+
+**Aggregated Reports**:
+- `{protocol}:{market}:spam:reports:peer:{peerID}:window:{windowID}` - String (JSON) - Aggregated reports per peer per window
+  - Written by: Spam Aggregator (when receiving reports)
+  - Read by: Spam Aggregator (to check consensus)
+  - TTL: 2 hours (set on first report)
+  - Value: JSON `AggregatedReport` with:
+    - `reports` (JSON array): All spam reports for this peer in this window
+    - `validator_ids` (array): Validator IDs that reported
+    - `validator_count` (INT): Number of unique validators reporting
+    - `snapshotter_addrs` (array): All snapshotter addresses associated with this peer
+    - `first_epoch` (INT): First epoch in window with reports
+    - `last_epoch` (INT): Last epoch in window with reports
+    - `first_seen` (INT): Timestamp when first report received
+    - `last_updated` (INT): Timestamp when last report received
+  - Purpose: Aggregate spam reports over multiple epochs before checking consensus
+  - Window calculation: `windowID = ((epochID + 9) / 10) * 10` (rounds up to next multiple of 10, hardcoded window size 10)
+
+**Window Peers Set**:
+- `{protocol}:{market}:spam:reports:window:{windowID}:peers` - SET (peer IDs)
+  - Written by: Spam Aggregator (when adding first report for a peer in a window)
+  - Read by: Spam Aggregator (to get all peers with reports in a window for consensus checking)
+  - TTL: 2 hours (set on first peer added, matches aggregation window TTL)
+  - Purpose: **Deterministic key** to track all peer IDs with reports in a window - enables efficient consensus checking
+
+**Master Windows Set** (for discovery/indexing):
+- `{protocol}:{market}:spam:reports:windows` - SET (window IDs as strings)
+  - Written by: Spam Aggregator (when adding first report for any peer in a window)
+  - Read by: Monitoring API (to list all windows with reports)
+  - Pruned by: Spam Aggregator (periodically removes expired windows - windows expire when their peers set TTL expires after 2 hours)
+  - TTL: None (persistent index, pruned when windows expire)
+  - Purpose: **Master index** of all windows that have spam reports - enables window discovery without knowing window IDs
+
+**Report Sent Tracking**:
+- `{protocol}:{market}:spam:report:sent:reporter:{reporterID}:peer:{peerID}:epoch:{epochID}:reason:{reason}` - String ("true")
+  - Written by: Spam Reporter (to prevent duplicate reports)
+  - Read by: Spam Reporter (to check if already sent)
+  - TTL: 24 hours (matches cache TTL)
+  - Purpose: Prevent a single validator from sending duplicate reports for the same peer/epoch/reason
+
+### Global Flagged State (Redis Cache - synced from on-chain, TTL: 24 hours)
+
+**Flagged Peers**:
+- `{protocol}:{market}:spam:consensus_flagged:peer:{peerID}` - String (JSON) - PRIMARY
+  - Written by: Flagging Service (after consensus reached, synced from on-chain)
+  - Read by: P2P Gateway (early rejection), Dequeuer (defense in depth)
+  - TTL: 24 hours (cache TTL, refreshed on sync)
+  - Value: JSON with `{"flagged_at": timestamp, "first_epoch": epochID, "last_epoch": epochID, "snapshotter_addrs": [addresses], "synced_at": timestamp}`
+  - Source of truth: On-chain contract
+  - Purpose: Cache flagged peer state for fast lookup (early rejection in P2P Gateway)
+
+**Flagged Snapshotters**:
+- `{protocol}:{market}:spam:consensus_flagged:snapshotter:{snapshotterAddr}` - String (JSON) - SECONDARY
+  - Written by: Flagging Service (after consensus reached, synced from on-chain)
+  - Read by: Dequeuer (defense in depth)
+  - TTL: 24 hours (cache TTL, refreshed on sync)
+  - Value: JSON with `{"flagged_at": timestamp, "associated_peer_id": peerID, "first_epoch": epochID, "last_epoch": epochID, "synced_at": timestamp}`
+  - Source of truth: On-chain contract
+  - Purpose: Cache flagged snapshotter state for fast lookup (defense in depth in Dequeuer)
+
+**Flagged Sets** (for quick lookup):
+- `flagged_peers:{dataMarket}` - SET (peer IDs) - NEW
+  - Written by: Flagging Service (synced from on-chain)
+  - Read by: P2P Gateway, Dequeuer (for quick lookup)
+  - TTL: 24 hours (cache TTL, refreshed on sync)
+  - Purpose: Quick lookup set of all flagged peer IDs for a data market
+
+- `flagged_snapshotters:{dataMarket}` - SET (snapshotter addresses) - EXISTING, EXTENDED
+  - Written by: Flagging Service (synced from on-chain), existing identity verifier
+  - Read by: Dequeuer, identity verifier (for quick lookup)
+  - TTL: 24 hours (cache TTL, refreshed on sync)
+  - Purpose: Quick lookup set of all flagged snapshotter addresses for a data market
+
+**Active Validators** (for consensus calculation):
+- `{protocol}:{market}:active:validators` - SET (validator Peer IDs)
+  - Written by: P2P Gateway (presence heartbeat), Spam Aggregator (monitoring)
+  - Read by: Spam Aggregator (to calculate consensus threshold)
+  - TTL: 5 minutes (presence heartbeat)
+  - Purpose: Track active validators for consensus threshold calculation
+
+### On-Chain State (Permanent - source of truth)
+
+**Contract Storage**:
+- Protocol contract: `flaggedPeers(bytes peerID) → FlaggedPeer`
+  - Stores peer ID, associated snapshotter addresses, first/last flagged epochs, timestamp
+  - Permanent until cleared via contract method
+  - Source of truth for flagged state
+
+- Protocol contract: `snapshotterToPeer(address snapshotter) → bytes peerID`
+  - Maps snapshotter address to peer ID
+  - Used for reverse lookup
+
+**Clearing Mechanism**:
+- Time-based: Clear entries where `flaggedAt + SPAM_FLAG_EXPIRY_DAYS < now` (default: 7 days)
+- Epoch-based: Clear entries where `lastFlaggedEpoch + SPAM_FLAG_EXPIRY_EPOCHS < currentEpoch` (default: 100 epochs)
+- Manual: Admin function to clear specific peers/addresses
+
+### State Synchronization
+
+**On Node Startup**:
+1. Query on-chain contract for all flagged peers
+2. Populate Redis cache with flagged peer and snapshotter keys
+3. Update flagged sets (`flagged_peers:{dataMarket}`, `flagged_snapshotters:{dataMarket}`)
+4. Set cache TTL: 24 hours
+
+**Periodic Sync** (every `SPAM_SYNC_INTERVAL_HOURS`):
+1. Query on-chain contract for changes since last sync
+2. Update Redis cache with new/changed flagged peers
+3. Remove cleared peers from Redis cache
+4. Refresh TTL on existing cache entries
+
+**Cache Refresh Strategy**:
+- On startup: Full sync from on-chain
+- Periodic: Incremental sync (check for new flags)
+- On flagging event: Immediate sync after on-chain update
+- Fallback: If Redis cache miss, query on-chain contract directly
+
+### Key Usage by Component
+
+**P2P Gateway**:
+- Reads: `{protocol}:{market}:spam:consensus_flagged:peer:{peerID}`, `flagged_peers:{dataMarket}`
+- Purpose: Early rejection of submissions from flagged peers (before queuing)
+
+**Dequeuer**:
+- Writes: All per-epoch tracking keys (validation failures, submission counts, peer-snapshotter maps)
+- Reads: `{protocol}:{market}:spam:consensus_flagged:peer:{peerID}`, `{protocol}:{market}:spam:consensus_flagged:snapshotter:{snapshotterAddr}`, `flagged_peers:{dataMarket}`, `flagged_snapshotters:{dataMarket}`
+- Purpose: Track spam behavior, enforce rate limits, reject flagged peers/snapshotters
+
+**Spam Reporter**:
+- Writes: `{protocol}:{market}:spam:report:sent:reporter:{reporterID}:peer:{peerID}:epoch:{epochID}:reason:{reason}`
+- Reads: Per-epoch tracking keys (to check thresholds)
+- Purpose: Broadcast spam reports when thresholds exceeded
+
+**Spam Aggregator**:
+- Writes: `{protocol}:{market}:spam:reports:peer:{peerID}:window:{windowID}`, `{protocol}:{market}:spam:reports:window:{windowID}:peers` (SET), `{protocol}:{market}:spam:reports:windows` (master set)
+- Reads: Aggregated report keys, window peers set (`{protocol}:{market}:spam:reports:window:{windowID}:peers`), master windows set (`{protocol}:{market}:spam:reports:windows`), `{protocol}:{market}:active:validators`
+- Purpose: Aggregate reports from multiple validators, check consensus, trigger flagging
+
+**Flagging Service**:
+- Writes: All flagged state keys (peer, snapshotter, sets)
+- Reads: On-chain contract (source of truth)
+- Purpose: Flag peers on-chain, sync state to Redis cache
+
+### TTL Management
+
+- **Per-epoch keys**: 24 hours TTL (set on first increment)
+- **Aggregation window keys**: 2 hours TTL (set on first report)
+- **Flagged state cache**: 24 hours TTL (refreshed on sync)
+- **On-chain state**: Permanent (no TTL, cleared via contract methods)
+- **Active validators**: 5 minutes TTL (presence heartbeat)
+
+All counters set TTL on first increment to prevent unbounded growth.
+
+## Manual Redis Key Cleanup
+
+When Redis memory usage is high or keys accumulate beyond expected thresholds, use the cleanup script to remove old keys.
+
+### Cleanup Script: `cleanup_old_redis_keys.py`
+
+**Location**: `scripts/cleanup_old_redis_keys.py`
+
+**Purpose**: 
+- Clean up old Redis keys to prevent memory bloat
+- Supports epoch-based cleanup (requires protocol/market) and time-based cleanup (works without protocol/market)
+- Handles multiple protocol:market combinations automatically
+
+**Why Protocol/Market is Needed**:
+- Epoch-based keys are namespaced: `{protocol}:{market}:epoch:{epochId}:...`
+- To determine what's "old", we need the current epoch
+- Current epoch is stored in Redis keys that require protocol/market to access
+- Queue/stream/timeline cleanup can work without protocol/market (they're time-based, not epoch-based)
+
+### Common Cleanup Scenarios
+
+#### 1. Discovery Mode (No Cleanup)
+Scan all keys to see what exists:
+
+```bash
+python3 scripts/cleanup_old_redis_keys.py --discover
+```
+
+This shows:
+- Total keys by type
+- Large queues (>1000 items)
+- Large timelines (>10000 entries)
+- All protocol:market combinations found
+
+#### 2. Clean Queues/Streams (No Protocol/Market Needed)
+For legacy queues or streams that have accumulated:
+
+```bash
+# Dry run first
+python3 scripts/cleanup_old_redis_keys.py --cleanup-queues --queue-max-length 1000 --dry-run
+
+# Actually clean
+python3 scripts/cleanup_old_redis_keys.py --cleanup-queues --queue-max-length 1000
+
+# Clean streams
+python3 scripts/cleanup_old_redis_keys.py --cleanup-streams --stream-max-length 10000 --dry-run
+python3 scripts/cleanup_old_redis_keys.py --cleanup-streams --stream-max-length 10000
+```
+
+#### 3. Clean Non-Namespaced Timelines (No Protocol/Market Needed)
+For non-namespaced timeline keys like `metrics:submissions:timeline`:
+
+```bash
+# Dry run
+python3 scripts/cleanup_old_redis_keys.py --keep-hours 24 --dry-run
+
+# Actually clean (keeps last 24 hours)
+python3 scripts/cleanup_old_redis_keys.py --keep-hours 24
+```
+
+#### 4. Clean ALL Markets Automatically (No Protocol/Market Needed)
+After refactoring with multiple markets support, clean all protocol:market combinations:
+
+```bash
+# Dry run - discovers all markets automatically
+python3 scripts/cleanup_old_redis_keys.py --all-markets --keep-hours 24 --cleanup-queues --dry-run
+
+# Actually clean all markets
+python3 scripts/cleanup_old_redis_keys.py --all-markets --keep-hours 24 --cleanup-queues
+```
+
+This will:
+- Discover all protocol:market combinations
+- Clean timeline entries older than 24 hours
+- Clean legacy queues
+- Remove old epoch-based keys
+
+#### 5. Clean Specific Protocol/Market (Requires Protocol/Market)
+For epoch-based cleanup of a specific protocol:market:
+
+```bash
+# Dry run
+python3 scripts/cleanup_old_redis_keys.py --keep-epochs 60 --protocol 0x1234... --market 0x5678... --dry-run
+
+# Actually clean (keeps last 60 epochs)
+python3 scripts/cleanup_old_redis_keys.py --keep-epochs 60 --protocol 0x1234... --market 0x5678...
+```
+
+### Cleanup Options
+
+- `--discover`: Scan all keys and show what exists (no cleanup)
+- `--dry-run`: Show what would be deleted without actually deleting
+- `--keep-epochs N`: Keep last N epochs (default: 60)
+- `--keep-hours N`: Keep last N hours of timeline data (overrides --keep-epochs for timelines)
+- `--cleanup-queues`: Clean up Redis LIST queues (trim to max length)
+- `--cleanup-streams`: Clean up Redis streams (trim to max length)
+- `--queue-max-length N`: Maximum length for queues after cleanup (default: 1000)
+- `--stream-max-length N`: Maximum length for streams after cleanup (default: 10000)
+- `--all-markets`: Clean up keys for all protocol:market combinations found
+- `--protocol ADDRESS`: Protocol state contract address
+- `--market ADDRESS`: Data market contract address
+- `--host HOST`: Redis host (default: localhost)
+- `--port PORT`: Redis port (default: 6380)
+- `--db DB`: Redis database (default: 0)
+
+### When to Run Cleanup
+
+**Regular Maintenance**:
+- Run `--discover` weekly to check key counts
+- Run `--all-markets --keep-hours 24` monthly to clean old data
+
+**Memory Pressure**:
+- If Redis memory usage is high, run `--all-markets --keep-hours 6 --cleanup-queues --cleanup-streams`
+- Check discovery results first to identify what's consuming memory
+
+**After Refactoring**:
+- After multi-market refactoring, run `--all-markets` to clean up old keys
+- After timeline pruning fixes, run `--keep-hours 24` to clean accumulated non-namespaced timelines
+
+### Troubleshooting
+
+**Script hangs during cleanup**:
+- Large timeline deletions (>100K entries) use batch processing
+- This is normal and may take several minutes
+- The script shows progress with batch counts
+
+**"Protocol and market required" error**:
+- Use `--all-markets` to discover and clean all markets automatically
+- Or use `--keep-hours` for time-based cleanup without protocol/market
+- Or use `--cleanup-queues`/`--cleanup-streams` for queue/stream cleanup
+
+**Timeline not being cleaned**:
+- Ensure state-tracker is running (it prunes timelines daily)
+- Run manual cleanup with `--keep-hours 24` to clean accumulated entries
+- Check if timeline is namespaced (`{protocol}:{market}:metrics:...`) or non-namespaced (`metrics:...`)
